@@ -14,7 +14,9 @@
 package rulefmt
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"io/ioutil"
 	"strings"
 	"time"
@@ -24,7 +26,7 @@ import (
 	yaml "gopkg.in/yaml.v3"
 
 	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/template"
 )
 
@@ -68,7 +70,7 @@ func (g *RuleGroups) Validate(node ruleGroups) (errs []error) {
 
 	for j, g := range g.Groups {
 		if g.Name == "" {
-			errs = append(errs, errors.Errorf("%d:%d: Groupname should not be empty", node.Groups[j].Line, node.Groups[j].Column))
+			errs = append(errs, errors.Errorf("%d:%d: Groupname must not be empty", node.Groups[j].Line, node.Groups[j].Column))
 		}
 
 		if _, ok := set[g.Name]; ok {
@@ -90,7 +92,7 @@ func (g *RuleGroups) Validate(node ruleGroups) (errs []error) {
 				}
 				errs = append(errs, &Error{
 					Group:    g.Name,
-					Rule:     i,
+					Rule:     i + 1,
 					RuleName: ruleName.Value,
 					Err:      node,
 				})
@@ -156,7 +158,7 @@ func (r *RuleNode) Validate() (nodes []WrappedError) {
 			err:  errors.Errorf("field 'expr' must be set in rule"),
 			node: &r.Expr,
 		})
-	} else if _, err := promql.ParseExpr(r.Expr.Value); err != nil {
+	} else if _, err := parser.ParseExpr(r.Expr.Value); err != nil {
 		nodes = append(nodes, WrappedError{
 			err:  errors.Wrapf(err, "could not parse expression"),
 			node: &r.Expr,
@@ -184,7 +186,7 @@ func (r *RuleNode) Validate() (nodes []WrappedError) {
 	}
 
 	for k, v := range r.Labels {
-		if !model.LabelName(k).IsValid() {
+		if !model.LabelName(k).IsValid() || k == model.MetricNameLabel {
 			nodes = append(nodes, WrappedError{
 				err: errors.Errorf("invalid label name: %s", k),
 			})
@@ -264,12 +266,25 @@ func Parse(content []byte) (*RuleGroups, []error) {
 	var (
 		groups RuleGroups
 		node   ruleGroups
+		errs   []error
 	)
-	err := yaml.Unmarshal(content, &groups)
-	_err := yaml.Unmarshal(content, &node)
-	if err != nil || _err != nil {
-		return nil, []error{err}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	decoder.KnownFields(true)
+	err := decoder.Decode(&groups)
+	// Ignore io.EOF which happens with empty input.
+	if err != nil && err != io.EOF {
+		errs = append(errs, err)
 	}
+	err = yaml.Unmarshal(content, &node)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return nil, errs
+	}
+
 	return &groups, groups.Validate(node)
 }
 

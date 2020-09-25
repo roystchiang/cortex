@@ -12,7 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/cortexproject/cortex/pkg/util"
 )
@@ -47,6 +47,12 @@ type TombstonesSet struct {
 	oldestTombstoneStart, newestTombstoneEnd model.Time // Used as optimization to find whether we want to iterate over tombstones or not
 }
 
+// Used for easier injection of mocks.
+type DeleteStoreAPI interface {
+	getCacheGenerationNumbers(ctx context.Context, user string) (*cacheGenNumbers, error)
+	GetPendingDeleteRequestsForUser(ctx context.Context, id string) ([]DeleteRequest, error)
+}
+
 // TombstonesLoader loads delete requests and gen numbers from store and keeps checking for updates.
 // It keeps checking for changes in gen numbers, which also means changes in delete requests and reloads specific users delete requests.
 type TombstonesLoader struct {
@@ -56,13 +62,13 @@ type TombstonesLoader struct {
 	cacheGenNumbers    map[string]*cacheGenNumbers
 	cacheGenNumbersMtx sync.RWMutex
 
-	deleteStore *DeleteStore
+	deleteStore DeleteStoreAPI
 	metrics     *tombstonesLoaderMetrics
 	quit        chan struct{}
 }
 
 // NewTombstonesLoader creates a TombstonesLoader
-func NewTombstonesLoader(deleteStore *DeleteStore, registerer prometheus.Registerer) *TombstonesLoader {
+func NewTombstonesLoader(deleteStore DeleteStoreAPI, registerer prometheus.Registerer) *TombstonesLoader {
 	tl := TombstonesLoader{
 		tombstones:      map[string]*TombstonesSet{},
 		cacheGenNumbers: map[string]*cacheGenNumbers{},
@@ -106,6 +112,7 @@ func (tl *TombstonesLoader) reloadTombstones() error {
 	for userID, oldGenNumbers := range tl.cacheGenNumbers {
 		newGenNumbers, err := tl.deleteStore.getCacheGenerationNumbers(context.Background(), userID)
 		if err != nil {
+			tl.cacheGenNumbersMtx.RUnlock()
 			return err
 		}
 
@@ -214,7 +221,7 @@ func (tl *TombstonesLoader) loadPendingTombstones(userID string) error {
 		tombstoneSet.tombstones[i].Matchers = make([][]*labels.Matcher, len(tombstoneSet.tombstones[i].Selectors))
 
 		for j, selector := range tombstoneSet.tombstones[i].Selectors {
-			tombstoneSet.tombstones[i].Matchers[j], err = promql.ParseMetricSelector(selector)
+			tombstoneSet.tombstones[i].Matchers[j], err = parser.ParseMetricSelector(selector)
 
 			if err != nil {
 				tl.metrics.deleteRequestsLoadFailures.Inc()

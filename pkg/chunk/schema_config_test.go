@@ -462,6 +462,141 @@ func TestSchemaConfig_Validate(t *testing.T) {
 			},
 			err: nil,
 		},
+		"should fail if chunks prefix is missing on IndexType: aws-dynamo": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "aws-dynamo",
+						ObjectType:  "aws-dynamo",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: cassandra": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "cassandra",
+						ObjectType:  "cassandra",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: bigtable-hashed": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "bigtable-hashed",
+						ObjectType:  "bigtable-hashed",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: gcp": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "gcp",
+						ObjectType:  "gcp",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: gcp-columnkey": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "gcp-columnkey",
+						ObjectType:  "gcp-columnkey",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: bigtable": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "bigtable",
+						ObjectType:  "bigtable",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"should fail if chunks prefix is missing on IndexType: grpc-store": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						Schema:      "v10",
+						IndexType:   "grpc-store",
+						ObjectType:  "grpc-store",
+						IndexTables: PeriodicTableConfig{Period: 24 * time.Hour},
+					},
+				},
+			},
+			err: errConfigChunkPrefixNotSet,
+		},
+		"invalid schema with same from time configs": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						From:   MustParseDayTime("1970-01-01"),
+						Schema: "v9",
+					},
+					{
+						From:   MustParseDayTime("1970-01-01"),
+						Schema: "v10",
+					},
+				},
+			},
+			err: errSchemaIncreasingFromTime,
+		},
+		"invalid schema with from time not in increasing order": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						From:   MustParseDayTime("1970-01-02"),
+						Schema: "v9",
+					},
+					{
+						From:   MustParseDayTime("1970-01-01"),
+						Schema: "v10",
+					},
+				},
+			},
+			err: errSchemaIncreasingFromTime,
+		},
+		"valid schema with different from time configs": {
+			config: &SchemaConfig{
+				Configs: []PeriodConfig{
+					{
+						From:   MustParseDayTime("1970-01-01"),
+						Schema: "v9",
+					},
+					{
+						From:   MustParseDayTime("1970-01-02"),
+						Schema: "v10",
+					},
+				},
+			},
+		},
 	}
 
 	for testName, testData := range tests {

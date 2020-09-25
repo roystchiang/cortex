@@ -5,15 +5,15 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
-	"sort"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/test"
@@ -21,7 +21,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
-	"github.com/cortexproject/cortex/pkg/querier/astmapper"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -51,7 +50,7 @@ var stores = []struct {
 			flagext.DefaultValues(&storeCfg)
 			storeCfg.WriteDedupeCacheConfig.Cache = cache.NewFifoCache("test", cache.FifoCacheConfig{
 				MaxSizeItems: 500,
-			})
+			}, prometheus.NewRegistry(), log.NewNopLogger())
 			return storeCfg
 		},
 	},
@@ -79,7 +78,7 @@ func newTestChunkStoreConfigWithMockStorage(t require.TestingT, schemaCfg Schema
 	require.NoError(t, err)
 	flagext.DefaultValues(&tbmConfig)
 	storage := NewMockStorage()
-	tableManager, err := NewTableManager(tbmConfig, schemaCfg, maxChunkAge, storage, nil, nil)
+	tableManager, err := NewTableManager(tbmConfig, schemaCfg, maxChunkAge, storage, nil, nil, nil)
 	require.NoError(t, err)
 
 	err = tableManager.SyncTables(context.Background())
@@ -91,9 +90,11 @@ func newTestChunkStoreConfigWithMockStorage(t require.TestingT, schemaCfg Schema
 	overrides, err := validation.NewOverrides(limits, nil)
 	require.NoError(t, err)
 
-	chunksCache, err := cache.New(storeCfg.ChunkCacheConfig)
+	reg := prometheus.NewRegistry()
+	logger := log.NewNopLogger()
+	chunksCache, err := cache.New(storeCfg.ChunkCacheConfig, reg, logger)
 	require.NoError(t, err)
-	writeDedupeCache, err := cache.New(storeCfg.WriteDedupeCacheConfig)
+	writeDedupeCache, err := cache.New(storeCfg.WriteDedupeCacheConfig, reg, logger)
 	require.NoError(t, err)
 
 	store := NewCompositeStore(nil)
@@ -178,8 +179,12 @@ func TestChunkStore_Get(t *testing.T) {
 			expect: []Chunk{fooChunk1},
 		},
 		{
+			query:  `foo{a="b", bar="baz"}`,
+			expect: nil,
+		},
+		{
 			query: `{__name__=~"foo"}`,
-			err:   "rpc error: code = Code(400) desc = query must contain metric name",
+			err:   "query must contain metric name",
 		},
 	}
 	for _, schema := range schemas {
@@ -200,7 +205,7 @@ func TestChunkStore_Get(t *testing.T) {
 			for _, tc := range testCases {
 				t.Run(fmt.Sprintf("%s / %s / %s", tc.query, schema, storeCase.name), func(t *testing.T) {
 					t.Log("========= Running query", tc.query, "with schema", schema)
-					matchers, err := promql.ParseMetricSelector(tc.query)
+					matchers, err := parser.ParseMetricSelector(tc.query)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -500,6 +505,10 @@ func TestChunkStore_getMetricNameChunks(t *testing.T) {
 			[]Chunk{chunk1, chunk2},
 		},
 		{
+			`foo{bar=~"beeping|baz"}`,
+			[]Chunk{chunk1},
+		},
+		{
 			`foo{toms="code", bar=~"beep|baz"}`,
 			[]Chunk{chunk1, chunk2},
 		},
@@ -521,7 +530,7 @@ func TestChunkStore_getMetricNameChunks(t *testing.T) {
 			for _, tc := range testCases {
 				t.Run(fmt.Sprintf("%s / %s / %s", tc.query, schema, storeCase.name), func(t *testing.T) {
 					t.Log("========= Running query", tc.query, "with schema", schema)
-					matchers, err := promql.ParseMetricSelector(tc.query)
+					matchers, err := parser.ParseMetricSelector(tc.query)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -536,177 +545,6 @@ func TestChunkStore_getMetricNameChunks(t *testing.T) {
 			}
 		}
 	}
-}
-
-// TestChunkStore_verifyRegexSetOptimizations tests if chunks are fetched correctly when we have the metric name
-func TestChunkStore_verifyRegexSetOptimizations(t *testing.T) {
-	ctx := context.Background()
-	now := model.Now()
-
-	testCases := []struct {
-		query  string
-		expect []string
-	}{
-		{
-			`foo`,
-			[]string{"foo"},
-		},
-		{
-			`foo{bar="baz"}`,
-			[]string{"foo{bar=\"baz\"}"},
-		},
-		{
-			`foo{bar!="baz"}`,
-			[]string{"foo"},
-		},
-		{
-			`foo{toms="code", bar="beep"}`,
-			[]string{"foo{bar=\"beep\"}", "foo{toms=\"code\"}"},
-		},
-		{
-			`foo{bar=~"beep"}`,
-			[]string{"foo{bar=\"beep\"}"},
-		},
-		{
-			`foo{bar=~"beep|baz"}`,
-			[]string{"foo{bar=\"baz\"}", "foo{bar=\"beep\"}"},
-		},
-		{
-			`foo{toms="code", bar=~"beep|baz"}`,
-			[]string{"foo{bar=\"baz\"}", "foo{bar=\"beep\"}", "foo{toms=\"code\"}"},
-		},
-		{
-			`foo{bar=~".+"}`,
-			[]string{"foo{bar}"},
-		},
-	}
-
-	for _, schema := range schemas {
-		var storeCfg StoreConfig
-		flagext.DefaultValues(&storeCfg)
-
-		schemaCfg := DefaultSchemaConfig("", schema, 0)
-		schemaObj, err := schemaCfg.Configs[0].CreateSchema()
-		require.NoError(t, err)
-
-		var mockSchema = &mockBaseSchema{schema: schemaObj}
-
-		switch s := schemaObj.(type) {
-		case StoreSchema:
-			schemaObj = mockStoreSchema{mockBaseSchema: mockSchema, schema: s}
-		case SeriesStoreSchema:
-			schemaObj = mockSeriesStoreSchema{mockBaseSchema: mockSchema, schema: s}
-		}
-
-		store := newTestChunkStoreConfigWithMockStorage(t, schemaCfg, schemaObj, storeCfg)
-		defer store.Stop()
-
-		from := now.Add(-time.Hour)
-		through := now
-
-		for _, tc := range testCases {
-			t.Run(fmt.Sprintf("%s / %s", tc.query, schema), func(t *testing.T) {
-				// reset queries for test
-				mockSchema.resetQueries()
-
-				t.Log("========= Running query", tc.query, "with schema", schema)
-				matchers, err := promql.ParseMetricSelector(tc.query)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				_, err = store.Get(ctx, userID, from, through, matchers...)
-				require.NoError(t, err)
-
-				qs := mockSchema.getQueries()
-				sort.Strings(qs)
-
-				if !reflect.DeepEqual(tc.expect, qs) {
-					t.Fatalf("%s: wrong queries - %s", tc.query, test.Diff(tc.expect, qs))
-				}
-			})
-		}
-	}
-}
-
-type mockBaseSchema struct {
-	schema BaseSchema
-
-	mu      sync.Mutex
-	queries []string
-}
-
-func (m *mockBaseSchema) getQueries() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.queries
-}
-
-func (m *mockBaseSchema) resetQueries() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.queries = nil
-}
-
-func (m *mockBaseSchema) GetReadQueriesForMetric(from, through model.Time, userID string, metricName string) ([]IndexQuery, error) {
-	m.mu.Lock()
-	m.queries = append(m.queries, metricName)
-	m.mu.Unlock()
-
-	return m.schema.GetReadQueriesForMetric(from, through, userID, metricName)
-}
-
-func (m *mockBaseSchema) GetReadQueriesForMetricLabel(from, through model.Time, userID string, metricName string, labelName string) ([]IndexQuery, error) {
-	m.mu.Lock()
-	m.queries = append(m.queries, fmt.Sprintf("%s{%s}", metricName, labelName))
-	m.mu.Unlock()
-
-	return m.schema.GetReadQueriesForMetricLabel(from, through, userID, metricName, labelName)
-}
-
-func (m *mockBaseSchema) GetReadQueriesForMetricLabelValue(from, through model.Time, userID string, metricName string, labelName string, labelValue string) ([]IndexQuery, error) {
-	m.mu.Lock()
-	m.queries = append(m.queries, fmt.Sprintf("%s{%s=%q}", metricName, labelName, labelValue))
-	m.mu.Unlock()
-	return m.schema.GetReadQueriesForMetricLabelValue(from, through, userID, metricName, labelName, labelValue)
-}
-
-func (m *mockBaseSchema) FilterReadQueries(queries []IndexQuery, shard *astmapper.ShardAnnotation) []IndexQuery {
-	return m.schema.FilterReadQueries(queries, shard)
-}
-
-type mockStoreSchema struct {
-	*mockBaseSchema
-	schema StoreSchema
-}
-
-func (m mockStoreSchema) GetWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error) {
-	return m.schema.GetWriteEntries(from, through, userID, metricName, labels, chunkID)
-}
-
-type mockSeriesStoreSchema struct {
-	*mockBaseSchema
-	schema SeriesStoreSchema
-}
-
-func (m mockSeriesStoreSchema) GetCacheKeysAndLabelWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]string, [][]IndexEntry, error) {
-	return m.schema.GetCacheKeysAndLabelWriteEntries(from, through, userID, metricName, labels, chunkID)
-}
-
-func (m mockSeriesStoreSchema) GetChunkWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error) {
-	return m.schema.GetChunkWriteEntries(from, through, userID, metricName, labels, chunkID)
-}
-
-func (m mockSeriesStoreSchema) GetChunksForSeries(from, through model.Time, userID string, seriesID []byte) ([]IndexQuery, error) {
-	return m.schema.GetChunksForSeries(from, through, userID, seriesID)
-}
-
-func (m mockSeriesStoreSchema) GetLabelNamesForSeries(from, through model.Time, userID string, seriesID []byte) ([]IndexQuery, error) {
-	return m.schema.GetLabelNamesForSeries(from, through, userID, seriesID)
-}
-
-func (m mockSeriesStoreSchema) GetSeriesDeleteEntries(from, through model.Time, userID string, metric labels.Labels, hasChunksForIntervalFunc hasChunksForIntervalFunc) ([]IndexEntry, error) {
-	return m.schema.GetSeriesDeleteEntries(from, through, userID, metric, hasChunksForIntervalFunc)
 }
 
 func mustNewLabelMatcher(matchType labels.MatchType, name string, value string) *labels.Matcher {
@@ -861,14 +699,14 @@ func TestIndexCachingWorks(t *testing.T) {
 	store := newTestChunkStoreConfig(t, "v9", storeCfg)
 	defer store.Stop()
 
-	storage := store.(CompositeStore).stores[0].Store.(*seriesStore).storage.(*MockStorage)
+	storage := store.(CompositeStore).stores[0].Store.(*seriesStore).fetcher.storage.(*MockStorage)
 
 	fooChunk1 := dummyChunkFor(model.Time(0).Add(15*time.Second), metric)
 	err := fooChunk1.Encode()
 	require.NoError(t, err)
 	err = store.Put(ctx, []Chunk{fooChunk1})
 	require.NoError(t, err)
-	n := storage.numWrites
+	n := storage.numIndexWrites
 
 	// Only one extra entry for the new chunk of same series.
 	fooChunk2 := dummyChunkFor(model.Time(0).Add(30*time.Second), metric)
@@ -876,7 +714,7 @@ func TestIndexCachingWorks(t *testing.T) {
 	require.NoError(t, err)
 	err = store.Put(ctx, []Chunk{fooChunk2})
 	require.NoError(t, err)
-	require.Equal(t, n+1, storage.numWrites)
+	require.Equal(t, n+1, storage.numIndexWrites)
 }
 
 func BenchmarkIndexCaching(b *testing.B) {
@@ -908,25 +746,25 @@ func TestChunkStoreError(t *testing.T) {
 			query:   "foo",
 			from:    model.Time(0).Add(31 * 24 * time.Hour),
 			through: model.Time(0),
-			err:     "rpc error: code = Code(400) desc = invalid query, through < from (0 < 2678400)",
+			err:     "invalid query, through < from (0 < 2678400)",
 		},
 		{
 			query:   "foo",
 			from:    model.Time(0),
 			through: model.Time(0).Add(31 * 24 * time.Hour),
-			err:     "rpc error: code = Code(400) desc = invalid query, length > limit (744h0m0s > 720h0m0s)",
+			err:     "the query time range exceeds the limit (query length: 744h0m0s, limit: 720h0m0s)",
 		},
 		{
 			query:   "{foo=\"bar\"}",
 			from:    model.Time(0),
 			through: model.Time(0).Add(1 * time.Hour),
-			err:     "rpc error: code = Code(400) desc = query must contain metric name",
+			err:     "query must contain metric name",
 		},
 		{
 			query:   "{__name__=~\"bar\"}",
 			from:    model.Time(0),
 			through: model.Time(0).Add(1 * time.Hour),
-			err:     "rpc error: code = Code(400) desc = query must contain metric name",
+			err:     "query must contain metric name",
 		},
 	} {
 		for _, schema := range schemas {
@@ -934,7 +772,7 @@ func TestChunkStoreError(t *testing.T) {
 				store := newTestChunkStore(t, schema)
 				defer store.Stop()
 
-				matchers, err := promql.ParseMetricSelector(tc.query)
+				matchers, err := parser.ParseMetricSelector(tc.query)
 				require.NoError(t, err)
 
 				// Query with ordinary time-range
@@ -981,7 +819,7 @@ func TestStoreMaxLookBack(t *testing.T) {
 	err = storeWithLookBackLimit.Put(ctx, []Chunk{fooChunk2})
 	require.NoError(t, err)
 
-	matchers, err := promql.ParseMetricSelector(`foo{bar="baz"}`)
+	matchers, err := parser.ParseMetricSelector(`foo{bar="baz"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,13 +836,13 @@ func TestStoreMaxLookBack(t *testing.T) {
 	require.Equal(t, now, chunks[0].Through)
 }
 
-func benchmarkParseIndexEntries(i int64, b *testing.B) {
+func benchmarkParseIndexEntries(i int64, regex string, b *testing.B) {
 	b.ReportAllocs()
 	b.StopTimer()
 	store := &store{}
 	ctx := context.Background()
 	entries := generateIndexEntries(i)
-	matcher, err := labels.NewMatcher(labels.MatchRegexp, "", ".*")
+	matcher, err := labels.NewMatcher(labels.MatchRegexp, "", regex)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1014,16 +852,29 @@ func benchmarkParseIndexEntries(i int64, b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if len(keys) != len(entries)/2 {
+		if regex == ".*" && len(keys) != len(entries)/2 {
 			b.Fatalf("expected keys:%d got:%d", len(entries)/2, len(keys))
 		}
 	}
 }
 
-func BenchmarkParseIndexEntries500(b *testing.B)   { benchmarkParseIndexEntries(500, b) }
-func BenchmarkParseIndexEntries2500(b *testing.B)  { benchmarkParseIndexEntries(2500, b) }
-func BenchmarkParseIndexEntries10000(b *testing.B) { benchmarkParseIndexEntries(10000, b) }
-func BenchmarkParseIndexEntries50000(b *testing.B) { benchmarkParseIndexEntries(50000, b) }
+func BenchmarkParseIndexEntries500(b *testing.B)   { benchmarkParseIndexEntries(500, ".*", b) }
+func BenchmarkParseIndexEntries2500(b *testing.B)  { benchmarkParseIndexEntries(2500, ".*", b) }
+func BenchmarkParseIndexEntries10000(b *testing.B) { benchmarkParseIndexEntries(10000, ".*", b) }
+func BenchmarkParseIndexEntries50000(b *testing.B) { benchmarkParseIndexEntries(50000, ".*", b) }
+
+func BenchmarkParseIndexEntriesRegexSet500(b *testing.B) {
+	benchmarkParseIndexEntries(500, "labelvalue0|labelvalue1|labelvalue2|labelvalue3|labelvalue600", b)
+}
+func BenchmarkParseIndexEntriesRegexSet2500(b *testing.B) {
+	benchmarkParseIndexEntries(2500, "labelvalue0|labelvalue1|labelvalue2|labelvalue3|labelvalue600", b)
+}
+func BenchmarkParseIndexEntriesRegexSet10000(b *testing.B) {
+	benchmarkParseIndexEntries(10000, "labelvalue0|labelvalue1|labelvalue2|labelvalue3|labelvalue600", b)
+}
+func BenchmarkParseIndexEntriesRegexSet50000(b *testing.B) {
+	benchmarkParseIndexEntries(50000, "labelvalue0|labelvalue1|labelvalue2|labelvalue3|labelvalue600", b)
+}
 
 func generateIndexEntries(n int64) []IndexEntry {
 	res := make([]IndexEntry, 0, n)
@@ -1089,7 +940,7 @@ func TestStore_DeleteChunk(t *testing.T) {
 
 	nonExistentChunk := dummyChunkForEncoding(model.Now(), metric3, encoding.Varbit, 200)
 
-	fooMetricNameMatcher, err := promql.ParseMetricSelector(`foo`)
+	fooMetricNameMatcher, err := parser.ParseMetricSelector(`foo`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1175,7 +1026,7 @@ func TestStore_DeleteChunk(t *testing.T) {
 				}
 				require.NoError(t, err)
 
-				matchersForDeletedChunk, err := promql.ParseMetricSelector(tc.chunkToDelete.Metric.String())
+				matchersForDeletedChunk, err := parser.ParseMetricSelector(tc.chunkToDelete.Metric.String())
 				require.NoError(t, err)
 
 				var nonDeletedIntervals []model.Interval
@@ -1218,7 +1069,7 @@ func TestStore_DeleteSeriesIDs(t *testing.T) {
 		{Name: "bar", Value: "baz2"},
 	}
 
-	matchers, err := promql.ParseMetricSelector(`foo`)
+	matchers, err := parser.ParseMetricSelector(`foo`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1300,4 +1151,54 @@ func TestStore_DeleteSeriesIDs(t *testing.T) {
 			require.Equal(t, string(labelsSeriesID(fooChunk2.Metric)), seriesIDs[0])
 		})
 	}
+}
+
+func TestDisableIndexDeduplication(t *testing.T) {
+	for i, disableIndexDeduplication := range []bool{
+		false, true,
+	} {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			ctx := context.Background()
+			metric := labels.Labels{
+				{Name: labels.MetricName, Value: "foo"},
+				{Name: "bar", Value: "baz"},
+			}
+			storeMaker := stores[0]
+			storeCfg := storeMaker.configFn()
+			storeCfg.ChunkCacheConfig.Cache = cache.NewFifoCache("chunk-cache", cache.FifoCacheConfig{
+				MaxSizeItems: 5,
+			}, prometheus.NewRegistry(), log.NewNopLogger())
+			storeCfg.DisableIndexDeduplication = disableIndexDeduplication
+
+			store := newTestChunkStoreConfig(t, "v9", storeCfg)
+			defer store.Stop()
+
+			storage := store.(CompositeStore).stores[0].Store.(*seriesStore).fetcher.storage.(*MockStorage)
+
+			fooChunk1 := dummyChunkFor(model.Time(0).Add(15*time.Second), metric)
+			err := fooChunk1.Encode()
+			require.NoError(t, err)
+			err = store.Put(ctx, []Chunk{fooChunk1})
+			require.NoError(t, err)
+			n := storage.numIndexWrites
+
+			// see if we have written the chunk to the store
+			require.Equal(t, 1, storage.numChunkWrites)
+
+			// Put the same chunk again
+			err = store.Put(ctx, []Chunk{fooChunk1})
+			require.NoError(t, err)
+
+			expectedTotalWrites := n
+			if disableIndexDeduplication {
+				expectedTotalWrites *= 2
+			}
+			require.Equal(t, expectedTotalWrites, storage.numIndexWrites)
+
+			// see if we deduped the chunk and the number of chunks we wrote is still 1
+			require.Equal(t, 1, storage.numChunkWrites)
+		})
+
+	}
+
 }

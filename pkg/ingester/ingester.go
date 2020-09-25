@@ -71,9 +71,9 @@ type Config struct {
 
 	RateUpdatePeriod time.Duration `yaml:"rate_update_period"`
 
-	// Use tsdb block storage
-	TSDBEnabled bool        `yaml:"-"`
-	TSDBConfig  tsdb.Config `yaml:"-"`
+	// Use blocks storage.
+	BlocksStorageEnabled bool                     `yaml:"-"`
+	BlocksStorageConfig  tsdb.BlocksStorageConfig `yaml:"-"`
 
 	// Injected at runtime and read from the distributor config, required
 	// to accurately apply global limits.
@@ -88,7 +88,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
 	cfg.WALConfig.RegisterFlags(f)
 
-	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing. Negative value or zero disables hand-over.")
+	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing. Negative value or zero disables hand-over. This feature is supported only by the chunks storage.")
 
 	f.DurationVar(&cfg.FlushCheckPeriod, "ingester.flush-period", 1*time.Minute, "Period with which to attempt to flush chunks.")
 	f.DurationVar(&cfg.RetainPeriod, "ingester.retain-period", 5*time.Minute, "Period chunks will remain in memory after flushing.")
@@ -108,7 +108,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 // Ingester deals with "in flight" chunks.  Based on Prometheus 1.x
 // MemorySeriesStorage.
 type Ingester struct {
-	services.Service
+	*services.BasicService
 
 	cfg          Config
 	clientConfig client.Config
@@ -139,8 +139,9 @@ type Ingester struct {
 	// To be passed to the WAL.
 	registerer prometheus.Registerer
 
-	// Hook for injecting behaviour from tests.
+	// Hooks for injecting behaviour from tests.
 	preFlushUserSeries func()
+	preFlushChunks     func()
 
 	// Prometheus block storage
 	TSDBState TSDBState
@@ -157,7 +158,7 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 		cfg.ingesterClientFactory = client.MakeIngesterClient
 	}
 
-	if cfg.TSDBEnabled {
+	if cfg.BlocksStorageEnabled {
 		return NewV2(cfg, clientConfig, limits, registerer)
 	}
 
@@ -199,7 +200,7 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 	// During WAL recovery, it will create new user states which requires the limiter.
 	// Hence initialise the limiter before creating the WAL.
 	// The '!cfg.WALConfig.WALEnabled' argument says don't flush on shutdown if the WAL is enabled.
-	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", ring.IngesterRingKey, !cfg.WALConfig.WALEnabled)
+	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester", ring.IngesterRingKey, !cfg.WALConfig.WALEnabled || cfg.WALConfig.FlushOnShutdown, registerer)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +208,7 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 	i.subservicesWatcher = services.NewFailureWatcher()
 	i.subservicesWatcher.WatchService(i.lifecycler)
 
-	i.Service = services.NewBasicService(i.starting, i.loop, i.stopping)
+	i.BasicService = services.NewBasicService(i.starting, i.loop, i.stopping)
 	return i, nil
 }
 
@@ -261,22 +262,21 @@ func (i *Ingester) startFlushLoops() {
 // Compared to the 'New' method:
 //   * Always replays the WAL.
 //   * Does not start the lifecycler.
-//   * No ingester v2.
-func NewForFlusher(cfg Config, clientConfig client.Config, chunkStore ChunkStore, registerer prometheus.Registerer) (*Ingester, error) {
-	if cfg.ingesterClientFactory == nil {
-		cfg.ingesterClientFactory = client.MakeIngesterClient
+func NewForFlusher(cfg Config, chunkStore ChunkStore, limits *validation.Overrides, registerer prometheus.Registerer) (*Ingester, error) {
+	if cfg.BlocksStorageEnabled {
+		return NewV2ForFlusher(cfg, registerer)
 	}
 
 	i := &Ingester{
-		cfg:          cfg,
-		clientConfig: clientConfig,
-		metrics:      newIngesterMetrics(registerer, true),
-		chunkStore:   chunkStore,
-		flushQueues:  make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
-		wal:          &noopWAL{},
+		cfg:         cfg,
+		metrics:     newIngesterMetrics(registerer, true),
+		chunkStore:  chunkStore,
+		flushQueues: make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		wal:         &noopWAL{},
+		limits:      limits,
 	}
 
-	i.Service = services.NewBasicService(i.startingForFlusher, i.loop, i.stopping)
+	i.BasicService = services.NewBasicService(i.startingForFlusher, i.loopForFlusher, i.stopping)
 	return i, nil
 }
 
@@ -296,6 +296,18 @@ func (i *Ingester) startingForFlusher(ctx context.Context) error {
 
 	i.startFlushLoops()
 	return nil
+}
+
+func (i *Ingester) loopForFlusher(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case err := <-i.subservicesWatcher.Chan():
+			return errors.Wrap(err, "ingester subservice failed")
+		}
+	}
 }
 
 func (i *Ingester) loop(ctx context.Context) error {
@@ -380,7 +392,7 @@ func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2Push(ctx, req)
 	}
 
@@ -433,17 +445,17 @@ func (i *Ingester) Push(ctx context.Context, req *client.WriteRequest) (*client.
 		}
 	}
 
-	if firstPartialErr != nil {
-		// grpcForwardableError turns the error into a string so it no longer references `req`
-		return &client.WriteResponse{}, grpcForwardableError(userID, firstPartialErr.code, firstPartialErr)
-	}
-
 	if record != nil {
 		// Log the record only if there was no error in ingestion.
 		if err := i.wal.Log(record); err != nil {
 			return nil, err
 		}
 		recordPool.Put(record)
+	}
+
+	if firstPartialErr != nil {
+		// grpcForwardableError turns the error into a string so it no longer references `req`
+		return &client.WriteResponse{}, grpcForwardableError(userID, firstPartialErr.code, firstPartialErr)
 	}
 
 	return &client.WriteResponse{}, nil
@@ -620,7 +632,7 @@ func (i *Ingester) Query(ctx context.Context, req *client.QueryRequest) (*client
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2Query(ctx, req)
 	}
 
@@ -687,11 +699,12 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 		return err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2QueryStream(req, stream)
 	}
 
 	log, ctx := spanlogger.New(stream.Context(), "QueryStream")
+	defer log.Finish()
 
 	from, through, matchers, err := client.FromQueryRequest(req)
 	if err != nil {
@@ -710,6 +723,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 	}
 
 	numSeries, numChunks := 0, 0
+	reuseWireChunks := [queryStreamBatchSize][]client.Chunk{}
 	batch := make([]client.TimeSeriesChunk, 0, queryStreamBatchSize)
 	// We'd really like to have series in label order, not FP order, so we
 	// can iteratively merge them with entries coming from the chunk store.  But
@@ -728,10 +742,12 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 		}
 
 		numSeries++
-		wireChunks, err := toWireChunks(chunks, nil)
+		reusePos := len(batch)
+		wireChunks, err := toWireChunks(chunks, reuseWireChunks[reusePos])
 		if err != nil {
 			return err
 		}
+		reuseWireChunks[reusePos] = wireChunks
 
 		numChunks += len(wireChunks)
 		batch = append(batch, client.TimeSeriesChunk{
@@ -767,7 +783,7 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2LabelValues(ctx, req)
 	}
 
@@ -792,7 +808,7 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2LabelNames(ctx, req)
 	}
 
@@ -817,7 +833,7 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2MetricsForLabelMatchers(ctx, req)
 	}
 
@@ -887,7 +903,7 @@ func (i *Ingester) UserStats(ctx context.Context, req *client.UserStatsRequest) 
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2UserStats(ctx, req)
 	}
 
@@ -916,7 +932,7 @@ func (i *Ingester) AllUserStats(ctx context.Context, req *client.UserStatsReques
 		return nil, err
 	}
 
-	if i.cfg.TSDBEnabled {
+	if i.cfg.BlocksStorageEnabled {
 		return i.v2AllUserStats(ctx, req)
 	}
 

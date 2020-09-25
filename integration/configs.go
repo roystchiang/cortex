@@ -1,9 +1,10 @@
 // +build requires_docker
 
-package main
+package integration
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -17,21 +18,41 @@ type storeConfig struct {
 }
 
 const (
-	networkName            = "e2e-cortex-test"
+	defaultNetworkName     = "e2e-cortex-test"
 	bucketName             = "cortex"
 	cortexConfigFile       = "config.yaml"
 	cortexSchemaConfigFile = "schema.yaml"
-	blocksStorageEngine    = "tsdb"
-	storeConfigTemplate    = `
+	blocksStorageEngine    = "blocks"
+	clientCertFile         = "certs/client.crt"
+	clientKeyFile          = "certs/client.key"
+	caCertFile             = "certs/root.crt"
+	serverCertFile         = "certs/server.crt"
+	serverKeyFile          = "certs/server.key"
+)
+
+// GetNetworkName returns the docker network name to run tests within.
+func GetNetworkName() string {
+	// If the E2E_NETWORK_NAME is set, use that for the network name.
+	// Otherwise, return the default network name.
+	if os.Getenv("E2E_NETWORK_NAME") != "" {
+		return os.Getenv("E2E_NETWORK_NAME")
+	}
+
+	return defaultNetworkName
+}
+
+var (
+	networkName         = GetNetworkName()
+	storeConfigTemplate = `
 - from: {{.From}}
   store: {{.IndexStore}}
   schema: v9
   index:
     prefix: cortex_
-    period: 168h 
+    period: 168h
   chunks:
     prefix: cortex_chunks_
-    period: 168h 
+    period: 168h
 `
 
 	cortexAlertmanagerUserConfigYaml = `route:
@@ -40,15 +61,38 @@ const (
 receivers:
   - name: "example_receiver"
 `
+
+	cortexRulerUserConfigYaml = `groups:
+- name: rule
+  interval: 100s
+  rules:
+  - record: test_rule
+    alert: ""
+    expr: up
+    for: 0s
+    labels: {}
+    annotations: {}	
+`
 )
 
 var (
 	cortexSchemaConfigYaml = buildSchemaConfigWith([]storeConfig{{From: "2019-03-20", IndexStore: "aws-dynamo"}})
 
 	AlertmanagerFlags = map[string]string{
-		"-alertmanager.storage.local.path": filepath.Join(e2e.ContainerSharedDir, "alertmanager_configs"),
+		"-alertmanager.configs.poll-interval": "1s",
+		"-alertmanager.web.external-url":      "http://localhost/api/prom",
+	}
+
+	AlertmanagerLocalFlags = map[string]string{
 		"-alertmanager.storage.type":       "local",
-		"-alertmanager.web.external-url":   "http://localhost/api/prom",
+		"-alertmanager.storage.local.path": filepath.Join(e2e.ContainerSharedDir, "alertmanager_configs"),
+	}
+
+	AlertmanagerS3Flags = map[string]string{
+		"-alertmanager.storage.type":                "s3",
+		"-alertmanager.storage.s3.buckets":          "cortex-alerts",
+		"-alertmanager.storage.s3.force-path-style": "true",
+		"-alertmanager.storage.s3.url":              fmt.Sprintf("s3://%s:%s@%s-minio-9000.:9000", e2edb.MinioAccessKey, e2edb.MinioSecretKey, networkName),
 	}
 
 	RulerConfigs = map[string]string{
@@ -63,28 +107,30 @@ var (
 
 	BlocksStorageFlags = map[string]string{
 		"-store.engine":                                 blocksStorageEngine,
-		"-experimental.tsdb.backend":                    "s3",
-		"-experimental.tsdb.block-ranges-period":        "1m",
-		"-experimental.tsdb.bucket-store.sync-interval": "5s",
-		"-experimental.tsdb.retention-period":           "5m",
-		"-experimental.tsdb.ship-interval":              "1m",
-		"-experimental.tsdb.head-compaction-interval":   "1s",
-		"-experimental.tsdb.s3.access-key-id":           e2edb.MinioAccessKey,
-		"-experimental.tsdb.s3.secret-access-key":       e2edb.MinioSecretKey,
-		"-experimental.tsdb.s3.bucket-name":             bucketName,
-		"-experimental.tsdb.s3.endpoint":                fmt.Sprintf("%s-minio-9000:9000", networkName),
-		"-experimental.tsdb.s3.insecure":                "true",
+		"-blocks-storage.backend":                       "s3",
+		"-blocks-storage.tsdb.block-ranges-period":      "1m",
+		"-blocks-storage.bucket-store.sync-interval":    "5s",
+		"-blocks-storage.tsdb.retention-period":         "5m",
+		"-blocks-storage.tsdb.ship-interval":            "1m",
+		"-blocks-storage.tsdb.head-compaction-interval": "1s",
+		"-blocks-storage.s3.access-key-id":              e2edb.MinioAccessKey,
+		"-blocks-storage.s3.secret-access-key":          e2edb.MinioSecretKey,
+		"-blocks-storage.s3.bucket-name":                bucketName,
+		"-blocks-storage.s3.endpoint":                   fmt.Sprintf("%s-minio-9000:9000", networkName),
+		"-blocks-storage.s3.insecure":                   "true",
 	}
 
 	BlocksStorageConfig = buildConfigFromTemplate(`
 storage:
-  engine: tsdb
+  engine: blocks
 
-tsdb:
+blocks_storage:
   backend:             s3
-  block_ranges_period: ["1m"]
-  retention_period:    5m
-  ship_interval:       1m
+
+  tsdb:
+    block_ranges_period: ["1m"]
+    retention_period:    5m
+    ship_interval:       1m
 
   bucket_store:
     sync_interval: 5s
@@ -120,7 +166,7 @@ storage:
 
 table_manager:
   poll_interval:    1m
-  retention_period: 168h 
+  retention_period: 168h
 
 schema:
 {{.SchemaConfig}}

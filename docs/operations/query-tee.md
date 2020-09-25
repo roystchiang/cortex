@@ -35,6 +35,15 @@ The following Prometheus API endpoints are supported by `query-tee`:
 - `/api/v1/labels` (GET)
 - `/api/v1/label/{name}/values` (GET)
 - `/api/v1/series` (GET)
+- `/api/v1/metadata` (GET)
+- `/api/v1/alerts` (GET)
+- `/api/v1/rules` (GET)
+
+#### Pass-through requests
+
+`query-tee` supports acting as a transparent proxy for requests to routes not matching any of the documented API endpoints above.
+When enabled, those requests are passed on to just the configured preferred backend.
+To activate this feature it requires setting `-proxy.passthrough-non-registered-routes=true` flag and configuring a preferred backend.
 
 ### Authentication
 
@@ -63,6 +72,18 @@ When a preferred backend **is not set**, `query-tee` sends back to the client:
 
 _Note: from the `query-tee` perspective, a backend request is considered successful even if the status code is 4xx because it generally means the error is due to an invalid request and not to a backend issue._
 
+### Backend results comparison
+
+`query-tee` allows to optionally enable the query results comparison between two backends. The results comparison can be enabled via the CLI flag `-proxy.compare-responses=true` and requires exactly two configured backends with a preferred one.
+
+When the comparison is enabled, the `query-tee` compares the response received from the two configured backends and logs a message for each query whose results don't match, as well as keeps track of the number of successful and failed comparison through the metric `cortex_querytee_responses_compared_total`.
+
+Floating point sample values are compared with a small tolerance that can be configured via `-proxy.value-comparison-tolerance`. This prevents false positives due to differences in floating point values _rounding_ introduced by the non deterministic series ordering within the Prometheus PromQL engine.
+
+### Slow backends
+
+`query-tee` sends back to the client the first viable response as soon as available, without waiting to receive a response from all backends.
+
 ### Exported metrics
 
 `query-tee` exposes the following Prometheus metrics on the port configured via the CLI flag `-server.metrics-port`:
@@ -73,4 +94,12 @@ _Note: from the `query-tee` perspective, a backend request is considered success
 cortex_querytee_request_duration_seconds_bucket{backend="<hostname>",method="<method>",route="<route>",status_code="<status>",le="<bucket>"}
 cortex_querytee_request_duration_seconds_sum{backend="<hostname>",method="<method>",route="<route>",status_code="<status>"}
 cortex_querytee_request_duration_seconds_count{backend="<hostname>",method="<method>",route="<route>",status_code="<status>"}
+
+# HELP cortex_querytee_responses_total Total number of responses sent back to the client by the selected backend.
+# TYPE cortex_querytee_responses_total counter
+cortex_querytee_responses_total{backend="<hostname>",method="<method>",route="<route>"}
+
+# HELP cortex_querytee_responses_compared_total Total number of responses compared per route name by result.
+# TYPE cortex_querytee_responses_compared_total counter
+cortex_querytee_responses_compared_total{route="<route>",result="<success|fail>"}
 ```

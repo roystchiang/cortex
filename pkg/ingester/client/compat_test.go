@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
+	"unsafe"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
+	"github.com/stretchr/testify/assert"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -113,13 +116,47 @@ func TestMetricMetadataToMetricTypeToMetricType(t *testing.T) {
 	}
 }
 
+func TestFromLabelAdaptersToLabels(t *testing.T) {
+	input := []LabelAdapter{{Name: "hello", Value: "world"}}
+	expected := labels.Labels{labels.Label{Name: "hello", Value: "world"}}
+	actual := FromLabelAdaptersToLabels(input)
+
+	assert.Equal(t, expected, actual)
+
+	// All strings must NOT be copied.
+	assert.Equal(t, uintptr(unsafe.Pointer(&input[0].Name)), uintptr(unsafe.Pointer(&actual[0].Name)))
+	assert.Equal(t, uintptr(unsafe.Pointer(&input[0].Value)), uintptr(unsafe.Pointer(&actual[0].Value)))
+}
+
+func TestFromLabelAdaptersToLabelsWithCopy(t *testing.T) {
+	input := []LabelAdapter{{Name: "hello", Value: "world"}}
+	expected := labels.Labels{labels.Label{Name: "hello", Value: "world"}}
+	actual := FromLabelAdaptersToLabelsWithCopy(input)
+
+	assert.Equal(t, expected, actual)
+
+	// All strings must be copied.
+	assert.NotEqual(t, uintptr(unsafe.Pointer(&input[0].Name)), uintptr(unsafe.Pointer(&actual[0].Name)))
+	assert.NotEqual(t, uintptr(unsafe.Pointer(&input[0].Value)), uintptr(unsafe.Pointer(&actual[0].Value)))
+}
+
 func TestQueryResponse(t *testing.T) {
 	want := buildTestMatrix(10, 10, 10)
 	have := FromQueryResponse(ToQueryResponse(want))
 	if !reflect.DeepEqual(have, want) {
 		t.Fatalf("Bad FromQueryResponse(ToQueryResponse) round trip")
 	}
+}
 
+func BenchmarkFromLabelAdaptersToLabelsWithCopy(b *testing.B) {
+	input := []LabelAdapter{
+		{Name: "hello", Value: "world"},
+		{Name: "some label", Value: "and its value"},
+		{Name: "long long long long long label name", Value: "perhaps even longer label value, but who's counting anyway?"}}
+
+	for i := 0; i < b.N; i++ {
+		FromLabelAdaptersToLabelsWithCopy(input)
+	}
 }
 
 // This test shows label sets with same fingerprints, and also shows how to easily create new collisions
@@ -179,4 +216,54 @@ func verifyCollision(t *testing.T, collision bool, ls1 labels.Labels, ls2 labels
 	} else if !collision && Fingerprint(ls1) == Fingerprint(ls2) {
 		t.Errorf("expected different fingerprints for %v (%016x) and %v (%016x)", ls1.String(), Fingerprint(ls1), ls2.String(), Fingerprint(ls2))
 	}
+}
+
+// The main usecase for `LabelsToKeyString` is to generate hashKeys
+// for maps. We are benchmarking that here.
+func BenchmarkSeriesMap(b *testing.B) {
+	benchmarkSeriesMap(100000, b)
+}
+
+func benchmarkSeriesMap(numSeries int, b *testing.B) {
+	series := makeSeries(numSeries)
+	sm := make(map[string]int, numSeries)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		for i, s := range series {
+			sm[LabelsToKeyString(s)] = i
+		}
+
+		for _, s := range series {
+			_, ok := sm[LabelsToKeyString(s)]
+			if !ok {
+				b.Fatal("element missing")
+			}
+		}
+
+		if len(sm) != numSeries {
+			b.Fatal("the number of series expected:", numSeries, "got:", len(sm))
+		}
+	}
+}
+
+func makeSeries(n int) []labels.Labels {
+	series := make([]labels.Labels, 0, n)
+	for i := 0; i < n; i++ {
+		series = append(series, labels.FromMap(map[string]string{
+			"label0": "value0",
+			"label1": "value1",
+			"label2": "value2",
+			"label3": "value3",
+			"label4": "value4",
+			"label5": "value5",
+			"label6": "value6",
+			"label7": "value7",
+			"label8": "value8",
+			"label9": strconv.Itoa(i),
+		}))
+	}
+
+	return series
 }

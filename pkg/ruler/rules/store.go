@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/cortexproject/cortex/pkg/configs/userconfig"
+	"github.com/prometheus/prometheus/pkg/rulefmt"
 
 	"github.com/cortexproject/cortex/pkg/configs/client"
-
-	legacy_rulefmt "github.com/cortexproject/cortex/pkg/ruler/legacy_rulefmt"
+	"github.com/cortexproject/cortex/pkg/configs/userconfig"
 )
 
 var (
@@ -27,6 +26,7 @@ type RuleStore interface {
 	GetRuleGroup(ctx context.Context, userID, namespace, group string) (*RuleGroupDesc, error)
 	SetRuleGroup(ctx context.Context, userID, namespace string, group *RuleGroupDesc) error
 	DeleteRuleGroup(ctx context.Context, userID, namespace string, group string) error
+	DeleteNamespace(ctx context.Context, userID, namespace string) error
 }
 
 // RuleGroupList contains a set of rule groups
@@ -34,11 +34,11 @@ type RuleGroupList []*RuleGroupDesc
 
 // Formatted returns the rule group list as a set of formatted rule groups mapped
 // by namespace
-func (l RuleGroupList) Formatted() map[string][]legacy_rulefmt.RuleGroup {
-	ruleMap := map[string][]legacy_rulefmt.RuleGroup{}
+func (l RuleGroupList) Formatted() map[string][]rulefmt.RuleGroup {
+	ruleMap := map[string][]rulefmt.RuleGroup{}
 	for _, g := range l {
 		if _, exists := ruleMap[g.Namespace]; !exists {
-			ruleMap[g.Namespace] = []legacy_rulefmt.RuleGroup{FromProto(g)}
+			ruleMap[g.Namespace] = []rulefmt.RuleGroup{FromProto(g)}
 			continue
 		}
 		ruleMap[g.Namespace] = append(ruleMap[g.Namespace], FromProto(g))
@@ -128,5 +128,10 @@ func (c *ConfigRuleStore) SetRuleGroup(ctx context.Context, userID, namespace st
 
 // DeleteRuleGroup is not implemented
 func (c *ConfigRuleStore) DeleteRuleGroup(ctx context.Context, userID, namespace string, group string) error {
+	return errors.New("not implemented by the config service rule store")
+}
+
+// DeleteNamespace is not implemented
+func (c *ConfigRuleStore) DeleteNamespace(ctx context.Context, userID, namespace string) error {
 	return errors.New("not implemented by the config service rule store")
 }

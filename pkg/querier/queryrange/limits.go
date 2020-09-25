@@ -17,6 +17,7 @@ import (
 type Limits interface {
 	MaxQueryLength(string) time.Duration
 	MaxQueryParallelism(string) int
+	MaxCacheFreshness(string) time.Duration
 }
 
 type limits struct {
@@ -42,7 +43,7 @@ func (l limits) Do(ctx context.Context, r Request) (Response, error) {
 
 	maxQueryLen := l.MaxQueryLength(userid)
 	queryLen := timestamp.Time(r.GetEnd()).Sub(timestamp.Time(r.GetStart()))
-	if maxQueryLen != 0 && queryLen > maxQueryLen {
+	if maxQueryLen > 0 && queryLen > maxQueryLen {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, validation.ErrQueryTooLong, queryLen, maxQueryLen)
 	}
 	return l.next.Do(ctx, r)

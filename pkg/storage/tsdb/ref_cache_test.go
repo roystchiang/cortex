@@ -1,7 +1,10 @@
 package tsdb
 
 import (
+	"fmt"
+	"math/rand"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,6 +96,96 @@ func TestRefCache_Purge(t *testing.T) {
 			assert.Equal(t, false, ok)
 		}
 	}
+}
+
+var goroutines = []int{50, 100, 500}
+
+func BenchmarkRefCacheConcurrency_single_label(b *testing.B) {
+	const seriesCount = 1e5
+
+	series := make([]labels.Labels, seriesCount)
+
+	for s := 0; s < len(series); s++ {
+		series[s] = labels.Labels{
+			{Name: "a", Value: strconv.Itoa(s)},
+		}
+	}
+
+	for _, num := range goroutines {
+		b.Run(fmt.Sprintf("%d", num), func(b *testing.B) {
+			benchmarkRefCacheConcurrency(b, series, num)
+		})
+	}
+}
+
+func BenchmarkRefCacheConcurrency_long_labels(b *testing.B) {
+	const seriesCount = 1e4
+	const labelsCount = 10
+	const labelNameLength = 100
+	const labelValueLength = 1000
+
+	r := rand.New(rand.NewSource(0))
+
+	series := make([]labels.Labels, seriesCount)
+
+	for s := 0; s < len(series); s++ {
+		lbls := make([]labels.Label, labelsCount)
+		for l := 0; l < len(lbls); l++ {
+			lbls[l] = labels.Label{
+				Name:  generateStr(r, labelNameLength),
+				Value: generateStr(r, labelValueLength),
+			}
+		}
+
+		series[s] = lbls
+	}
+
+	for _, num := range goroutines {
+		b.Run(fmt.Sprintf("%d", num), func(b *testing.B) {
+			benchmarkRefCacheConcurrency(b, series, num)
+		})
+	}
+}
+
+var alphabet = "abcdefghijklmnopqrstuvxyz"
+
+func generateStr(r *rand.Rand, l int) string {
+	buf := make([]byte, l)
+	for i := 0; i < l; i++ {
+		buf[i] = alphabet[r.Intn(len(alphabet))]
+	}
+	return string(buf)
+}
+
+func benchmarkRefCacheConcurrency(b *testing.B, series []labels.Labels, goroutines int) {
+	c := NewRefCache()
+
+	fn := func(wg *sync.WaitGroup, start chan struct{}, step int) {
+		defer wg.Done()
+		<-start
+
+		for i := 0; i < b.N; i++ {
+			now := time.Now()
+
+			for s := 0; s < len(series); s += step {
+				_, ok := c.Ref(now, series[s])
+				if !ok {
+					c.SetRef(now, series[s], uint64(s))
+				}
+			}
+		}
+	}
+
+	start := make(chan struct{})
+	wg := &sync.WaitGroup{}
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go fn(wg, start, 1+(i%10))
+	}
+
+	b.ResetTimer()
+	close(start)
+	wg.Wait()
 }
 
 func BenchmarkRefCache_SetRef(b *testing.B) {

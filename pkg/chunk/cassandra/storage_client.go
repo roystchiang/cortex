@@ -10,8 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/gocql/gocql"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
@@ -38,10 +41,14 @@ type Config struct {
 	CustomAuthenticators     flagext.StringSlice `yaml:"custom_authenticators"`
 	Timeout                  time.Duration       `yaml:"timeout"`
 	ConnectTimeout           time.Duration       `yaml:"connect_timeout"`
+	ReconnectInterval        time.Duration       `yaml:"reconnect_interval"`
 	Retries                  int                 `yaml:"max_retries"`
 	MaxBackoff               time.Duration       `yaml:"retry_max_backoff"`
 	MinBackoff               time.Duration       `yaml:"retry_min_backoff"`
 	QueryConcurrency         int                 `yaml:"query_concurrency"`
+	NumConnections           int                 `yaml:"num_connections"`
+	ConvictHosts             bool                `yaml:"convict_hosts_on_failure"`
+	TableOptions             string              `yaml:"table_options"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -50,7 +57,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.Port, "cassandra.port", 9042, "Port that Cassandra is running on")
 	f.StringVar(&cfg.Keyspace, "cassandra.keyspace", "", "Keyspace to use in Cassandra.")
 	f.StringVar(&cfg.Consistency, "cassandra.consistency", "QUORUM", "Consistency level for Cassandra.")
-	f.IntVar(&cfg.ReplicationFactor, "cassandra.replication-factor", 1, "Replication factor to use in Cassandra.")
+	f.IntVar(&cfg.ReplicationFactor, "cassandra.replication-factor", 3, "Replication factor to use in Cassandra.")
 	f.BoolVar(&cfg.DisableInitialHostLookup, "cassandra.disable-initial-host-lookup", false, "Instruct the cassandra driver to not attempt to get host info from the system.peers table.")
 	f.BoolVar(&cfg.SSL, "cassandra.ssl", false, "Use SSL when connecting to cassandra instances.")
 	f.BoolVar(&cfg.HostVerification, "cassandra.host-verification", true, "Require SSL certificate validation.")
@@ -62,10 +69,14 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&cfg.CustomAuthenticators, "cassandra.custom-authenticator", "If set, when authenticating with cassandra a custom authenticator will be expected during the handshake. This flag can be set multiple times.")
 	f.DurationVar(&cfg.Timeout, "cassandra.timeout", 2*time.Second, "Timeout when connecting to cassandra.")
 	f.DurationVar(&cfg.ConnectTimeout, "cassandra.connect-timeout", 5*time.Second, "Initial connection timeout, used during initial dial to server.")
-	f.IntVar(&cfg.Retries, "cassandra.max-retries", 0, "Number of retries to perform on a request. (Default is 0: no retries)")
-	f.DurationVar(&cfg.MinBackoff, "cassandra.retry-min-backoff", 100*time.Millisecond, "Minimum time to wait before retrying a failed request. (Default = 100ms)")
-	f.DurationVar(&cfg.MaxBackoff, "cassandra.retry-max-backoff", 10*time.Second, "Maximum time to wait before retrying a failed request. (Default = 10s)")
-	f.IntVar(&cfg.QueryConcurrency, "cassandra.query-concurrency", 0, "Limit number of concurrent queries to Cassandra. (Default is 0: no limit)")
+	f.DurationVar(&cfg.ReconnectInterval, "cassandra.reconnent-interval", 1*time.Second, "Interval to retry connecting to cassandra nodes marked as DOWN.")
+	f.IntVar(&cfg.Retries, "cassandra.max-retries", 0, "Number of retries to perform on a request. Set to 0 to disable retries.")
+	f.DurationVar(&cfg.MinBackoff, "cassandra.retry-min-backoff", 100*time.Millisecond, "Minimum time to wait before retrying a failed request.")
+	f.DurationVar(&cfg.MaxBackoff, "cassandra.retry-max-backoff", 10*time.Second, "Maximum time to wait before retrying a failed request.")
+	f.IntVar(&cfg.QueryConcurrency, "cassandra.query-concurrency", 0, "Limit number of concurrent queries to Cassandra. Set to 0 to disable the limit.")
+	f.IntVar(&cfg.NumConnections, "cassandra.num-connections", 2, "Number of TCP connections per host.")
+	f.BoolVar(&cfg.ConvictHosts, "cassandra.convict-hosts-on-failure", true, "Convict hosts of being down on failure.")
+	f.StringVar(&cfg.TableOptions, "cassandra.table-options", "", "Table options used to create index or chunk tables. This value is used as plain text in the table `WITH` like this, \"CREATE TABLE <generated_by_cortex> (...) WITH <cassandra.table-options>\". For details, see https://cortexmetrics.io/docs/production/cassandra. By default it will use the default table options of your Cassandra cluster.")
 }
 
 func (cfg *Config) Validate() error {
@@ -78,20 +89,19 @@ func (cfg *Config) Validate() error {
 	return nil
 }
 
-func (cfg *Config) session() (*gocql.Session, error) {
-	consistency, err := gocql.ParseConsistencyWrapper(cfg.Consistency)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
+func (cfg *Config) session(name string, reg prometheus.Registerer) (*gocql.Session, error) {
 	cluster := gocql.NewCluster(strings.Split(cfg.Addresses, ",")...)
 	cluster.Port = cfg.Port
 	cluster.Keyspace = cfg.Keyspace
-	cluster.Consistency = consistency
 	cluster.BatchObserver = observer{}
 	cluster.QueryObserver = observer{}
 	cluster.Timeout = cfg.Timeout
 	cluster.ConnectTimeout = cfg.ConnectTimeout
+	cluster.ReconnectInterval = cfg.ReconnectInterval
+	cluster.NumConns = cfg.NumConnections
+	cluster.Logger = log.With(pkgutil.Logger, "module", "gocql", "client", name)
+	cluster.Registerer = prometheus.WrapRegistererWith(
+		prometheus.Labels{"client": name}, reg)
 	if cfg.Retries > 0 {
 		cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{
 			NumRetries: cfg.Retries,
@@ -99,7 +109,10 @@ func (cfg *Config) session() (*gocql.Session, error) {
 			Max:        cfg.MaxBackoff,
 		}
 	}
-	if err = cfg.setClusterConfig(cluster); err != nil {
+	if !cfg.ConvictHosts {
+		cluster.ConvictionPolicy = noopConvictionPolicy{}
+	}
+	if err := cfg.setClusterConfig(cluster); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -122,6 +135,12 @@ func (cfg *Config) session() (*gocql.Session, error) {
 
 // apply config settings to a cassandra ClusterConfig
 func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
+	consistency, err := gocql.ParseConsistencyWrapper(cfg.Consistency)
+	if err != nil {
+		return errors.Wrap(err, "unable to parse the configured consistency")
+	}
+
+	cluster.Consistency = consistency
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
 	if cfg.SSL {
@@ -197,15 +216,19 @@ func (cfg *Config) createKeyspace() error {
 type StorageClient struct {
 	cfg            Config
 	schemaCfg      chunk.SchemaConfig
-	session        *gocql.Session
+	readSession    *gocql.Session
+	writeSession   *gocql.Session
 	querySemaphore *semaphore.Weighted
 }
 
 // NewStorageClient returns a new StorageClient.
-func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig) (*StorageClient, error) {
-	pkgutil.WarnExperimentalUse("Cassandra Backend")
+func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig, registerer prometheus.Registerer) (*StorageClient, error) {
+	readSession, err := cfg.session("index-read", registerer)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
 
-	session, err := cfg.session()
+	writeSession, err := cfg.session("index-write", registerer)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -218,7 +241,8 @@ func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig) (*StorageClient,
 	client := &StorageClient{
 		cfg:            cfg,
 		schemaCfg:      schemaCfg,
-		session:        session,
+		readSession:    readSession,
+		writeSession:   writeSession,
 		querySemaphore: querySemaphore,
 	}
 	return client, nil
@@ -226,7 +250,8 @@ func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig) (*StorageClient,
 
 // Stop implement chunk.IndexClient.
 func (s *StorageClient) Stop() {
-	s.session.Close()
+	s.readSession.Close()
+	s.writeSession.Close()
 }
 
 // Cassandra batching isn't really useful in this case, its more to do multiple
@@ -263,7 +288,7 @@ func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 	b := batch.(*writeBatch)
 
 	for _, entry := range b.entries {
-		err := s.session.Query(fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES (?, ?, ?)",
+		err := s.writeSession.Query(fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES (?, ?, ?)",
 			entry.TableName), entry.HashValue, entry.RangeValue, entry.Value).WithContext(ctx).Exec()
 		if err != nil {
 			return errors.WithStack(err)
@@ -271,7 +296,7 @@ func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 	}
 
 	for _, entry := range b.deletes {
-		err := s.session.Query(fmt.Sprintf("DELETE FROM %s WHERE hash = ? and range = ?",
+		err := s.writeSession.Query(fmt.Sprintf("DELETE FROM %s WHERE hash = ? and range = ?",
 			entry.TableName), entry.HashValue, entry.RangeValue).WithContext(ctx).Exec()
 		if err != nil {
 			return errors.WithStack(err)
@@ -298,27 +323,27 @@ func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callb
 
 	switch {
 	case len(query.RangeValuePrefix) > 0 && query.ValueEqual == nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND range < ?",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND range < ?",
 			query.TableName), query.HashValue, query.RangeValuePrefix, append(query.RangeValuePrefix, '\xff'))
 
 	case len(query.RangeValuePrefix) > 0 && query.ValueEqual != nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND range < ? AND value = ? ALLOW FILTERING",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND range < ? AND value = ? ALLOW FILTERING",
 			query.TableName), query.HashValue, query.RangeValuePrefix, append(query.RangeValuePrefix, '\xff'), query.ValueEqual)
 
 	case len(query.RangeValueStart) > 0 && query.ValueEqual == nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ?",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ?",
 			query.TableName), query.HashValue, query.RangeValueStart)
 
 	case len(query.RangeValueStart) > 0 && query.ValueEqual != nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND value = ? ALLOW FILTERING",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND range >= ? AND value = ? ALLOW FILTERING",
 			query.TableName), query.HashValue, query.RangeValueStart, query.ValueEqual)
 
 	case query.ValueEqual == nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ?",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ?",
 			query.TableName), query.HashValue)
 
 	case query.ValueEqual != nil:
-		q = s.session.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? value = ? ALLOW FILTERING",
+		q = s.readSession.Query(fmt.Sprintf("SELECT range, value FROM %s WHERE hash = ? AND value = ? ALLOW FILTERING",
 			query.TableName), query.HashValue, query.ValueEqual)
 	}
 
@@ -370,8 +395,44 @@ func (b *readBatchIter) Value() []byte {
 	return b.value
 }
 
+// ObjectClient implements chunk.ObjectClient for Cassandra.
+type ObjectClient struct {
+	cfg            Config
+	schemaCfg      chunk.SchemaConfig
+	readSession    *gocql.Session
+	writeSession   *gocql.Session
+	querySemaphore *semaphore.Weighted
+}
+
+// NewObjectClient returns a new ObjectClient.
+func NewObjectClient(cfg Config, schemaCfg chunk.SchemaConfig, registerer prometheus.Registerer) (*ObjectClient, error) {
+	readSession, err := cfg.session("chunks-read", registerer)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	writeSession, err := cfg.session("chunks-write", registerer)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	var querySemaphore *semaphore.Weighted
+	if cfg.QueryConcurrency > 0 {
+		querySemaphore = semaphore.NewWeighted(int64(cfg.QueryConcurrency))
+	}
+
+	client := &ObjectClient{
+		cfg:            cfg,
+		schemaCfg:      schemaCfg,
+		readSession:    readSession,
+		writeSession:   writeSession,
+		querySemaphore: querySemaphore,
+	}
+	return client, nil
+}
+
 // PutChunks implements chunk.ObjectClient.
-func (s *StorageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) error {
+func (s *ObjectClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) error {
 	for i := range chunks {
 		buf, err := chunks[i].Encoded()
 		if err != nil {
@@ -384,7 +445,7 @@ func (s *StorageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) err
 		}
 
 		// Must provide a range key, even though its not useds - hence 0x00.
-		q := s.session.Query(fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES (?, 0x00, ?)",
+		q := s.writeSession.Query(fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES (?, 0x00, ?)",
 			tableName), key, buf)
 		if err := q.WithContext(ctx).Exec(); err != nil {
 			return errors.WithStack(err)
@@ -395,11 +456,11 @@ func (s *StorageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) err
 }
 
 // GetChunks implements chunk.ObjectClient.
-func (s *StorageClient) GetChunks(ctx context.Context, input []chunk.Chunk) ([]chunk.Chunk, error) {
+func (s *ObjectClient) GetChunks(ctx context.Context, input []chunk.Chunk) ([]chunk.Chunk, error) {
 	return util.GetParallelChunks(ctx, input, s.getChunk)
 }
 
-func (s *StorageClient) getChunk(ctx context.Context, decodeContext *chunk.DecodeContext, input chunk.Chunk) (chunk.Chunk, error) {
+func (s *ObjectClient) getChunk(ctx context.Context, decodeContext *chunk.DecodeContext, input chunk.Chunk) (chunk.Chunk, error) {
 	if s.querySemaphore != nil {
 		if err := s.querySemaphore.Acquire(ctx, 1); err != nil {
 			return input, err
@@ -413,7 +474,7 @@ func (s *StorageClient) getChunk(ctx context.Context, decodeContext *chunk.Decod
 	}
 
 	var buf []byte
-	if err := s.session.Query(fmt.Sprintf("SELECT value FROM %s WHERE hash = ?", tableName), input.ExternalKey()).
+	if err := s.readSession.Query(fmt.Sprintf("SELECT value FROM %s WHERE hash = ?", tableName), input.ExternalKey()).
 		WithContext(ctx).Scan(&buf); err != nil {
 		return input, errors.WithStack(err)
 	}
@@ -421,7 +482,41 @@ func (s *StorageClient) getChunk(ctx context.Context, decodeContext *chunk.Decod
 	return input, err
 }
 
-func (s *StorageClient) DeleteChunk(ctx context.Context, chunkID string) error {
-	// ToDo: implement this to support deleting chunks from Cassandra
-	return chunk.ErrMethodNotImplemented
+func (s *ObjectClient) DeleteChunk(ctx context.Context, userID, chunkID string) error {
+	chunkRef, err := chunk.ParseExternalKey(userID, chunkID)
+	if err != nil {
+		return err
+	}
+
+	tableName, err := s.schemaCfg.ChunkTableFor(chunkRef.From)
+	if err != nil {
+		return err
+	}
+
+	q := s.writeSession.Query(fmt.Sprintf("DELETE FROM %s WHERE hash = ?",
+		tableName), chunkID)
+	if err := q.WithContext(ctx).Exec(); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
+
+// Stop implement chunk.ObjectClient.
+func (s *ObjectClient) Stop() {
+	s.readSession.Close()
+	s.writeSession.Close()
+}
+
+type noopConvictionPolicy struct{}
+
+// AddFailure should return `true` if the host should be convicted, `false` otherwise.
+// Convicted means connections are removed - we don't want that.
+// Implementats gocql.ConvictionPolicy.
+func (noopConvictionPolicy) AddFailure(err error, host *gocql.HostInfo) bool {
+	level.Error(pkgutil.Logger).Log("msg", "Cassandra host failure", "err", err, "host", host.String())
+	return false
+}
+
+// Implementats gocql.ConvictionPolicy.
+func (noopConvictionPolicy) Reset(host *gocql.HostInfo) {}

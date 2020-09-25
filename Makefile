@@ -1,8 +1,9 @@
-.PHONY: all test clean images protos exes dist
+.PHONY: all test clean images protos exes dist doc clean-doc check-doc
 .DEFAULT_GOAL := all
 
 # Version number
 VERSION=$(shell cat "./VERSION" 2> /dev/null)
+GOPROXY_VALUE=$(shell go env GOPROXY)
 
 # Boiler plate for building Docker containers.
 # All this must go at top of file I'm afraid.
@@ -23,13 +24,13 @@ SED ?= $(shell which gsed 2>/dev/null || which sed)
 # declared.
 %/$(UPTODATE): %/Dockerfile
 	@echo
-	$(SUDO) docker build --build-arg=revision=$(GIT_REVISION) -t $(IMAGE_PREFIX)$(shell basename $(@D)) $(@D)/
+	$(SUDO) docker build --build-arg=revision=$(GIT_REVISION) --build-arg=goproxyValue=$(GOPROXY_VALUE) -t $(IMAGE_PREFIX)$(shell basename $(@D)) $(@D)/
 	$(SUDO) docker tag $(IMAGE_PREFIX)$(shell basename $(@D)) $(IMAGE_PREFIX)$(shell basename $(@D)):$(IMAGE_TAG)
 	touch $@
 
 # We don't want find to scan inside a bunch of directories, to accelerate the
 # 'make: Entering directory '/go/src/github.com/cortexproject/cortex' phase.
-DONT_FIND := -name tools -prune -o -name vendor -prune -o -name .git -prune -o -name .cache -prune -o -name .pkg -prune -o
+DONT_FIND := -name vendor -prune -o -name .git -prune -o -name .cache -prune -o -name .pkg -prune -o -name packaging -prune -o
 
 # Get a list of directories containing Dockerfiles
 DOCKERFILES := $(shell find . $(DONT_FIND) -type f -name 'Dockerfile' -print)
@@ -66,6 +67,8 @@ pkg/distributor/ha_tracker.pb.go: pkg/distributor/ha_tracker.proto
 pkg/ruler/rules/rules.pb.go: pkg/ruler/rules/rules.proto
 pkg/ruler/ruler.pb.go: pkg/ruler/rules/rules.proto
 pkg/ring/kv/memberlist/kv.pb.go: pkg/ring/kv/memberlist/kv.proto
+pkg/chunk/grpc/grpc.pb.go: pkg/chunk/grpc/grpc.proto
+tools/blocksconvert/scheduler.pb.go: tools/blocksconvert/scheduler.proto
 
 all: $(UPTODATE_FILES)
 test: protos
@@ -94,7 +97,7 @@ GOVOLUMES=	-v $(shell pwd)/.cache:/go/cache:delegated \
 			-v $(shell pwd)/.pkg:/go/pkg:delegated \
 			-v $(shell pwd):/go/src/github.com/cortexproject/cortex:delegated
 
-exes $(EXES) protos $(PROTO_GOS) lint test shell mod-check check-protos web-build web-pre web-deploy: build-image/$(UPTODATE)
+exes $(EXES) protos $(PROTO_GOS) lint test shell mod-check check-protos web-build web-pre web-deploy doc: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
 	@mkdir -p $(shell pwd)/.cache
 	@echo
@@ -129,7 +132,7 @@ protos: $(PROTO_GOS)
 %.pb.go:
 	@# The store-gateway RPC is based on Thanos which uses relative references to other protos, so we need
 	@# to configure all such relative paths.
-	protoc -I $(GOPATH)/src:./vendor/github.com/thanos-io/thanos/pkg/store:./vendor/github.com/thanos-io/thanos/pkg/store/storepb:./vendor/github.com/gogo/protobuf:./vendor:./$(@D) --gogoslick_out=plugins=grpc,Mgoogle/protobuf/any.proto=github.com/gogo/protobuf/types,:./$(@D) ./$(patsubst %.pb.go,%.proto,$@)
+	protoc -I $(GOPATH)/src:./vendor/github.com/thanos-io/thanos/pkg:./vendor/github.com/gogo/protobuf:./vendor:./$(@D) --gogoslick_out=plugins=grpc,Mgoogle/protobuf/any.proto=github.com/gogo/protobuf/types,:./$(@D) ./$(patsubst %.pb.go,%.proto,$@)
 
 lint:
 	misspell -error docs
@@ -138,7 +141,9 @@ lint:
 	golangci-lint run
 
 	# Ensure no blacklisted package is imported.
-	faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,golang.org/x/net/context=context" ./pkg/... ./cmd/... ./tools/... ./integration/...
+	faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
+		golang.org/x/net/context=context,\
+		sync/atomic=go.uber.org/atomic" ./pkg/... ./cmd/... ./tools/... ./integration/...
 
 	# Validate Kubernetes spec files. Requires:
 	# https://kubeval.instrumenta.dev
@@ -173,11 +178,20 @@ web-build: web-pre
 web-deploy:
 	./tools/website/web-deploy.sh
 
+# Generates the config file documentation.
+doc: clean-doc
+	go run ./tools/doc-generator ./docs/configuration/config-file-reference.template > ./docs/configuration/config-file-reference.md
+	go run ./tools/doc-generator ./docs/blocks-storage/compactor.template            > ./docs/blocks-storage/compactor.md
+	go run ./tools/doc-generator ./docs/blocks-storage/store-gateway.template        > ./docs/blocks-storage/store-gateway.md
+	go run ./tools/doc-generator ./docs/blocks-storage/querier.template              > ./docs/blocks-storage/querier.md
+	embedmd -w docs/operations/requests-mirroring-to-secondary-cluster.md
+	embedmd -w docs/configuration/single-process-config.md
+
 endif
 
 clean:
 	$(SUDO) docker rmi $(IMAGE_NAMES) >/dev/null 2>&1 || true
-	rm -rf $(UPTODATE_FILES) $(EXES) .cache
+	rm -rf -- $(UPTODATE_FILES) $(EXES) .cache $(PACKAGES) dist/*
 	go clean ./...
 
 clean-protos:
@@ -198,17 +212,15 @@ load-images:
 		fi \
 	done
 
-# Generates the config file documentation.
-doc: clean-doc
-	go run ./tools/doc-generator ./docs/configuration/config-file-reference.template >> ./docs/configuration/config-file-reference.md
-	go run ./tools/doc-generator ./docs/operations/blocks-storage.template           >> ./docs/operations/blocks-storage.md
-	embedmd -w docs/operations/requests-mirroring-to-secondary-cluster.md
-
 clean-doc:
-	rm -f ./docs/configuration/config-file-reference.md ./docs/operations/blocks-storage.md
+	rm -f \
+		./docs/configuration/config-file-reference.md \
+		./docs/blocks-storage/compactor.md \
+		./docs/blocks-storage/store-gateway.md \
+		./docs/blocks-storage/querier.md
 
 check-doc: doc
-	@git diff --exit-code -- ./docs/configuration/config-file-reference.md ./docs/operations/blocks-storage.md
+	@git diff --exit-code -- ./docs/configuration/config-file-reference.md ./docs/blocks-storage/*.md ./docs/configuration/*.md
 
 clean-white-noise:
 	@find . -path ./.pkg -prune -o -path ./vendor -prune -o -path ./website -prune -or -type f -name "*.md" -print | \
@@ -221,10 +233,63 @@ web-serve:
 	cd website && hugo --config config.toml -v server
 
 # Generate binaries for a Cortex release
-dist:
+dist dist/cortex-linux-amd64 dist/cortex-darwin-amd64 dist/query-tee-linux-amd64 dist/query-tee-darwin-amd64 dist/cortex-linux-amd64-sha-256 dist/cortex-darwin-amd64-sha-256 dist/query-tee-linux-amd64-sha-256 dist/query-tee-darwin-amd64-sha-256:
 	rm -fr ./dist
 	mkdir -p ./dist
 	GOOS="linux"  GOARCH="amd64" CGO_ENABLED=0 go build $(GO_FLAGS) -o ./dist/cortex-linux-amd64   ./cmd/cortex
 	GOOS="darwin" GOARCH="amd64" CGO_ENABLED=0 go build $(GO_FLAGS) -o ./dist/cortex-darwin-amd64  ./cmd/cortex
-	shasum -a 256 ./dist/cortex-darwin-amd64 | cut -d ' ' -f 1 > ./dist/cortex-darwin-amd64-sha-256
-	shasum -a 256 ./dist/cortex-linux-amd64  | cut -d ' ' -f 1 > ./dist/cortex-linux-amd64-sha-256
+	GOOS="linux"  GOARCH="amd64" CGO_ENABLED=0 go build $(GO_FLAGS) -o ./dist/query-tee-linux-amd64   ./cmd/query-tee
+	GOOS="darwin" GOARCH="amd64" CGO_ENABLED=0 go build $(GO_FLAGS) -o ./dist/query-tee-darwin-amd64  ./cmd/query-tee
+	sha256sum ./dist/cortex-darwin-amd64 | cut -d ' ' -f 1 > ./dist/cortex-darwin-amd64-sha-256
+	sha256sum ./dist/cortex-linux-amd64  | cut -d ' ' -f 1 > ./dist/cortex-linux-amd64-sha-256
+	sha256sum ./dist/query-tee-darwin-amd64 | cut -d ' ' -f 1 > ./dist/query-tee-darwin-amd64-sha-256
+	sha256sum ./dist/query-tee-linux-amd64  | cut -d ' ' -f 1 > ./dist/query-tee-linux-amd64-sha-256
+
+# Generate packages for a Cortex release.
+FPM_OPTS := fpm -s dir -v $(VERSION) -n cortex -f \
+	--license "Apache 2.0" \
+	--url "https://github.com/cortexproject/cortex"
+
+FPM_ARGS := dist/cortex-linux-amd64=/usr/local/bin/cortex \
+	docs/configuration/single-process-config.yaml=/etc/cortex/single-process-config.yaml\
+
+PACKAGES := dist/cortex-$(VERSION).rpm dist/cortex-$(VERSION).deb
+PACKAGE_IN_CONTAINER := true
+PACKAGE_IMAGE ?= $(IMAGE_PREFIX)fpm
+ifeq ($(PACKAGE_IN_CONTAINER), true)
+
+.PHONY: packages
+packages: dist/cortex-linux-amd64 packaging/fpm/$(UPTODATE)
+	@mkdir -p $(shell pwd)/.pkg
+	@mkdir -p $(shell pwd)/.cache
+	@echo ">>>> Entering build container: $@"
+	@$(SUDO) time docker run $(RM) $(TTY) \
+		-v  $(shell pwd):/src/github.com/cortexproject/cortex:delegated \
+		-i $(PACKAGE_IMAGE) $@;
+
+else
+
+packages: $(PACKAGES)
+
+dist/%.deb: dist/cortex-linux-amd64 $(wildcard packaging/deb/**)
+	$(FPM_OPTS) -t deb \
+		--after-install packaging/deb/control/postinst \
+		--before-remove packaging/deb/control/prerm \
+		--package $@ $(FPM_ARGS) \
+		packaging/deb/default/cortex=/etc/default/cortex \
+		packaging/deb/systemd/cortex.service=/etc/systemd/system/cortex.service
+	sha256sum ./dist/cortex-$(VERSION).deb | cut -d ' ' -f 1 > ./dist/cortex-$(VERSION).deb-sha-256
+
+dist/%.rpm: dist/cortex-linux-amd64 $(wildcard packaging/rpm/**)
+	$(FPM_OPTS) -t rpm  \
+		--after-install packaging/rpm/control/post \
+		--before-remove packaging/rpm/control/preun \
+		--package $@ $(FPM_ARGS) \
+		packaging/rpm/sysconfig/cortex=/etc/sysconfig/cortex \
+		packaging/rpm/systemd/cortex.service=/etc/systemd/system/cortex.service
+	sha256sum ./dist/cortex-$(VERSION).rpm | cut -d ' ' -f 1 > ./dist/cortex-$(VERSION).rpm-sha-256
+endif
+
+.PHONY: test-packages
+test-packages: packages packaging/rpm/centos-systemd/$(UPTODATE) packaging/deb/debian-systemd/$(UPTODATE)
+	./tools/packaging/test-packages $(IMAGE_PREFIX) $(VERSION)

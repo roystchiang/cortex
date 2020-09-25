@@ -3,6 +3,7 @@ package objectclient
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io/ioutil"
 	strings "strings"
 
@@ -16,8 +17,12 @@ import (
 
 // Object Rule Storage Schema
 // =======================
-// Object Name: "rules/<user_id>/<namespace>/<group_name>"
+// Object Name: "rules/<user_id>/<base64 URL Encoded: namespace>/<base64 URL Encoded: group_name>"
 // Storage Format: Encoded RuleGroupDesc
+//
+// Prometheus Rule Groups can include a large number of characters that are not valid object names
+// in common object storage systems. A URL Base64 encoding allows for generic consistent naming
+// across all backends
 
 const (
 	rulePrefix = "rules/"
@@ -144,15 +149,45 @@ func (o *RuleStore) DeleteRuleGroup(ctx context.Context, userID string, namespac
 	return err
 }
 
+// DeleteNamespace deletes all the rule groups in the specified namespace
+func (o *RuleStore) DeleteNamespace(ctx context.Context, userID, namespace string) error {
+	ruleGroupObjects, _, err := o.client.List(ctx, generateRuleObjectKey(userID, namespace, ""))
+	if err != nil {
+		return err
+	}
+
+	if len(ruleGroupObjects) == 0 {
+		return rules.ErrGroupNamespaceNotFound
+	}
+
+	for _, obj := range ruleGroupObjects {
+		level.Debug(util.Logger).Log("msg", "deleting rule group", "namespace", namespace, "key", obj.Key)
+		err = o.client.DeleteObject(ctx, obj.Key)
+		if err != nil {
+			level.Error(util.Logger).Log("msg", "unable to delete rule group from namespace", "err", err, "namespace", namespace, "key", obj.Key)
+			return err
+		}
+	}
+
+	return nil
+}
+
 func generateRuleObjectKey(id, namespace, name string) string {
 	if id == "" {
 		return rulePrefix
 	}
+
 	prefix := rulePrefix + id + "/"
 	if namespace == "" {
 		return prefix
 	}
-	return prefix + namespace + "/" + name
+
+	ns := base64.URLEncoding.EncodeToString([]byte(namespace)) + "/"
+	if name == "" {
+		return prefix + ns
+	}
+
+	return prefix + ns + base64.URLEncoding.EncodeToString([]byte(name))
 }
 
 func decomposeRuleObjectKey(handle string) string {

@@ -1,6 +1,7 @@
 cmd/test-exporter/test-exporter
 cmd/cortex/cortex
 cmd/query-tee/query-tee
+cmd/blocksconvert/blocksconvert
 .uptodate
 .pkg
 .cache
@@ -10,4 +11,4 @@ website/resources
 website/content/en/docs
 e2e_integration_test*
 active-query-tracker
-
+dist/

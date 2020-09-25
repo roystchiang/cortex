@@ -3,6 +3,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,13 +15,25 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
+type MockStorageMode int
+
+var errPermissionDenied = errors.New("permission denied")
+
+const (
+	MockStorageModeReadWrite = 0
+	MockStorageModeReadOnly  = 1
+	MockStorageModeWriteOnly = 2
+)
+
 // MockStorage is a fake in-memory StorageClient.
 type MockStorage struct {
 	mtx     sync.RWMutex
 	tables  map[string]*mockTable
 	objects map[string][]byte
 
-	numWrites int
+	numIndexWrites int
+	numChunkWrites int
+	mode           MockStorageMode
 }
 
 type mockTable struct {
@@ -43,6 +56,10 @@ func NewMockStorage() *MockStorage {
 
 // Stop doesn't do anything.
 func (*MockStorage) Stop() {
+}
+
+func (m *MockStorage) SetMode(mode MockStorageMode) {
+	m.mode = mode
 }
 
 // ListTables implements StorageClient.
@@ -134,10 +151,14 @@ func (m *MockStorage) BatchWrite(ctx context.Context, batch WriteBatch) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	if m.mode == MockStorageModeReadOnly {
+		return errPermissionDenied
+	}
+
 	mockBatch := *batch.(*mockWriteBatch)
 	seenWrites := map[string]bool{}
 
-	m.numWrites += len(mockBatch.inserts)
+	m.numIndexWrites += len(mockBatch.inserts)
 
 	for _, req := range mockBatch.inserts {
 		table, ok := m.tables[req.tableName]
@@ -207,6 +228,10 @@ func (m *MockStorage) BatchWrite(ctx context.Context, batch WriteBatch) error {
 func (m *MockStorage) QueryPages(ctx context.Context, queries []IndexQuery, callback func(IndexQuery, ReadBatch) (shouldContinue bool)) error {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
+
+	if m.mode == MockStorageModeWriteOnly {
+		return errPermissionDenied
+	}
 
 	for _, query := range queries {
 		err := m.query(ctx, query, func(b ReadBatch) bool {
@@ -301,6 +326,12 @@ func (m *MockStorage) PutChunks(_ context.Context, chunks []Chunk) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	if m.mode == MockStorageModeReadOnly {
+		return errPermissionDenied
+	}
+
+	m.numChunkWrites += len(chunks)
+
 	for i := range chunks {
 		buf, err := chunks[i].Encoded()
 		if err != nil {
@@ -315,6 +346,10 @@ func (m *MockStorage) PutChunks(_ context.Context, chunks []Chunk) error {
 func (m *MockStorage) GetChunks(ctx context.Context, chunkSet []Chunk) ([]Chunk, error) {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
+
+	if m.mode == MockStorageModeWriteOnly {
+		return nil, errPermissionDenied
+	}
 
 	decodeContext := NewDecodeContext()
 	result := []Chunk{}
@@ -333,13 +368,21 @@ func (m *MockStorage) GetChunks(ctx context.Context, chunkSet []Chunk) ([]Chunk,
 }
 
 // DeleteChunk implements StorageClient.
-func (m *MockStorage) DeleteChunk(ctx context.Context, chunkID string) error {
+func (m *MockStorage) DeleteChunk(ctx context.Context, userID, chunkID string) error {
+	if m.mode == MockStorageModeReadOnly {
+		return errPermissionDenied
+	}
+
 	return m.DeleteObject(ctx, chunkID)
 }
 
 func (m *MockStorage) GetObject(ctx context.Context, objectKey string) (io.ReadCloser, error) {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
+
+	if m.mode == MockStorageModeWriteOnly {
+		return nil, errPermissionDenied
+	}
 
 	buf, ok := m.objects[objectKey]
 	if !ok {
@@ -355,6 +398,10 @@ func (m *MockStorage) PutObject(ctx context.Context, objectKey string, object io
 		return err
 	}
 
+	if m.mode == MockStorageModeReadOnly {
+		return errPermissionDenied
+	}
+
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -365,6 +412,10 @@ func (m *MockStorage) PutObject(ctx context.Context, objectKey string, object io
 func (m *MockStorage) DeleteObject(ctx context.Context, objectKey string) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
+
+	if m.mode == MockStorageModeReadOnly {
+		return errPermissionDenied
+	}
 
 	if _, ok := m.objects[objectKey]; !ok {
 		return ErrStorageObjectNotFound
@@ -378,6 +429,10 @@ func (m *MockStorage) List(ctx context.Context, prefix string) ([]StorageObject,
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
+	if m.mode == MockStorageModeWriteOnly {
+		return nil, nil, errPermissionDenied
+	}
+
 	storageObjects := make([]StorageObject, 0, len(m.objects))
 	for key := range m.objects {
 		// ToDo: Store mtime when we have mtime based use-cases for storage objects
@@ -385,6 +440,10 @@ func (m *MockStorage) List(ctx context.Context, prefix string) ([]StorageObject,
 	}
 
 	return storageObjects, []StorageCommonPrefix{}, nil
+}
+
+func (m *MockStorage) PathSeparator() string {
+	return DirDelim
 }
 
 type mockWriteBatch struct {

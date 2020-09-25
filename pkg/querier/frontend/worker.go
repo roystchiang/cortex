@@ -27,7 +27,7 @@ type WorkerConfig struct {
 	MatchMaxConcurrency bool          `yaml:"match_max_concurrent"`
 	DNSLookupDuration   time.Duration `yaml:"dns_lookup_duration"`
 
-	GRPCClientConfig grpcclient.Config `yaml:"grpc_client_config"`
+	GRPCClientConfig grpcclient.ConfigWithTLS `yaml:"grpc_client_config"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
@@ -38,6 +38,10 @@ func (cfg *WorkerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.DNSLookupDuration, "querier.dns-lookup-period", 10*time.Second, "How often to query DNS.")
 
 	cfg.GRPCClientConfig.RegisterFlagsWithPrefix("querier.frontend-client", f)
+}
+
+func (cfg *WorkerConfig) Validate(log log.Logger) error {
+	return cfg.GRPCClientConfig.Validate(log)
 }
 
 // Worker is the counter-part to the frontend, actually processing requests.
@@ -139,10 +143,10 @@ func (w *worker) watchDNSLoop(servCtx context.Context) error {
 }
 
 func (w *worker) connect(ctx context.Context, address string) (FrontendClient, error) {
-	opts := []grpc.DialOption{
-		grpc.WithInsecure(),
+	opts, err := w.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{middleware.ClientUserHeaderInterceptor}, nil)
+	if err != nil {
+		return nil, err
 	}
-	opts = append(opts, w.cfg.GRPCClientConfig.DialOption([]grpc.UnaryClientInterceptor{middleware.ClientUserHeaderInterceptor}, nil)...)
 
 	conn, err := grpc.DialContext(ctx, address, opts...)
 	if err != nil {

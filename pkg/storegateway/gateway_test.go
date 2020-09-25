@@ -6,18 +6,26 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/kit/log"
+	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
@@ -27,9 +35,55 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
-func TestStoreGateway_InitialSyncWithShardingEnabled(t *testing.T) {
+func TestConfig_Validate(t *testing.T) {
+	tests := map[string]struct {
+		setup    func(cfg *Config, limits *validation.Limits)
+		expected error
+	}{
+		"should pass by default": {
+			setup:    func(cfg *Config, limits *validation.Limits) {},
+			expected: nil,
+		},
+		"should fail if the sharding strategy is invalid": {
+			setup: func(cfg *Config, limits *validation.Limits) {
+				cfg.ShardingEnabled = true
+				cfg.ShardingStrategy = "xxx"
+			},
+			expected: errInvalidShardingStrategy,
+		},
+		"should fail if the sharding strategy is shuffle-sharding and shard size has not been set": {
+			setup: func(cfg *Config, limits *validation.Limits) {
+				cfg.ShardingEnabled = true
+				cfg.ShardingStrategy = ShardingStrategyShuffle
+			},
+			expected: errInvalidTenantShardSize,
+		},
+		"should pass if the sharding strategy is shuffle-sharding and shard size has been set": {
+			setup: func(cfg *Config, limits *validation.Limits) {
+				cfg.ShardingEnabled = true
+				cfg.ShardingStrategy = ShardingStrategyShuffle
+				limits.StoreGatewayTenantShardSize = 3
+			},
+			expected: nil,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			cfg := &Config{}
+			limits := &validation.Limits{}
+			flagext.DefaultValues(cfg, limits)
+			testData.setup(cfg, limits)
+
+			assert.Equal(t, testData.expected, cfg.Validate(*limits))
+		})
+	}
+}
+
+func TestStoreGateway_InitialSyncWithDefaultShardingEnabled(t *testing.T) {
 	tests := map[string]struct {
 		initialExists bool
 		initialState  ring.IngesterState
@@ -79,7 +133,7 @@ func TestStoreGateway_InitialSyncWithShardingEnabled(t *testing.T) {
 				}))
 			}
 
-			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), nil)
+			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
 			require.NoError(t, err)
 			defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
 			assert.False(t, g.ringLifecycler.IsRegistered())
@@ -118,7 +172,7 @@ func TestStoreGateway_InitialSyncWithShardingDisabled(t *testing.T) {
 	defer cleanup()
 	bucketClient := &cortex_tsdb.BucketClientMock{}
 
-	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, nil, mockLoggingLevel(), log.NewNopLogger(), nil)
+	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, nil, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
 	require.NoError(t, err)
 	defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
 
@@ -141,7 +195,7 @@ func TestStoreGateway_InitialSyncFailure(t *testing.T) {
 	ringStore := consul.NewInMemoryClient(ring.GetCodec())
 	bucketClient := &cortex_tsdb.BucketClientMock{}
 
-	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), nil)
+	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
 	require.NoError(t, err)
 
 	bucketClient.MockIter("", []string{}, errors.New("network error"))
@@ -162,7 +216,8 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 
 	// This tests uses real TSDB blocks. 24h time range, 2h block range period,
 	// 2 users = total (24 / 12) * 2 = 24 blocks.
-	numBlocks := 24
+	numUsers := 2
+	numBlocks := numUsers * 12
 	now := time.Now()
 	require.NoError(t, mockTSDB(path.Join(storageDir, "user-1"), 24, now.Add(-24*time.Hour).Unix()*1000, now.Unix()*1000))
 	require.NoError(t, mockTSDB(path.Join(storageDir, "user-2"), 24, now.Add(-24*time.Hour).Unix()*1000, now.Unix()*1000))
@@ -171,43 +226,65 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 	require.NoError(t, err)
 
 	tests := map[string]struct {
-		shardingEnabled      bool
+		shardingStrategy     string // Empty string means disabled.
+		tenantShardSize      int    // Used only when the sharding strategy is shuffle-sharding.
 		replicationFactor    int
 		numGateways          int
 		expectedBlocksLoaded int
 	}{
-		"1 gateway, sharding disabled": {
-			shardingEnabled:      false,
+		"sharding disabled, 1 gateway": {
+			shardingStrategy:     "",
 			numGateways:          1,
 			expectedBlocksLoaded: numBlocks,
 		},
-		"2 gateways, sharding disabled": {
-			shardingEnabled:      false,
+		"sharding disabled, 2 gateways": {
+			shardingStrategy:     "",
 			numGateways:          2,
 			expectedBlocksLoaded: 2 * numBlocks, // each gateway loads all the blocks
 		},
-		"1 gateway, sharding enabled, replication factor = 1": {
-			shardingEnabled:      true,
+		"default sharding strategy, 1 gateway, RF = 1": {
+			shardingStrategy:     ShardingStrategyDefault,
 			replicationFactor:    1,
 			numGateways:          1,
 			expectedBlocksLoaded: numBlocks,
 		},
-		"2 gateways, sharding enabled, replication factor = 1": {
-			shardingEnabled:      true,
+		"default sharding strategy, 2 gateways, RF = 1": {
+			shardingStrategy:     ShardingStrategyDefault,
 			replicationFactor:    1,
 			numGateways:          2,
 			expectedBlocksLoaded: numBlocks, // blocks are sharded across gateways
 		},
-		"3 gateways, sharding enabled, replication factor = 2": {
-			shardingEnabled:      true,
+		"default sharding strategy, 3 gateways, RF = 2": {
+			shardingStrategy:     ShardingStrategyDefault,
 			replicationFactor:    2,
 			numGateways:          3,
 			expectedBlocksLoaded: 2 * numBlocks, // blocks are replicated 2 times
 		},
-		"3 gateways, sharding enabled, replication factor = 3": {
-			shardingEnabled:      true,
+		"default sharding strategy, 5 gateways, RF = 3": {
+			shardingStrategy:     ShardingStrategyDefault,
 			replicationFactor:    3,
-			numGateways:          3,
+			numGateways:          5,
+			expectedBlocksLoaded: 3 * numBlocks, // blocks are replicated 3 times
+		},
+		"shuffle sharding strategy, 1 gateway, RF = 1, SS = 1": {
+			shardingStrategy:     ShardingStrategyShuffle,
+			tenantShardSize:      1,
+			replicationFactor:    1,
+			numGateways:          1,
+			expectedBlocksLoaded: numBlocks,
+		},
+		"shuffle sharding strategy, 5 gateways, RF = 2, SS = 3": {
+			shardingStrategy:     ShardingStrategyShuffle,
+			tenantShardSize:      3,
+			replicationFactor:    2,
+			numGateways:          5,
+			expectedBlocksLoaded: 2 * numBlocks, // blocks are replicated 2 times
+		},
+		"shuffle sharding strategy, 20 gateways, RF = 3, SS = 3": {
+			shardingStrategy:     ShardingStrategyShuffle,
+			tenantShardSize:      3,
+			replicationFactor:    3,
+			numGateways:          20,
 			expectedBlocksLoaded: 3 * numBlocks, // blocks are replicated 3 times
 		},
 	}
@@ -216,6 +293,7 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 		t.Run(testName, func(t *testing.T) {
 			ctx := context.Background()
 			storageCfg, cleanup := mockStorageConfig(t)
+			storageCfg.BucketStore.SyncInterval = time.Hour // Do not trigger the periodic sync in this test (we explicitly sync stores).
 			defer cleanup()
 			ringStore := consul.NewInMemoryClient(ring.GetCodec())
 
@@ -227,14 +305,26 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 			for i := 1; i <= testData.numGateways; i++ {
 				instanceID := fmt.Sprintf("gateway-%d", i)
 
+				limits := defaultLimitsConfig()
 				gatewayCfg := mockGatewayConfig()
-				gatewayCfg.ShardingEnabled = testData.shardingEnabled
 				gatewayCfg.ShardingRing.ReplicationFactor = testData.replicationFactor
 				gatewayCfg.ShardingRing.InstanceID = instanceID
 				gatewayCfg.ShardingRing.InstanceAddr = fmt.Sprintf("127.0.0.%d", i)
+				gatewayCfg.ShardingRing.RingCheckPeriod = time.Hour // Do not check the ring topology changes in this test (we explicitly sync stores).
+
+				if testData.shardingStrategy == "" {
+					gatewayCfg.ShardingEnabled = false
+				} else {
+					gatewayCfg.ShardingEnabled = true
+					gatewayCfg.ShardingStrategy = testData.shardingStrategy
+					limits.StoreGatewayTenantShardSize = testData.tenantShardSize
+				}
+
+				overrides, err := validation.NewOverrides(limits, nil)
+				require.NoError(t, err)
 
 				reg := prometheus.NewPedanticRegistry()
-				g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), reg)
+				g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, overrides, mockLoggingLevel(), log.NewNopLogger(), reg)
 				require.NoError(t, err)
 				defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
 
@@ -246,7 +336,7 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 			}
 
 			// Wait until the ring client of each gateway has synced (to avoid flaky tests on subsequent assertions).
-			if testData.shardingEnabled {
+			if testData.shardingStrategy != "" {
 				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
 
@@ -266,11 +356,16 @@ func TestStoreGateway_BlocksSharding(t *testing.T) {
 
 			// Assert on the number of blocks loaded extracting this information from metrics.
 			metrics := util.BuildMetricFamiliesPerUserFromUserRegistries(registries)
-			assert.Equal(t, float64(testData.expectedBlocksLoaded), metrics.GetSumOfGauges("cortex_storegateway_bucket_store_blocks_loaded"))
+			assert.Equal(t, float64(testData.expectedBlocksLoaded), metrics.GetSumOfGauges("cortex_bucket_store_blocks_loaded"))
+			assert.Equal(t, float64(2*testData.numGateways), metrics.GetSumOfGauges("cortex_bucket_stores_tenants_discovered"))
 
-			// The total number of blocks synced (before filtering) is always equal to the total
-			// number of blocks for each instance.
-			assert.Equal(t, float64(testData.numGateways*numBlocks), metrics.GetSumOfGauges("cortex_storegateway_blocks_meta_synced"))
+			if testData.shardingStrategy == ShardingStrategyShuffle {
+				assert.Equal(t, float64(testData.tenantShardSize*numBlocks), metrics.GetSumOfGauges("cortex_blocks_meta_synced"))
+				assert.Equal(t, float64(testData.tenantShardSize*numUsers), metrics.GetSumOfGauges("cortex_bucket_stores_tenants_synced"))
+			} else {
+				assert.Equal(t, float64(testData.numGateways*numBlocks), metrics.GetSumOfGauges("cortex_blocks_meta_synced"))
+				assert.Equal(t, float64(testData.numGateways*numUsers), metrics.GetSumOfGauges("cortex_bucket_stores_tenants_synced"))
+			}
 		})
 	}
 }
@@ -314,7 +409,7 @@ func TestStoreGateway_ShouldSupportLoadRingTokensFromFile(t *testing.T) {
 			bucketClient := &cortex_tsdb.BucketClientMock{}
 			bucketClient.MockIter("", []string{}, nil)
 
-			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), nil)
+			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
 			require.NoError(t, err)
 			defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
 			assert.False(t, g.ringLifecycler.IsRegistered())
@@ -438,7 +533,7 @@ func TestStoreGateway_SyncOnRingTopologyChanged(t *testing.T) {
 			bucketClient := &cortex_tsdb.BucketClientMock{}
 			bucketClient.MockIter("", []string{}, nil)
 
-			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), reg)
+			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), reg)
 			require.NoError(t, err)
 
 			// Store the initial ring state before starting the gateway.
@@ -496,7 +591,7 @@ func TestStoreGateway_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testin
 	bucketClient := &cortex_tsdb.BucketClientMock{}
 	bucketClient.MockIter("", []string{}, nil)
 
-	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, mockLoggingLevel(), log.NewNopLogger(), nil)
+	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, ringStore, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(ctx, g))
 	defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
@@ -524,6 +619,175 @@ func TestStoreGateway_RingLifecyclerShouldAutoForgetUnhealthyInstances(t *testin
 	})
 }
 
+func TestStoreGateway_SeriesQueryingShouldRemoveExternalLabels(t *testing.T) {
+	ctx := context.Background()
+	logger := log.NewNopLogger()
+	userID := "user-1"
+
+	storageDir, err := ioutil.TempDir(os.TempDir(), "")
+	require.NoError(t, err)
+	defer os.RemoveAll(storageDir) //nolint:errcheck
+
+	// Generate 2 TSDB blocks with the same exact series (and data points).
+	numSeries := 2
+	now := time.Now()
+	minT := now.Add(-1*time.Hour).Unix() * 1000
+	maxT := now.Unix() * 1000
+	step := (maxT - minT) / int64(numSeries)
+	require.NoError(t, mockTSDB(path.Join(storageDir, userID), numSeries, minT, maxT))
+	require.NoError(t, mockTSDB(path.Join(storageDir, userID), numSeries, minT, maxT))
+
+	bucketClient, err := filesystem.NewBucketClient(filesystem.Config{Directory: storageDir})
+	require.NoError(t, err)
+
+	// Find the created blocks (we expect 2).
+	var blockIDs []string
+	require.NoError(t, bucketClient.Iter(ctx, "user-1/", func(key string) error {
+		blockIDs = append(blockIDs, strings.TrimSuffix(strings.TrimPrefix(key, userID+"/"), "/"))
+		return nil
+	}))
+	require.Len(t, blockIDs, 2)
+
+	// Inject different external labels for each block.
+	for idx, blockID := range blockIDs {
+		meta := metadata.Thanos{
+			Labels: map[string]string{
+				cortex_tsdb.TenantIDExternalLabel:   userID,
+				cortex_tsdb.IngesterIDExternalLabel: fmt.Sprintf("ingester-%d", idx),
+				cortex_tsdb.ShardIDExternalLabel:    fmt.Sprintf("shard-%d", idx),
+			},
+			Source: metadata.TestSource,
+		}
+
+		_, err := metadata.InjectThanos(logger, filepath.Join(storageDir, userID, blockID), meta, nil)
+		require.NoError(t, err)
+	}
+
+	// Create a store-gateway used to query back the series from the blocks.
+	gatewayCfg := mockGatewayConfig()
+	gatewayCfg.ShardingEnabled = false
+	storageCfg, cleanup := mockStorageConfig(t)
+	defer cleanup()
+
+	g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, nil, defaultLimitsOverrides(t), mockLoggingLevel(), logger, nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, g))
+	defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
+
+	// Query back all series.
+	req := &storepb.SeriesRequest{
+		MinTime: minT,
+		MaxTime: maxT,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_RE, Name: "__name__", Value: ".*"},
+		},
+	}
+
+	srv := newBucketStoreSeriesServer(setUserIDToGRPCContext(ctx, userID))
+	err = g.Series(req, srv)
+	require.NoError(t, err)
+	assert.Empty(t, srv.Warnings)
+	assert.Len(t, srv.SeriesSet, numSeries)
+
+	for seriesID := 0; seriesID < numSeries; seriesID++ {
+		actual := srv.SeriesSet[seriesID]
+
+		// Ensure Cortex external labels have been removed.
+		assert.Equal(t, []storepb.Label{{Name: "series_id", Value: strconv.Itoa(seriesID)}}, actual.Labels)
+
+		// Ensure samples have been correctly queried. The Thanos store also deduplicate samples
+		// in most cases, but it's not strictly required guaranteeing deduplication at this stage.
+		samples, err := readSamplesFromChunks(actual.Chunks)
+		require.NoError(t, err)
+		assert.Equal(t, []sample{
+			{ts: minT + (step * int64(seriesID)), value: float64(seriesID)},
+		}, samples)
+	}
+}
+
+func TestStoreGateway_SeriesQueryingShouldEnforceMaxChunksPerQueryLimit(t *testing.T) {
+	const chunksQueried = 10
+
+	tests := map[string]struct {
+		limit       int
+		expectedErr string
+	}{
+		"no limit enforced if zero": {
+			limit:       0,
+			expectedErr: "",
+		},
+		"should return NO error if the actual number of queried chunks is <= limit": {
+			limit:       chunksQueried,
+			expectedErr: "",
+		},
+		"should return error if the actual number of queried chunks is > limit": {
+			limit:       chunksQueried - 1,
+			expectedErr: fmt.Sprintf("exceeded chunks limit: limit %d violated (got %d)", chunksQueried-1, chunksQueried),
+		},
+	}
+
+	ctx := context.Background()
+	logger := log.NewNopLogger()
+	userID := "user-1"
+
+	storageDir, err := ioutil.TempDir(os.TempDir(), "")
+	require.NoError(t, err)
+	defer os.RemoveAll(storageDir) //nolint:errcheck
+
+	// Generate 1 TSDB block with chunksQueried series. Since each mocked series contains only 1 sample,
+	// it will also only have 1 chunk.
+	now := time.Now()
+	minT := now.Add(-1*time.Hour).Unix() * 1000
+	maxT := now.Unix() * 1000
+	require.NoError(t, mockTSDB(path.Join(storageDir, userID), chunksQueried, minT, maxT))
+
+	bucketClient, err := filesystem.NewBucketClient(filesystem.Config{Directory: storageDir})
+	require.NoError(t, err)
+
+	// Create a store-gateway used to query back the series from the blocks.
+	gatewayCfg := mockGatewayConfig()
+	gatewayCfg.ShardingEnabled = false
+	storageCfg, cleanup := mockStorageConfig(t)
+	defer cleanup()
+
+	// Prepare the request to query back all series (1 chunk per series in this test).
+	req := &storepb.SeriesRequest{
+		MinTime: minT,
+		MaxTime: maxT,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_RE, Name: "__name__", Value: ".*"},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			// Customise the limits.
+			limits := defaultLimitsConfig()
+			limits.MaxChunksPerQuery = testData.limit
+			overrides, err := validation.NewOverrides(limits, nil)
+			require.NoError(t, err)
+
+			g, err := newStoreGateway(gatewayCfg, storageCfg, bucketClient, nil, overrides, mockLoggingLevel(), logger, nil)
+			require.NoError(t, err)
+			require.NoError(t, services.StartAndAwaitRunning(ctx, g))
+			defer services.StopAndAwaitTerminated(ctx, g) //nolint:errcheck
+
+			// Query back all the series (1 chunk per series in this test).
+			srv := newBucketStoreSeriesServer(setUserIDToGRPCContext(ctx, userID))
+			err = g.Series(req, srv)
+
+			if testData.expectedErr != "" {
+				require.Error(t, err)
+				assert.True(t, strings.Contains(err.Error(), testData.expectedErr))
+			} else {
+				require.NoError(t, err)
+				assert.Empty(t, srv.Warnings)
+				assert.Len(t, srv.SeriesSet, chunksQueried)
+			}
+		})
+	}
+}
+
 func mockGatewayConfig() Config {
 	cfg := Config{}
 	flagext.DefaultValues(&cfg)
@@ -534,11 +798,11 @@ func mockGatewayConfig() Config {
 	return cfg
 }
 
-func mockStorageConfig(t *testing.T) (cortex_tsdb.Config, func()) {
+func mockStorageConfig(t *testing.T) (cortex_tsdb.BlocksStorageConfig, func()) {
 	tmpDir, err := ioutil.TempDir(os.TempDir(), "store-gateway-test-*")
 	require.NoError(t, err)
 
-	cfg := cortex_tsdb.Config{}
+	cfg := cortex_tsdb.BlocksStorageConfig{}
 	flagext.DefaultValues(&cfg)
 
 	cfg.BucketStore.ConsistencyDelay = 0
@@ -551,8 +815,8 @@ func mockStorageConfig(t *testing.T) (cortex_tsdb.Config, func()) {
 	return cfg, cleanup
 }
 
-// mockTSDB create 1+ TSDB blocks storing numSeries of series with
-// timestamp evenly distributed between minT and maxT.
+// mockTSDB create 1+ TSDB blocks storing numSeries of series, each series
+// with 1 sample and its timestamp evenly distributed between minT and maxT.
 func mockTSDB(dir string, numSeries int, minT, maxT int64) error {
 	// Create a new TSDB on a temporary directory. The blocks
 	// will be then snapshotted to the input dir.
@@ -563,8 +827,9 @@ func mockTSDB(dir string, numSeries int, minT, maxT int64) error {
 	defer os.RemoveAll(tempDir) //nolint:errcheck
 
 	db, err := tsdb.Open(tempDir, nil, nil, &tsdb.Options{
-		BlockRanges:       []int64{int64(2 * 60 * 60 * 1000)}, // 2h period
-		RetentionDuration: uint64(15 * 86400 * 1000),          // 15 days
+		MinBlockDuration:  2 * time.Hour.Milliseconds(),
+		MaxBlockDuration:  2 * time.Hour.Milliseconds(),
+		RetentionDuration: 15 * 24 * time.Hour.Milliseconds(),
 	})
 	if err != nil {
 		return err
@@ -576,7 +841,7 @@ func mockTSDB(dir string, numSeries int, minT, maxT int64) error {
 	for i := 0; i < numSeries; i++ {
 		lbls := labels.Labels{labels.Label{Name: "series_id", Value: strconv.Itoa(i)}}
 
-		app := db.Appender()
+		app := db.Appender(context.Background())
 		if _, err := app.Add(lbls, minT+(step*int64(i)), float64(i)); err != nil {
 			return err
 		}
@@ -605,4 +870,66 @@ func generateSortedTokens(numTokens int) ring.Tokens {
 	})
 
 	return ring.Tokens(tokens)
+}
+
+func readSamplesFromChunks(rawChunks []storepb.AggrChunk) ([]sample, error) {
+	var samples []sample
+
+	for _, rawChunk := range rawChunks {
+		c, err := chunkenc.FromData(chunkenc.EncXOR, rawChunk.Raw.Data)
+		if err != nil {
+			return nil, err
+		}
+
+		it := c.Iterator(nil)
+		for it.Next() {
+			if it.Err() != nil {
+				return nil, it.Err()
+			}
+
+			ts, v := it.At()
+			samples = append(samples, sample{
+				ts:    ts,
+				value: v,
+			})
+		}
+
+		if it.Err() != nil {
+			return nil, it.Err()
+		}
+	}
+
+	return samples, nil
+}
+
+type sample struct {
+	ts    int64
+	value float64
+}
+
+func defaultLimitsConfig() validation.Limits {
+	limits := validation.Limits{}
+	flagext.DefaultValues(&limits)
+	return limits
+}
+
+func defaultLimitsOverrides(t *testing.T) *validation.Overrides {
+	overrides, err := validation.NewOverrides(defaultLimitsConfig(), nil)
+	require.NoError(t, err)
+
+	return overrides
+}
+
+type mockShardingStrategy struct {
+	mock.Mock
+}
+
+func (m *mockShardingStrategy) FilterUsers(ctx context.Context, userIDs []string) []string {
+	args := m.Called(ctx, userIDs)
+	return args.Get(0).([]string)
+}
+
+func (m *mockShardingStrategy) FilterBlocks(ctx context.Context, userID string, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+	args := m.Called(ctx, userID, metas, synced)
+	return args.Error(0)
 }

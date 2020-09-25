@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-kit/kit/log"
@@ -16,10 +15,12 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/weaveworks/common/logging"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/cortexproject/cortex/pkg/storage/backend/filesystem"
@@ -48,7 +49,7 @@ func TestBucketStores_InitialSync(t *testing.T) {
 	require.NoError(t, err)
 
 	reg := prometheus.NewPedanticRegistry()
-	stores, err := NewBucketStores(cfg, nil, bucket, mockLoggingLevel(), log.NewNopLogger(), reg)
+	stores, err := NewBucketStores(cfg, NewNoShardingStrategy(), bucket, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), reg)
 	require.NoError(t, err)
 
 	// Query series before the initial sync.
@@ -66,7 +67,7 @@ func TestBucketStores_InitialSync(t *testing.T) {
 		seriesSet, warnings, err := querySeries(stores, userID, metricName, 20, 40)
 		require.NoError(t, err)
 		assert.Empty(t, warnings)
-		assert.Len(t, seriesSet, 1)
+		require.Len(t, seriesSet, 1)
 		assert.Equal(t, []storepb.Label{{Name: labels.MetricName, Value: metricName}}, seriesSet[0].Labels)
 	}
 
@@ -77,18 +78,34 @@ func TestBucketStores_InitialSync(t *testing.T) {
 	assert.Empty(t, seriesSet)
 
 	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-			# HELP bucket_store_blocks_loaded Number of currently loaded blocks.
-			# TYPE bucket_store_blocks_loaded gauge
-			bucket_store_blocks_loaded 2
+			# HELP cortex_bucket_store_blocks_loaded Number of currently loaded blocks.
+			# TYPE cortex_bucket_store_blocks_loaded gauge
+			cortex_bucket_store_blocks_loaded 2
 
-			# HELP bucket_store_block_loads_total Total number of remote block loading attempts.
-			# TYPE bucket_store_block_loads_total counter
-			bucket_store_block_loads_total 2
+			# HELP cortex_bucket_store_block_loads_total Total number of remote block loading attempts.
+			# TYPE cortex_bucket_store_block_loads_total counter
+			cortex_bucket_store_block_loads_total 2
 
-			# HELP bucket_store_block_load_failures_total Total number of failed remote block loading attempts.
-			# TYPE bucket_store_block_load_failures_total counter
-			bucket_store_block_load_failures_total 0
-	`), "bucket_store_blocks_loaded", "bucket_store_block_loads_total", "bucket_store_block_load_failures_total"))
+			# HELP cortex_bucket_store_block_load_failures_total Total number of failed remote block loading attempts.
+			# TYPE cortex_bucket_store_block_load_failures_total counter
+			cortex_bucket_store_block_load_failures_total 0
+
+			# HELP cortex_bucket_stores_gate_queries_concurrent_max Number of maximum concurrent queries allowed.
+			# TYPE cortex_bucket_stores_gate_queries_concurrent_max gauge
+			cortex_bucket_stores_gate_queries_concurrent_max 100
+
+			# HELP cortex_bucket_stores_gate_queries_in_flight Number of queries that are currently in flight.
+			# TYPE cortex_bucket_stores_gate_queries_in_flight gauge
+			cortex_bucket_stores_gate_queries_in_flight 0
+	`),
+		"cortex_bucket_store_blocks_loaded",
+		"cortex_bucket_store_block_loads_total",
+		"cortex_bucket_store_block_load_failures_total",
+		"cortex_bucket_stores_gate_queries_concurrent_max",
+		"cortex_bucket_stores_gate_queries_in_flight",
+	))
+
+	assert.Greater(t, testutil.ToFloat64(stores.syncLastSuccess), float64(0))
 }
 
 func TestBucketStores_SyncBlocks(t *testing.T) {
@@ -108,7 +125,7 @@ func TestBucketStores_SyncBlocks(t *testing.T) {
 	require.NoError(t, err)
 
 	reg := prometheus.NewPedanticRegistry()
-	stores, err := NewBucketStores(cfg, nil, bucket, mockLoggingLevel(), log.NewNopLogger(), reg)
+	stores, err := NewBucketStores(cfg, NewNoShardingStrategy(), bucket, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), reg)
 	require.NoError(t, err)
 
 	// Run an initial sync to discover 1 block.
@@ -132,48 +149,88 @@ func TestBucketStores_SyncBlocks(t *testing.T) {
 	assert.Equal(t, []storepb.Label{{Name: labels.MetricName, Value: metricName}}, seriesSet[0].Labels)
 
 	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-			# HELP bucket_store_blocks_loaded Number of currently loaded blocks.
-			# TYPE bucket_store_blocks_loaded gauge
-			bucket_store_blocks_loaded 2
+			# HELP cortex_bucket_store_blocks_loaded Number of currently loaded blocks.
+			# TYPE cortex_bucket_store_blocks_loaded gauge
+			cortex_bucket_store_blocks_loaded 2
 
-			# HELP bucket_store_block_loads_total Total number of remote block loading attempts.
-			# TYPE bucket_store_block_loads_total counter
-			bucket_store_block_loads_total 2
+			# HELP cortex_bucket_store_block_loads_total Total number of remote block loading attempts.
+			# TYPE cortex_bucket_store_block_loads_total counter
+			cortex_bucket_store_block_loads_total 2
 
-			# HELP bucket_store_block_load_failures_total Total number of failed remote block loading attempts.
-			# TYPE bucket_store_block_load_failures_total counter
-			bucket_store_block_load_failures_total 0
-	`), "bucket_store_blocks_loaded", "bucket_store_block_loads_total", "bucket_store_block_load_failures_total"))
+			# HELP cortex_bucket_store_block_load_failures_total Total number of failed remote block loading attempts.
+			# TYPE cortex_bucket_store_block_load_failures_total counter
+			cortex_bucket_store_block_load_failures_total 0
+
+			# HELP cortex_bucket_stores_gate_queries_concurrent_max Number of maximum concurrent queries allowed.
+			# TYPE cortex_bucket_stores_gate_queries_concurrent_max gauge
+			cortex_bucket_stores_gate_queries_concurrent_max 100
+
+			# HELP cortex_bucket_stores_gate_queries_in_flight Number of queries that are currently in flight.
+			# TYPE cortex_bucket_stores_gate_queries_in_flight gauge
+			cortex_bucket_stores_gate_queries_in_flight 0
+	`),
+		"cortex_bucket_store_blocks_loaded",
+		"cortex_bucket_store_block_loads_total",
+		"cortex_bucket_store_block_load_failures_total",
+		"cortex_bucket_stores_gate_queries_concurrent_max",
+		"cortex_bucket_stores_gate_queries_in_flight",
+	))
+
+	assert.Greater(t, testutil.ToFloat64(stores.syncLastSuccess), float64(0))
 }
 
 func TestBucketStores_syncUsersBlocks(t *testing.T) {
-	cfg, cleanup := prepareStorageConfig(t)
-	cfg.BucketStore.TenantSyncConcurrency = 2
-	defer cleanup()
+	allUsers := []string{"user-1", "user-2", "user-3"}
 
-	bucketClient := &cortex_tsdb.BucketClientMock{}
-	bucketClient.MockIter("", []string{"user-1", "user-2", "user-3"}, nil)
+	tests := map[string]struct {
+		shardingStrategy ShardingStrategy
+		expectedStores   int32
+	}{
+		"when sharding is disabled all users should be synced": {
+			shardingStrategy: NewNoShardingStrategy(),
+			expectedStores:   3,
+		},
+		"when sharding is enabled only stores for filtered users should be created": {
+			shardingStrategy: func() ShardingStrategy {
+				s := &mockShardingStrategy{}
+				s.On("FilterUsers", mock.Anything, allUsers).Return([]string{"user-1", "user-2"})
+				return s
+			}(),
+			expectedStores: 2,
+		},
+	}
 
-	stores, err := NewBucketStores(cfg, nil, bucketClient, mockLoggingLevel(), log.NewNopLogger(), nil)
-	require.NoError(t, err)
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			cfg, cleanup := prepareStorageConfig(t)
+			cfg.BucketStore.TenantSyncConcurrency = 2
+			defer cleanup()
 
-	// Sync user stores and count the number of times the callback is called.
-	storesCount := int32(0)
-	err = stores.syncUsersBlocks(context.Background(), func(ctx context.Context, bs *store.BucketStore) error {
-		atomic.AddInt32(&storesCount, 1)
-		return nil
-	})
+			bucketClient := &cortex_tsdb.BucketClientMock{}
+			bucketClient.MockIter("", allUsers, nil)
 
-	assert.NoError(t, err)
-	bucketClient.AssertNumberOfCalls(t, "Iter", 1)
-	assert.Equal(t, storesCount, int32(3))
+			stores, err := NewBucketStores(cfg, testData.shardingStrategy, bucketClient, defaultLimitsOverrides(t), mockLoggingLevel(), log.NewNopLogger(), nil)
+			require.NoError(t, err)
+
+			// Sync user stores and count the number of times the callback is called.
+			var storesCount atomic.Int32
+			err = stores.syncUsersBlocks(context.Background(), func(ctx context.Context, bs *store.BucketStore) error {
+				storesCount.Inc()
+				return nil
+			})
+
+			assert.NoError(t, err)
+			bucketClient.AssertNumberOfCalls(t, "Iter", 1)
+			assert.Equal(t, storesCount.Load(), testData.expectedStores)
+		})
+	}
 }
 
-func prepareStorageConfig(t *testing.T) (cortex_tsdb.Config, func()) {
+func prepareStorageConfig(t *testing.T) (cortex_tsdb.BlocksStorageConfig, func()) {
 	tmpDir, err := ioutil.TempDir(os.TempDir(), "blocks-sync-*")
 	require.NoError(t, err)
 
-	cfg := cortex_tsdb.Config{}
+	cfg := cortex_tsdb.BlocksStorageConfig{}
 	flagext.DefaultValues(&cfg)
 	cfg.BucketStore.SyncDir = tmpDir
 
@@ -201,7 +258,7 @@ func generateStorageBlock(t *testing.T, storageDir, userID string, metricName st
 		require.NoError(t, os.RemoveAll(tmpDir))
 	}()
 
-	db, err := tsdb.Open(tmpDir, log.NewNopLogger(), nil, tsdb.DefaultOptions)
+	db, err := tsdb.Open(tmpDir, log.NewNopLogger(), nil, tsdb.DefaultOptions())
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, db.Close())
@@ -209,7 +266,7 @@ func generateStorageBlock(t *testing.T, storageDir, userID string, metricName st
 
 	series := labels.Labels{labels.Label{Name: labels.MetricName, Value: metricName}}
 
-	app := db.Appender()
+	app := db.Appender(context.Background())
 	for ts := minT; ts < maxT; ts += step {
 		_, err = app.Add(series, ts, 1)
 		require.NoError(t, err)
@@ -233,7 +290,7 @@ func querySeries(stores *BucketStores, userID, metricName string, minT, maxT int
 	}
 
 	ctx := setUserIDToGRPCContext(context.Background(), userID)
-	srv := NewBucketStoreSeriesServer(ctx)
+	srv := newBucketStoreSeriesServer(ctx)
 	err := stores.Series(req, srv)
 
 	return srv.SeriesSet, srv.Warnings, err

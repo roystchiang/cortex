@@ -1,6 +1,6 @@
 // +build requires_docker
 
-package main
+package integration
 
 import (
 	"fmt"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,191 +23,39 @@ import (
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 )
 
-func TestQuerierWithBlocksStorageWithoutStoreGateway(t *testing.T) {
+func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 	tests := map[string]struct {
-		flags map[string]string
-	}{
-		"querier running with ingester gRPC streaming disabled and inmemory index cache": {
-			flags: mergeFlags(BlocksStorageFlags, map[string]string{
-				"-querier.ingester-streaming":                         "false",
-				"-experimental.tsdb.bucket-store.index-cache.backend": "inmemory",
-			}),
-		},
-		"querier running with ingester gRPC streaming enabled and inmemory index cache": {
-			flags: mergeFlags(BlocksStorageFlags, map[string]string{
-				"-querier.ingester-streaming":                         "true",
-				"-experimental.tsdb.bucket-store.index-cache.backend": "inmemory",
-			}),
-		},
-		"querier running with memcached index cache": {
-			flags: mergeFlags(BlocksStorageFlags, map[string]string{
-				// The address will be inject during the test execution because it's dynamic.
-				"-experimental.tsdb.bucket-store.index-cache.backend": "memcached",
-			}),
-		},
-	}
-
-	for testName, testCfg := range tests {
-		t.Run(testName, func(t *testing.T) {
-			const blockRangePeriod = 5 * time.Second
-
-			s, err := e2e.NewScenario(networkName)
-			require.NoError(t, err)
-			defer s.Close()
-
-			// Configure the blocks storage to frequently compact TSDB head
-			// and ship blocks to the storage.
-			flags := mergeFlags(testCfg.flags, map[string]string{
-				"-experimental.tsdb.store-gateway-enabled":      "false",
-				"-experimental.tsdb.block-ranges-period":        blockRangePeriod.String(),
-				"-experimental.tsdb.ship-interval":              "1s",
-				"-experimental.tsdb.bucket-store.sync-interval": "1s",
-				"-experimental.tsdb.retention-period":           ((blockRangePeriod * 2) - 1).String(),
-			})
-
-			// Detect the index cache backend from flags.
-			indexCacheBackend := tsdb.IndexCacheBackendDefault
-			if flags["-experimental.tsdb.bucket-store.index-cache.backend"] != "" {
-				indexCacheBackend = flags["-experimental.tsdb.bucket-store.index-cache.backend"]
-			}
-
-			// Start dependencies.
-			consul := e2edb.NewConsul()
-			minio := e2edb.NewMinio(9000, flags["-experimental.tsdb.s3.bucket-name"])
-			memcached := e2ecache.NewMemcached()
-			require.NoError(t, s.StartAndWaitReady(consul, minio, memcached))
-
-			// Add the memcached address to the flags.
-			flags["-experimental.tsdb.bucket-store.index-cache.memcached.addresses"] = "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort)
-
-			// Start Cortex components.
-			distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags, "")
-			ingester := e2ecortex.NewIngester("ingester", consul.NetworkHTTPEndpoint(), flags, "")
-			querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags, "")
-			require.NoError(t, s.StartAndWaitReady(distributor, ingester, querier))
-
-			// Wait until both the distributor and querier have updated the ring.
-			require.NoError(t, distributor.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
-
-			c, err := e2ecortex.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", "user-1")
-			require.NoError(t, err)
-
-			// Push some series to Cortex.
-			series1Timestamp := time.Now()
-			series2Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
-			series1, expectedVector1 := generateSeries("series_1", series1Timestamp)
-			series2, expectedVector2 := generateSeries("series_2", series2Timestamp)
-
-			res, err := c.Push(series1)
-			require.NoError(t, err)
-			require.Equal(t, 200, res.StatusCode)
-
-			res, err = c.Push(series2)
-			require.NoError(t, err)
-			require.Equal(t, 200, res.StatusCode)
-
-			// Wait until the TSDB head is compacted and shipped to the storage.
-			// The shipped block contains the 1st series, while the 2ns series in in the head.
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_shipper_uploads_total"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_memory_series_created_total"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series_removed_total"))
-
-			// Push another series to further compact another block and delete the first block
-			// due to expired retention.
-			series3Timestamp := series2Timestamp.Add(blockRangePeriod * 2)
-			series3, expectedVector3 := generateSeries("series_3", series3Timestamp)
-
-			res, err = c.Push(series3)
-			require.NoError(t, err)
-			require.Equal(t, 200, res.StatusCode)
-
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_shipper_uploads_total"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(3), "cortex_ingester_memory_series_created_total"))
-			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_memory_series_removed_total"))
-
-			// Wait until the querier has synched the new uploaded blocks.
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2), "cortex_querier_bucket_store_blocks_loaded"))
-
-			// Query back the series (1 only in the storage, 1 only in the ingesters, 1 on both).
-			result, err := c.Query("series_1", series1Timestamp)
-			require.NoError(t, err)
-			require.Equal(t, model.ValVector, result.Type())
-			assert.Equal(t, expectedVector1, result.(model.Vector))
-
-			result, err = c.Query("series_2", series2Timestamp)
-			require.NoError(t, err)
-			require.Equal(t, model.ValVector, result.Type())
-			assert.Equal(t, expectedVector2, result.(model.Vector))
-
-			result, err = c.Query("series_3", series3Timestamp)
-			require.NoError(t, err)
-			require.Equal(t, model.ValVector, result.Type())
-			assert.Equal(t, expectedVector3, result.(model.Vector))
-
-			// Check the in-memory index cache metrics (in the querier).
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(7), "cortex_querier_blocks_index_cache_requests_total"))
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(0), "cortex_querier_blocks_index_cache_hits_total")) // no cache hit cause the cache was empty
-
-			if indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2*2), "cortex_querier_blocks_index_cache_items"))             // 2 series both for postings and series cache
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2*2), "cortex_querier_blocks_index_cache_items_added_total")) // 2 series both for postings and series cache
-			} else if indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(11), "cortex_querier_blocks_index_cache_memcached_operations_total")) // 7 gets + 4 sets
-			}
-
-			// Query back again the 1st series from storage. This time it should use the index cache.
-			result, err = c.Query("series_1", series1Timestamp)
-			require.NoError(t, err)
-			require.Equal(t, model.ValVector, result.Type())
-			assert.Equal(t, expectedVector1, result.(model.Vector))
-
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(7+2), "cortex_querier_blocks_index_cache_requests_total"))
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2), "cortex_querier_blocks_index_cache_hits_total")) // this time has used the index cache
-
-			if indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2*2), "cortex_querier_blocks_index_cache_items"))             // as before
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2*2), "cortex_querier_blocks_index_cache_items_added_total")) // as before
-			} else if indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(11+2), "cortex_querier_blocks_index_cache_memcached_operations_total")) // as before + 2 gets
-			}
-
-			// Ensure no service-specific metrics prefix is used by the wrong service.
-			assertServiceMetricsPrefixes(t, Distributor, distributor)
-			assertServiceMetricsPrefixes(t, Ingester, ingester)
-			assertServiceMetricsPrefixes(t, Querier, querier)
-		})
-	}
-}
-
-func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *testing.T) {
-	tests := map[string]struct {
-		blocksShardingEnabled    bool
+		blocksShardingStrategy   string // Empty means sharding is disabled.
+		tenantShardSize          int
 		ingesterStreamingEnabled bool
 		indexCacheBackend        string
 	}{
-		"blocks sharding enabled, ingester gRPC streaming disabled, inmemory index cache": {
-			blocksShardingEnabled:    true,
-			ingesterStreamingEnabled: false,
-			indexCacheBackend:        tsdb.IndexCacheBackendInMemory,
-		},
-		"blocks sharding enabled, ingester gRPC streaming enabled, inmemory index cache": {
-			blocksShardingEnabled:    true,
-			ingesterStreamingEnabled: true,
-			indexCacheBackend:        tsdb.IndexCacheBackendInMemory,
-		},
 		"blocks sharding disabled, ingester gRPC streaming disabled, memcached index cache": {
-			blocksShardingEnabled:    false,
+			blocksShardingStrategy:   "",
 			ingesterStreamingEnabled: false,
 			// Memcached index cache is required to avoid flaky tests when the blocks sharding is disabled
 			// because two different requests may hit two different store-gateways, so if the cache is not
 			// shared there's no guarantee we'll have a cache hit.
 			indexCacheBackend: tsdb.IndexCacheBackendMemcached,
 		},
-		"blocks sharding enabled, ingester gRPC streaming enabled, memcached index cache": {
-			blocksShardingEnabled:    true,
+		"blocks default sharding, ingester gRPC streaming disabled, inmemory index cache": {
+			blocksShardingStrategy:   "default",
+			ingesterStreamingEnabled: false,
+			indexCacheBackend:        tsdb.IndexCacheBackendInMemory,
+		},
+		"blocks default sharding, ingester gRPC streaming enabled, inmemory index cache": {
+			blocksShardingStrategy:   "default",
+			ingesterStreamingEnabled: true,
+			indexCacheBackend:        tsdb.IndexCacheBackendInMemory,
+		},
+		"blocks default sharding, ingester gRPC streaming enabled, memcached index cache": {
+			blocksShardingStrategy:   "default",
+			ingesterStreamingEnabled: true,
+			indexCacheBackend:        tsdb.IndexCacheBackendMemcached,
+		},
+		"blocks shuffle sharding, ingester gRPC streaming enabled, memcached index cache": {
+			blocksShardingStrategy:   "shuffle-sharding",
+			tenantShardSize:          1,
 			ingesterStreamingEnabled: true,
 			indexCacheBackend:        tsdb.IndexCacheBackendMemcached,
 		},
@@ -223,24 +72,25 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			// Configure the blocks storage to frequently compact TSDB head
 			// and ship blocks to the storage.
 			flags := mergeFlags(BlocksStorageFlags, map[string]string{
-				"-experimental.tsdb.store-gateway-enabled":            "true",
-				"-experimental.tsdb.block-ranges-period":              blockRangePeriod.String(),
-				"-experimental.tsdb.ship-interval":                    "1s",
-				"-experimental.tsdb.bucket-store.sync-interval":       "1s",
-				"-experimental.tsdb.retention-period":                 ((blockRangePeriod * 2) - 1).String(),
-				"-experimental.tsdb.bucket-store.index-cache.backend": testCfg.indexCacheBackend,
-				"-experimental.store-gateway.sharding-enabled":        strconv.FormatBool(testCfg.blocksShardingEnabled),
-				"-querier.ingester-streaming":                         strconv.FormatBool(testCfg.ingesterStreamingEnabled),
+				"-blocks-storage.tsdb.block-ranges-period":         blockRangePeriod.String(),
+				"-blocks-storage.tsdb.ship-interval":               "1s",
+				"-blocks-storage.bucket-store.sync-interval":       "1s",
+				"-blocks-storage.tsdb.retention-period":            ((blockRangePeriod * 2) - 1).String(),
+				"-blocks-storage.bucket-store.index-cache.backend": testCfg.indexCacheBackend,
+				"-store-gateway.sharding-enabled":                  strconv.FormatBool(testCfg.blocksShardingStrategy != ""),
+				"-store-gateway.sharding-strategy":                 testCfg.blocksShardingStrategy,
+				"-store-gateway.tenant-shard-size":                 fmt.Sprintf("%d", testCfg.tenantShardSize),
+				"-querier.ingester-streaming":                      strconv.FormatBool(testCfg.ingesterStreamingEnabled),
 			})
 
 			// Start dependencies.
 			consul := e2edb.NewConsul()
-			minio := e2edb.NewMinio(9000, flags["-experimental.tsdb.s3.bucket-name"])
+			minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
 			memcached := e2ecache.NewMemcached()
 			require.NoError(t, s.StartAndWaitReady(consul, minio, memcached))
 
 			// Add the memcached address to the flags.
-			flags["-experimental.tsdb.bucket-store.index-cache.memcached.addresses"] = "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort)
+			flags["-blocks-storage.bucket-store.index-cache.memcached.addresses"] = "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort)
 
 			// Start Cortex components.
 			distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags, "")
@@ -251,9 +101,9 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			require.NoError(t, s.StartAndWaitReady(distributor, ingester, storeGateway1, storeGateway2))
 
 			// Start the querier with configuring store-gateway addresses if sharding is disabled.
-			if !testCfg.blocksShardingEnabled {
+			if testCfg.blocksShardingStrategy == "" {
 				flags = mergeFlags(flags, map[string]string{
-					"-experimental.querier.store-gateway-addresses": strings.Join([]string{storeGateway1.NetworkGRPCEndpoint(), storeGateway2.NetworkGRPCEndpoint()}, ","),
+					"-querier.store-gateway-addresses": strings.Join([]string{storeGateway1.NetworkGRPCEndpoint(), storeGateway2.NetworkGRPCEndpoint()}, ","),
 				})
 			}
 			querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags, "")
@@ -262,7 +112,7 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			// Wait until both the distributor and querier have updated the ring. The querier will also watch
 			// the store-gateway ring if blocks sharding is enabled.
 			require.NoError(t, distributor.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
-			if testCfg.blocksShardingEnabled {
+			if testCfg.blocksShardingStrategy != "" {
 				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(float64(512+(512*storeGateways.NumInstances()))), "cortex_ring_tokens_total"))
 			} else {
 				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
@@ -307,15 +157,23 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_memory_series_removed_total"))
 
 			// Wait until the querier has discovered the uploaded blocks.
-			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2), "cortex_querier_blocks_meta_synced"))
+			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2), "cortex_blocks_meta_synced"))
 
 			// Wait until the store-gateway has synched the new uploaded blocks. When sharding is enabled
 			// we don't known which store-gateway instance will synch the blocks, so we need to wait on
 			// metrics extracted from all instances.
-			if testCfg.blocksShardingEnabled {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2), "cortex_storegateway_bucket_store_blocks_loaded"))
+			if testCfg.blocksShardingStrategy != "" {
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2), "cortex_bucket_store_blocks_loaded"))
 			} else {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(float64(2*storeGateways.NumInstances())), "cortex_storegateway_bucket_store_blocks_loaded"))
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(float64(2*storeGateways.NumInstances())), "cortex_bucket_store_blocks_loaded"))
+			}
+
+			// Check how many tenants have been discovered and synced by store-gateways.
+			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(float64(1*storeGateways.NumInstances())), "cortex_bucket_stores_tenants_discovered"))
+			if testCfg.blocksShardingStrategy == "shuffle-sharding" {
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(float64(1)), "cortex_bucket_stores_tenants_synced"))
+			} else {
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(float64(1*storeGateways.NumInstances())), "cortex_bucket_stores_tenants_synced"))
 			}
 
 			// Query back the series (1 only in the storage, 1 only in the ingesters, 1 on both).
@@ -335,14 +193,14 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			assert.Equal(t, expectedVector3, result.(model.Vector))
 
 			// Check the in-memory index cache metrics (in the store-gateway).
-			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(7), "cortex_storegateway_blocks_index_cache_requests_total"))
-			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(0), "cortex_storegateway_blocks_index_cache_hits_total")) // no cache hit cause the cache was empty
+			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(7), "thanos_store_index_cache_requests_total"))
+			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(0), "thanos_store_index_cache_hits_total")) // no cache hit cause the cache was empty
 
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "cortex_storegateway_blocks_index_cache_items"))             // 2 series both for postings and series cache
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "cortex_storegateway_blocks_index_cache_items_added_total")) // 2 series both for postings and series cache
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "thanos_store_index_cache_items"))             // 2 series both for postings and series cache
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "thanos_store_index_cache_items_added_total")) // 2 series both for postings and series cache
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(11), "cortex_storegateway_blocks_index_cache_memcached_operations_total")) // 7 gets + 4 sets
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(11), "thanos_memcached_operations_total")) // 7 gets + 4 sets
 			}
 
 			// Query back again the 1st series from storage. This time it should use the index cache.
@@ -351,14 +209,14 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
 
-			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(7+2), "cortex_storegateway_blocks_index_cache_requests_total"))
-			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2), "cortex_storegateway_blocks_index_cache_hits_total")) // this time has used the index cache
+			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(7+2), "thanos_store_index_cache_requests_total"))
+			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2), "thanos_store_index_cache_hits_total")) // this time has used the index cache
 
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "cortex_storegateway_blocks_index_cache_items"))             // as before
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "cortex_storegateway_blocks_index_cache_items_added_total")) // as before
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "thanos_store_index_cache_items"))             // as before
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2), "thanos_store_index_cache_items_added_total")) // as before
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(11+2), "cortex_storegateway_blocks_index_cache_memcached_operations_total")) // as before + 2 gets
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(11+2), "thanos_memcached_operations_total")) // as before + 2 gets
 			}
 
 			// Ensure no service-specific metrics prefix is used by the wrong service.
@@ -371,7 +229,7 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInMicroservicesMode(t *te
 	}
 }
 
-func TestQuerierWithBlocksStorageAndStoreGatewayRunningInSingleBinaryMode(t *testing.T) {
+func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 	tests := map[string]struct {
 		blocksShardingEnabled    bool
 		ingesterStreamingEnabled bool
@@ -424,24 +282,23 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInSingleBinaryMode(t *tes
 			// Configure the blocks storage to frequently compact TSDB head
 			// and ship blocks to the storage.
 			flags := mergeFlags(BlocksStorageFlags, map[string]string{
-				"-experimental.tsdb.store-gateway-enabled":                        "true",
-				"-experimental.tsdb.block-ranges-period":                          blockRangePeriod.String(),
-				"-experimental.tsdb.ship-interval":                                "1s",
-				"-experimental.tsdb.bucket-store.sync-interval":                   "1s",
-				"-experimental.tsdb.retention-period":                             ((blockRangePeriod * 2) - 1).String(),
-				"-experimental.tsdb.bucket-store.index-cache.backend":             testCfg.indexCacheBackend,
-				"-experimental.tsdb.bucket-store.index-cache.memcached.addresses": "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
-				"-querier.ingester-streaming":                                     strconv.FormatBool(testCfg.ingesterStreamingEnabled),
+				"-blocks-storage.tsdb.block-ranges-period":                     blockRangePeriod.String(),
+				"-blocks-storage.tsdb.ship-interval":                           "1s",
+				"-blocks-storage.bucket-store.sync-interval":                   "1s",
+				"-blocks-storage.tsdb.retention-period":                        ((blockRangePeriod * 2) - 1).String(),
+				"-blocks-storage.bucket-store.index-cache.backend":             testCfg.indexCacheBackend,
+				"-blocks-storage.bucket-store.index-cache.memcached.addresses": "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
+				"-querier.ingester-streaming":                                  strconv.FormatBool(testCfg.ingesterStreamingEnabled),
 				// Ingester.
 				"-ring.store":      "consul",
 				"-consul.hostname": consul.NetworkHTTPEndpoint(),
 				// Distributor.
 				"-distributor.replication-factor": strconv.FormatInt(seriesReplicationFactor, 10),
 				// Store-gateway.
-				"-experimental.store-gateway.sharding-enabled":              strconv.FormatBool(testCfg.blocksShardingEnabled),
-				"-experimental.store-gateway.sharding-ring.store":           "consul",
-				"-experimental.store-gateway.sharding-ring.consul.hostname": consul.NetworkHTTPEndpoint(),
-				"-experimental.store-gateway.replication-factor":            "1",
+				"-store-gateway.sharding-enabled":                 strconv.FormatBool(testCfg.blocksShardingEnabled),
+				"-store-gateway.sharding-ring.store":              "consul",
+				"-store-gateway.sharding-ring.consul.hostname":    consul.NetworkHTTPEndpoint(),
+				"-store-gateway.sharding-ring.replication-factor": "1",
 			})
 
 			// Start Cortex replicas.
@@ -499,15 +356,16 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInSingleBinaryMode(t *tes
 			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*cluster.NumInstances())), "cortex_ingester_memory_series_removed_total"))
 
 			// Wait until the querier has discovered the uploaded blocks (discovered both by the querier and store-gateway).
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*cluster.NumInstances()*2)), "cortex_querier_blocks_meta_synced"))
+			require.NoError(t, cluster.WaitSumMetricsWithOptions(e2e.Equals(float64(2*cluster.NumInstances()*2)), []string{"cortex_blocks_meta_synced"}, e2e.WithLabelMatchers(
+				labels.MustNewMatcher(labels.MatchEqual, "component", "querier"))))
 
 			// Wait until the store-gateway has synched the new uploaded blocks.
 			const shippedBlocks = 2
 
 			if testCfg.blocksShardingEnabled {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(shippedBlocks*seriesReplicationFactor)), "cortex_storegateway_bucket_store_blocks_loaded"))
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(shippedBlocks*seriesReplicationFactor)), "cortex_bucket_store_blocks_loaded"))
 			} else {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(shippedBlocks*seriesReplicationFactor*cluster.NumInstances())), "cortex_storegateway_bucket_store_blocks_loaded"))
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(shippedBlocks*seriesReplicationFactor*cluster.NumInstances())), "cortex_bucket_store_blocks_loaded"))
 			}
 
 			// Query back the series (1 only in the storage, 1 only in the ingesters, 1 on both).
@@ -527,14 +385,14 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInSingleBinaryMode(t *tes
 			assert.Equal(t, expectedVector3, result.(model.Vector))
 
 			// Check the in-memory index cache metrics (in the store-gateway).
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(7*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_requests_total"))
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(0), "cortex_storegateway_blocks_index_cache_hits_total")) // no cache hit cause the cache was empty
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(7*seriesReplicationFactor)), "thanos_store_index_cache_requests_total"))
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(0), "thanos_store_index_cache_hits_total")) // no cache hit cause the cache was empty
 
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_items"))             // 2 series both for postings and series cache
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_items_added_total")) // 2 series both for postings and series cache
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "thanos_store_index_cache_items"))             // 2 series both for postings and series cache
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "thanos_store_index_cache_items_added_total")) // 2 series both for postings and series cache
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(11*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_memcached_operations_total")) // 7 gets + 4 sets
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(11*seriesReplicationFactor)), "thanos_memcached_operations_total")) // 7 gets + 4 sets
 			}
 
 			// Query back again the 1st series from storage. This time it should use the index cache.
@@ -543,14 +401,14 @@ func TestQuerierWithBlocksStorageAndStoreGatewayRunningInSingleBinaryMode(t *tes
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
 
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((7+2)*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_requests_total"))
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_hits_total")) // this time has used the index cache
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((7+2)*seriesReplicationFactor)), "thanos_store_index_cache_requests_total"))
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*seriesReplicationFactor)), "thanos_store_index_cache_hits_total")) // this time has used the index cache
 
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_items"))             // as before
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_items_added_total")) // as before
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "thanos_store_index_cache_items"))             // as before
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*2*seriesReplicationFactor)), "thanos_store_index_cache_items_added_total")) // as before
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((11+2)*seriesReplicationFactor)), "cortex_storegateway_blocks_index_cache_memcached_operations_total")) // as before + 2 gets
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((11+2)*seriesReplicationFactor)), "thanos_memcached_operations_total")) // as before + 2 gets
 			}
 		})
 	}
@@ -566,14 +424,14 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 	// Configure the blocks storage to frequently compact TSDB head
 	// and ship blocks to the storage.
 	flags := mergeFlags(BlocksStorageFlags, map[string]string{
-		"-experimental.tsdb.block-ranges-period": blockRangePeriod.String(),
-		"-experimental.tsdb.ship-interval":       "1s",
-		"-experimental.tsdb.retention-period":    ((blockRangePeriod * 2) - 1).String(),
+		"-blocks-storage.tsdb.block-ranges-period": blockRangePeriod.String(),
+		"-blocks-storage.tsdb.ship-interval":       "1s",
+		"-blocks-storage.tsdb.retention-period":    ((blockRangePeriod * 2) - 1).String(),
 	})
 
 	// Start dependencies.
 	consul := e2edb.NewConsul()
-	minio := e2edb.NewMinio(9000, flags["-experimental.tsdb.s3.bucket-name"])
+	minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
 	require.NoError(t, s.StartAndWaitReady(consul, minio))
 
 	// Start Cortex components for the write path.
@@ -608,14 +466,18 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series_removed_total"))
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series"))
 
-	// Start the querier and configure it to not frequently sync blocks.
-	querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), mergeFlags(flags, map[string]string{
-		"-experimental.tsdb.bucket-store.sync-interval": "1m",
+	// Start the querier and store-gateway, and configure them to not frequently sync blocks.
+	storeGateway := e2ecortex.NewStoreGateway("store-gateway", consul.NetworkHTTPEndpoint(), mergeFlags(flags, map[string]string{
+		"-blocks-storage.bucket-store.sync-interval": "1m",
 	}), "")
-	require.NoError(t, s.StartAndWaitReady(querier))
+	querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), mergeFlags(flags, map[string]string{
+		"-blocks-storage.bucket-store.sync-interval": "1m",
+	}), "")
+	require.NoError(t, s.StartAndWaitReady(querier, storeGateway))
 
-	// Wait until the querier has updated the ring.
-	require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+	// Wait until the querier and store-gateway have updated the ring.
+	require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512*2), "cortex_ring_tokens_total"))
+	require.NoError(t, storeGateway.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
 
 	// Query back the series.
 	c, err = e2ecortex.NewClient("", querier.HTTPEndpoint(), "", "", "user-1")
@@ -627,7 +489,7 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 	assert.Equal(t, expectedVector1, result.(model.Vector))
 
 	// Delete all blocks from the storage.
-	storage, err := e2ecortex.NewS3ClientForMinio(minio, flags["-experimental.tsdb.s3.bucket-name"])
+	storage, err := e2ecortex.NewS3ClientForMinio(minio, flags["-blocks-storage.s3.bucket-name"])
 	require.NoError(t, err)
 	require.NoError(t, storage.DeleteBlocks("user-1"))
 
@@ -691,6 +553,7 @@ func TestQuerierWithChunksStorage(t *testing.T) {
 	querierFlags := mergeFlags(flags, map[string]string{
 		"-store.index-cache-read.memcached.addresses":  "dns+memcached0:11211",
 		"-store.index-cache-write.memcached.addresses": "dns+memcached1:11211",
+		"-store.max-query-length":                      "240h",
 	})
 
 	querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), querierFlags, "")
@@ -709,6 +572,13 @@ func TestQuerierWithChunksStorage(t *testing.T) {
 		c, err := e2ecortex.NewClient("", querier.HTTPEndpoint(), "", "", fmt.Sprintf("user-%d", userID))
 		require.NoError(t, err)
 
+		if userID == 0 { // No need to repeat this test for each user.
+			res, body, err := c.QueryRaw("{instance=~\"hello.*\"}")
+			require.NoError(t, err)
+			require.Equal(t, 422, res.StatusCode)
+			require.Contains(t, string(body), "query must contain metric name")
+		}
+
 		for q := 0; q < numQueriesPerUser; q++ {
 			go func() {
 				defer wg.Done()
@@ -723,9 +593,130 @@ func TestQuerierWithChunksStorage(t *testing.T) {
 
 	wg.Wait()
 
+	c, err := e2ecortex.NewClient("", querier.HTTPEndpoint(), "", "", "user-0")
+	require.NoError(t, err)
+
+	// Ensure limit errors on ranged queries don't return 500s.
+	start := now.Add(-264 * time.Hour)
+	end := now
+	step := 264 * time.Hour
+
+	r, body, err := c.QueryRangeRaw("series_1", start, end, step)
+	require.NoError(t, err)
+	require.Equal(t, 422, r.StatusCode)
+	expected := `
+	{
+		"error":"expanding series: the query time range exceeds the limit (query length: 264h5m0s, limit: 240h0m0s)",
+		"errorType":"execution",
+		"status":"error"
+	}
+	`
+	require.JSONEq(t, expected, string(body))
+
 	// Ensure no service-specific metrics prefix is used by the wrong service.
 	assertServiceMetricsPrefixes(t, Distributor, distributor)
 	assertServiceMetricsPrefixes(t, Ingester, ingester)
 	assertServiceMetricsPrefixes(t, Querier, querier)
 	assertServiceMetricsPrefixes(t, TableManager, tableManager)
+}
+
+func TestHashCollisionHandling(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
+	flags := mergeFlags(ChunksStorageFlags, map[string]string{})
+
+	// Start dependencies.
+	dynamo := e2edb.NewDynamoDB()
+
+	consul := e2edb.NewConsul()
+	require.NoError(t, s.StartAndWaitReady(consul, dynamo))
+
+	tableManager := e2ecortex.NewTableManager("table-manager", ChunksStorageFlags, "")
+	require.NoError(t, s.StartAndWaitReady(tableManager))
+
+	// Wait until the first table-manager sync has completed, so that we're
+	// sure the tables have been created.
+	require.NoError(t, tableManager.WaitSumMetrics(e2e.Greater(0), "cortex_table_manager_sync_success_timestamp_seconds"))
+
+	// Start Cortex components for the write path.
+	distributor := e2ecortex.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags, "")
+	ingester := e2ecortex.NewIngester("ingester", consul.NetworkHTTPEndpoint(), flags, "")
+	require.NoError(t, s.StartAndWaitReady(distributor, ingester))
+
+	// Wait until the distributor has updated the ring.
+	require.NoError(t, distributor.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+
+	// Push a series for each user to Cortex.
+	now := time.Now()
+
+	c, err := e2ecortex.NewClient(distributor.HTTPEndpoint(), "", "", "", "user-0")
+	require.NoError(t, err)
+
+	var series []prompb.TimeSeries
+	var expectedVector model.Vector
+	// Generate two series which collide on fingerprints and fast fingerprints.
+	tsMillis := e2e.TimeToMilliseconds(now)
+	metric1 := []prompb.Label{
+		{Name: "A", Value: "K6sjsNNczPl"},
+		{Name: labels.MetricName, Value: "fingerprint_collision"},
+	}
+	metric2 := []prompb.Label{
+		{Name: "A", Value: "cswpLMIZpwt"},
+		{Name: labels.MetricName, Value: "fingerprint_collision"},
+	}
+
+	series = append(series, prompb.TimeSeries{
+		Labels: metric1,
+		Samples: []prompb.Sample{
+			{Value: float64(0), Timestamp: tsMillis},
+		},
+	})
+	expectedVector = append(expectedVector, &model.Sample{
+		Metric:    prompbLabelsToModelMetric(metric1),
+		Value:     model.SampleValue(float64(0)),
+		Timestamp: model.Time(tsMillis),
+	})
+	series = append(series, prompb.TimeSeries{
+		Labels: metric2,
+		Samples: []prompb.Sample{
+			{Value: float64(1), Timestamp: tsMillis},
+		},
+	})
+	expectedVector = append(expectedVector, &model.Sample{
+		Metric:    prompbLabelsToModelMetric(metric2),
+		Value:     model.SampleValue(float64(1)),
+		Timestamp: model.Time(tsMillis),
+	})
+
+	res, err := c.Push(series)
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	querier := e2ecortex.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags, "")
+	require.NoError(t, s.StartAndWaitReady(querier))
+
+	// Wait until the querier has updated the ring.
+	require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+
+	// Query the series.
+	c, err = e2ecortex.NewClient("", querier.HTTPEndpoint(), "", "", "user-0")
+	require.NoError(t, err)
+
+	result, err := c.Query("fingerprint_collision", now)
+	require.NoError(t, err)
+	require.Equal(t, model.ValVector, result.Type())
+	require.Equal(t, expectedVector, result.(model.Vector))
+}
+
+func prompbLabelsToModelMetric(pbLabels []prompb.Label) model.Metric {
+	metric := model.Metric{}
+
+	for _, l := range pbLabels {
+		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
+	}
+
+	return metric
 }

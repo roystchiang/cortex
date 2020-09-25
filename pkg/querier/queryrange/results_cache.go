@@ -14,6 +14,7 @@ import (
 	"github.com/gogo/protobuf/types"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/uber/jaeger-client-go"
 	"github.com/weaveworks/common/httpgrpc"
@@ -26,8 +27,8 @@ import (
 )
 
 var (
-	// Value that cachecontrolHeader has if the response indicates that the results should not be cached.
-	noCacheValue = "no-store"
+	// Value that cacheControlHeader has if the response indicates that the results should not be cached.
+	noStoreValue = "no-store"
 
 	// ResultsCacheGenNumberHeaderName holds name of the header we want to set in http response
 	ResultsCacheGenNumberHeaderName = "Results-Cache-Gen-Number"
@@ -39,8 +40,7 @@ type CacheGenNumberLoader interface {
 
 // ResultsCacheConfig is the config for the results cache.
 type ResultsCacheConfig struct {
-	CacheConfig       cache.Config  `yaml:"cache"`
-	MaxCacheFreshness time.Duration `yaml:"max_freshness"`
+	CacheConfig cache.Config `yaml:"cache"`
 }
 
 // RegisterFlags registers flags.
@@ -48,8 +48,6 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.CacheConfig.RegisterFlagsWithPrefix("frontend.", "", f)
 
 	flagext.DeprecatedFlag(f, "frontend.cache-split-interval", "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.")
-
-	f.DurationVar(&cfg.MaxCacheFreshness, "frontend.max-cache-freshness", 1*time.Minute, "Most recent allowed cacheable result, to prevent caching very recent results that might still be in flux.")
 }
 
 // Extractor is used by the cache to extract a subset of a response from a cache entry.
@@ -103,6 +101,10 @@ func (t constSplitter) GenerateCacheKey(userID string, r Request) string {
 	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
 }
 
+// ShouldCacheFn checks whether the current request should go to cache
+// or not. If not, just send the request to next handler.
+type ShouldCacheFn func(r Request) bool
+
 type resultsCache struct {
 	logger   log.Logger
 	cfg      ResultsCacheConfig
@@ -114,6 +116,7 @@ type resultsCache struct {
 	extractor            Extractor
 	merger               Merger
 	cacheGenNumberLoader CacheGenNumberLoader
+	shouldCache          ShouldCacheFn
 }
 
 // NewResultsCacheMiddleware creates results cache middleware from config.
@@ -130,8 +133,10 @@ func NewResultsCacheMiddleware(
 	merger Merger,
 	extractor Extractor,
 	cacheGenNumberLoader CacheGenNumberLoader,
+	shouldCache ShouldCacheFn,
+	reg prometheus.Registerer,
 ) (Middleware, cache.Cache, error) {
-	c, err := cache.New(cfg.CacheConfig)
+	c, err := cache.New(cfg.CacheConfig, reg, logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,6 +156,7 @@ func NewResultsCacheMiddleware(
 			extractor:            extractor,
 			splitter:             splitter,
 			cacheGenNumberLoader: cacheGenNumberLoader,
+			shouldCache:          shouldCache,
 		}
 	}), c, nil
 }
@@ -159,6 +165,10 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+	}
+
+	if s.shouldCache != nil && !s.shouldCache(r) {
+		return s.next.Do(ctx, r)
 	}
 
 	if s.cacheGenNumberLoader != nil {
@@ -171,7 +181,8 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 		response Response
 	)
 
-	maxCacheTime := int64(model.Now().Add(-s.cfg.MaxCacheFreshness))
+	maxCacheFreshness := s.limits.MaxCacheFreshness(userID)
+	maxCacheTime := int64(model.Now().Add(-maxCacheFreshness))
 	if r.GetStart() > maxCacheTime {
 		return s.next.Do(ctx, r)
 	}
@@ -184,7 +195,7 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	}
 
 	if err == nil && len(extents) > 0 {
-		extents, err := s.filterRecentExtents(r, extents)
+		extents, err := s.filterRecentExtents(r, maxCacheFreshness, extents)
 		if err != nil {
 			return nil, err
 		}
@@ -196,10 +207,10 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 
 // shouldCacheResponse says whether the response should be cached or not.
 func (s resultsCache) shouldCacheResponse(ctx context.Context, r Response) bool {
-	headerValues := getHeaderValuesWithName(r, cachecontrolHeader)
+	headerValues := getHeaderValuesWithName(r, cacheControlHeader)
 	for _, v := range headerValues {
-		if v == noCacheValue {
-			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cachecontrolHeader, noCacheValue))
+		if v == noStoreValue {
+			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
 			return false
 		}
 	}
@@ -417,8 +428,8 @@ func partition(req Request, extents []Extent, extractor Extractor) ([]Request, [
 	return requests, cachedResponses, nil
 }
 
-func (s resultsCache) filterRecentExtents(req Request, extents []Extent) ([]Extent, error) {
-	maxCacheTime := (int64(model.Now().Add(-s.cfg.MaxCacheFreshness)) / req.GetStep()) * req.GetStep()
+func (s resultsCache) filterRecentExtents(req Request, maxCacheFreshness time.Duration, extents []Extent) ([]Extent, error) {
+	maxCacheTime := (int64(model.Now().Add(-maxCacheFreshness)) / req.GetStep()) * req.GetStep()
 	for i := range extents {
 		// Never cache data for the latest freshness period.
 		if extents[i].End > maxCacheTime {
@@ -445,14 +456,14 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	}
 
 	var resp CachedResponse
-	sp, _ := opentracing.StartSpanFromContext(ctx, "unmarshal-extent")
-	defer sp.Finish()
+	log, ctx := spanlogger.New(ctx, "unmarshal-extent") //nolint:ineffassign,staticcheck
+	defer log.Finish()
 
-	sp.LogFields(otlog.Int("bytes", len(bufs[0])))
+	log.LogFields(otlog.Int("bytes", len(bufs[0])))
 
 	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
-		level.Error(s.logger).Log("msg", "error unmarshalling cached value", "err", err)
-		sp.LogFields(otlog.Error(err))
+		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
+		log.Error(err)
 		return nil, false
 	}
 

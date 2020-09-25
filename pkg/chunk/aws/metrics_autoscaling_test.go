@@ -58,24 +58,32 @@ func fixturePeriodicTableConfig(prefix string) chunk.PeriodicTableConfig {
 
 func fixtureProvisionConfig(inactLastN int64, writeScale, inactWriteScale chunk.AutoScalingConfig) chunk.ProvisionConfig {
 	return chunk.ProvisionConfig{
-		ProvisionedWriteThroughput: write,
-		ProvisionedReadThroughput:  read,
-		InactiveWriteThroughput:    inactiveWrite,
-		InactiveReadThroughput:     inactiveRead,
-		WriteScale:                 writeScale,
-		InactiveWriteScale:         inactWriteScale,
-		InactiveWriteScaleLastN:    inactLastN,
+		ActiveTableProvisionConfig: chunk.ActiveTableProvisionConfig{
+			ProvisionedWriteThroughput: write,
+			ProvisionedReadThroughput:  read,
+			WriteScale:                 writeScale,
+		},
+		InactiveTableProvisionConfig: chunk.InactiveTableProvisionConfig{
+			InactiveWriteThroughput: inactiveWrite,
+			InactiveReadThroughput:  inactiveRead,
+			InactiveWriteScale:      inactWriteScale,
+			InactiveWriteScaleLastN: inactLastN,
+		},
 	}
 }
 
 func fixtureReadProvisionConfig(readScale, inactReadScale chunk.AutoScalingConfig) chunk.ProvisionConfig {
 	return chunk.ProvisionConfig{
-		ProvisionedWriteThroughput: write,
-		ProvisionedReadThroughput:  read,
-		InactiveWriteThroughput:    inactiveWrite,
-		InactiveReadThroughput:     inactiveRead,
-		ReadScale:                  readScale,
-		InactiveReadScale:          inactReadScale,
+		ActiveTableProvisionConfig: chunk.ActiveTableProvisionConfig{
+			ProvisionedWriteThroughput: write,
+			ProvisionedReadThroughput:  read,
+			ReadScale:                  readScale,
+		},
+		InactiveTableProvisionConfig: chunk.InactiveTableProvisionConfig{
+			InactiveWriteThroughput: inactiveWrite,
+			InactiveReadThroughput:  inactiveRead,
+			InactiveReadScale:       inactReadScale,
+		},
 	}
 }
 
@@ -131,6 +139,7 @@ func TestTableManagerMetricsAutoScaling(t *testing.T) {
 			},
 			tableLastUpdated: make(map[string]time.Time),
 		},
+		metrics: newMetrics(nil),
 	}
 
 	indexWriteScale := fixtureWriteScale()
@@ -162,7 +171,7 @@ func TestTableManagerMetricsAutoScaling(t *testing.T) {
 		ChunkTables:         fixtureProvisionConfig(2, chunkWriteScale, inactiveWriteScale),
 	}
 
-	tableManager, err := chunk.NewTableManager(tbm, cfg, maxChunkAge, client, nil, nil)
+	tableManager, err := chunk.NewTableManager(tbm, cfg, maxChunkAge, client, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,6 +300,7 @@ func TestTableManagerMetricsReadAutoScaling(t *testing.T) {
 			tableLastUpdated:     make(map[string]time.Time),
 			tableReadLastUpdated: make(map[string]time.Time),
 		},
+		metrics: newMetrics(nil),
 	}
 
 	indexReadScale := fixtureReadScale()
@@ -320,7 +330,7 @@ func TestTableManagerMetricsReadAutoScaling(t *testing.T) {
 		ChunkTables:         fixtureReadProvisionConfig(chunkReadScale, inactiveReadScale),
 	}
 
-	tableManager, err := chunk.NewTableManager(tbm, cfg, maxChunkAge, client, nil, nil)
+	tableManager, err := chunk.NewTableManager(tbm, cfg, maxChunkAge, client, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

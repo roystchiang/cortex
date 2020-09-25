@@ -11,86 +11,18 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
-	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
+	"github.com/cortexproject/cortex/pkg/util/tls"
 )
-
-func Test_findSmallestInstanceSet(t *testing.T) {
-	tests := map[string]struct {
-		input    []ring.ReplicationSet
-		expected []string
-	}{
-		"empty replication set": {
-			input:    nil,
-			expected: nil,
-		},
-		"single replication set": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-2"}}},
-			},
-			expected: []string{"instance-1"},
-		},
-		"no replication": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-3"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}}},
-			},
-			expected: []string{"instance-1", "instance-3"},
-		},
-		"all replication sets share the same instance": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-3"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-4"}, {Addr: "instance-2"}}},
-			},
-			expected: []string{"instance-2"},
-		},
-		"all replication sets share the same instance except one": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-3"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-4"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-5"}, {Addr: "instance-1"}}},
-			},
-			expected: []string{"instance-2", "instance-5"},
-		},
-		"few replication sets share the same instance": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-3"}, {Addr: "instance-4"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-5"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-4"}, {Addr: "instance-6"}}},
-			},
-			expected: []string{"instance-1", "instance-4"},
-		},
-		"no replication set share the same instance": {
-			input: []ring.ReplicationSet{
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-1"}, {Addr: "instance-2"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-3"}, {Addr: "instance-4"}}},
-				{Ingesters: []ring.IngesterDesc{{Addr: "instance-5"}, {Addr: "instance-6"}}},
-			},
-			expected: []string{"instance-1", "instance-3", "instance-5"},
-		},
-	}
-
-	for testName, testData := range tests {
-		t.Run(testName, func(t *testing.T) {
-			assert.Equal(t, testData.expected, findSmallestInstanceSet(testData.input))
-		})
-	}
-}
 
 func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 	// The following block IDs have been picked to have increasing hash values
@@ -105,29 +37,74 @@ func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 	block3Hash := cortex_tsdb.HashBlockID(block3)
 	block4Hash := cortex_tsdb.HashBlockID(block4)
 
+	// Ensure the user ID we use belongs to the instances holding the token for the block 1
+	// (it's expected by the assertions below).
+	userID := "user-A"
+	require.LessOrEqual(t, cortex_tsdb.HashTenantID(userID), block1Hash)
+
 	tests := map[string]struct {
+		shardingStrategy  string
+		tenantShardSize   int
 		replicationFactor int
 		setup             func(*ring.Desc)
 		queryBlocks       []ulid.ULID
-		expectedClients   []string
+		exclude           map[ulid.ULID][]string
+		expectedClients   map[string][]ulid.ULID
+		expectedErr       error
 	}{
-		"single instance in the ring with replication factor = 1": {
+		//
+		// Sharding strategy: default
+		//
+		"default sharding, single instance in the ring with RF = 1": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
 			replicationFactor: 1,
 			setup: func(d *ring.Desc) {
 				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
 			},
-			queryBlocks:     []ulid.ULID{block1, block2},
-			expectedClients: []string{"127.0.0.1"},
+			queryBlocks: []ulid.ULID{block1, block2},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2},
+			},
 		},
-		"single instance in the ring with replication factor = 2": {
+		"default sharding, single instance in the ring with RF = 1 but excluded": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			exclude: map[ulid.ULID][]string{
+				block1: {"127.0.0.1"},
+			},
+			expectedErr: fmt.Errorf("no store-gateway instance left after checking exclude for block %s", block1.String()),
+		},
+		"default sharding, single instance in the ring with RF = 1 but excluded for non queried block": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			exclude: map[ulid.ULID][]string{
+				block3: {"127.0.0.1"},
+			},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2},
+			},
+		},
+		"default sharding, single instance in the ring with RF = 2": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
 			replicationFactor: 2,
 			setup: func(d *ring.Desc) {
 				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
 			},
-			queryBlocks:     []ulid.ULID{block1, block2},
-			expectedClients: []string{"127.0.0.1"},
+			queryBlocks: []ulid.ULID{block1, block2},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2},
+			},
 		},
-		"multiple instances in the ring with replication factor = 1": {
+		"default sharding, multiple instances in the ring with each requested block belonging to a different store-gateway and RF = 1": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
 			replicationFactor: 1,
 			setup: func(d *ring.Desc) {
 				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
@@ -135,10 +112,30 @@ func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
 				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
 			},
-			queryBlocks:     []ulid.ULID{block1, block3, block4},
-			expectedClients: []string{"127.0.0.1", "127.0.0.3", "127.0.0.4"},
+			queryBlocks: []ulid.ULID{block1, block3, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1},
+				"127.0.0.3": {block3},
+				"127.0.0.4": {block4},
+			},
 		},
-		"multiple instances in the ring with replication factor = 2": {
+		"default sharding, multiple instances in the ring with each requested block belonging to a different store-gateway and RF = 1 but excluded": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block3, block4},
+			exclude: map[ulid.ULID][]string{
+				block3: {"127.0.0.3"},
+			},
+			expectedErr: fmt.Errorf("no store-gateway instance left after checking exclude for block %s", block3.String()),
+		},
+		"default sharding, multiple instances in the ring with each requested block belonging to a different store-gateway and RF = 2": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
 			replicationFactor: 2,
 			setup: func(d *ring.Desc) {
 				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
@@ -146,8 +143,168 @@ func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
 				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
 			},
-			queryBlocks:     []ulid.ULID{block1, block3, block4},
-			expectedClients: []string{"127.0.0.1", "127.0.0.4" /* block4 is also replicated by instance-4 */},
+			queryBlocks: []ulid.ULID{block1, block3, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1},
+				"127.0.0.3": {block3},
+				"127.0.0.4": {block4},
+			},
+		},
+		"default sharding, multiple instances in the ring with multiple requested blocks belonging to the same store-gateway and RF = 2": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
+			replicationFactor: 2,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2, block3, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block4},
+				"127.0.0.2": {block2, block3},
+			},
+		},
+		"default sharding, multiple instances in the ring with each requested block belonging to a different store-gateway and RF = 2 and some blocks excluded but with replacement available": {
+			shardingStrategy:  storegateway.ShardingStrategyDefault,
+			replicationFactor: 2,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block3, block4},
+			exclude: map[ulid.ULID][]string{
+				block3: {"127.0.0.3"},
+				block1: {"127.0.0.1"},
+			},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.2": {block1},
+				"127.0.0.4": {block3, block4},
+			},
+		},
+		//
+		// Sharding strategy: shuffle sharding
+		//
+		"shuffle sharding, single instance in the ring with RF = 1, SS = 1": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   1,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2},
+			},
+		},
+		"shuffle sharding, single instance in the ring with RF = 1, SS = 1 but excluded": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   1,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			exclude: map[ulid.ULID][]string{
+				block1: {"127.0.0.1"},
+			},
+			expectedErr: fmt.Errorf("no store-gateway instance left after checking exclude for block %s", block1.String()),
+		},
+		"shuffle sharding, single instance in the ring with RF = 2, SS = 2": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   2,
+			replicationFactor: 2,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2},
+			},
+		},
+		"shuffle sharding, multiple instances in the ring with RF = 1, SS = 1": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   1,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block2, block4},
+			},
+		},
+		"shuffle sharding, multiple instances in the ring with RF = 1, SS = 2": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   2,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1, block4},
+				"127.0.0.2": {block2},
+			},
+		},
+		"shuffle sharding, multiple instances in the ring with RF = 1, SS = 4": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   4,
+			replicationFactor: 1,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2, block4},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.1": {block1},
+				"127.0.0.2": {block2},
+				"127.0.0.4": {block4},
+			},
+		},
+		"shuffle sharding, multiple instances in the ring with RF = 2, SS = 2 with excluded blocks but some replacement available": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   2,
+			replicationFactor: 2,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			exclude: map[ulid.ULID][]string{
+				block1: {"127.0.0.1"},
+				block2: {"127.0.0.1"},
+			},
+			expectedClients: map[string][]ulid.ULID{
+				"127.0.0.2": {block1, block2},
+			},
+		},
+		"shuffle sharding, multiple instances in the ring with RF = 2, SS = 2 with excluded blocks and no replacement available": {
+			shardingStrategy:  storegateway.ShardingStrategyShuffle,
+			tenantShardSize:   2,
+			replicationFactor: 2,
+			setup: func(d *ring.Desc) {
+				d.AddIngester("instance-1", "127.0.0.1", "", []uint32{block1Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-2", "127.0.0.2", "", []uint32{block2Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-3", "127.0.0.3", "", []uint32{block3Hash + 1}, ring.ACTIVE)
+				d.AddIngester("instance-4", "127.0.0.4", "", []uint32{block4Hash + 1}, ring.ACTIVE)
+			},
+			queryBlocks: []ulid.ULID{block1, block2},
+			exclude: map[ulid.ULID][]string{
+				block1: {"127.0.0.1", "127.0.0.2"},
+				block2: {"127.0.0.1"},
+			},
+			expectedErr: fmt.Errorf("no store-gateway instance left after checking exclude for block %s", block1.String()),
 		},
 	}
 
@@ -174,8 +331,12 @@ func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 			r, err := ring.NewWithStoreClientAndStrategy(ringCfg, "test", "test", ringStore, &storegateway.BlocksReplicationStrategy{})
 			require.NoError(t, err)
 
+			limits := &blocksStoreLimitsMock{
+				storeGatewayTenantShardSize: testData.tenantShardSize,
+			}
+
 			reg := prometheus.NewPedanticRegistry()
-			s, err := newBlocksStoreReplicationSet(r, log.NewNopLogger(), reg)
+			s, err := newBlocksStoreReplicationSet(r, testData.shardingStrategy, limits, tls.ClientConfig{}, log.NewNopLogger(), reg)
 			require.NoError(t, err)
 			require.NoError(t, services.StartAndAwaitRunning(ctx, s))
 			defer services.StopAndAwaitTerminated(ctx, s) //nolint:errcheck
@@ -186,28 +347,26 @@ func TestBlocksStoreReplicationSet_GetClientsFor(t *testing.T) {
 				return err == nil && len(all.Ingesters) > 0
 			})
 
-			var metas []*metadata.Meta
-			for _, id := range testData.queryBlocks {
-				metas = append(metas, &metadata.Meta{BlockMeta: tsdb.BlockMeta{ULID: id}})
+			clients, err := s.GetClientsFor(userID, testData.queryBlocks, testData.exclude)
+			assert.Equal(t, testData.expectedErr, err)
+
+			if testData.expectedErr == nil {
+				assert.Equal(t, testData.expectedClients, getStoreGatewayClientAddrs(clients))
+
+				assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+					# HELP cortex_storegateway_clients The current number of store-gateway clients in the pool.
+					# TYPE cortex_storegateway_clients gauge
+					cortex_storegateway_clients{client="querier"} %d
+				`, len(testData.expectedClients))), "cortex_storegateway_clients"))
 			}
-
-			clients, err := s.GetClientsFor(metas)
-			require.NoError(t, err)
-			assert.ElementsMatch(t, testData.expectedClients, getStoreClientClientAddrs(clients))
-
-			assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-				# HELP cortex_storegateway_clients The current number of store-gateway clients in the pool.
-				# TYPE cortex_storegateway_clients gauge
-				cortex_storegateway_clients{client="querier"} %d
-			`, len(testData.expectedClients))), "cortex_storegateway_clients"))
 		})
 	}
 }
 
-func getStoreClientClientAddrs(clients []storegatewaypb.StoreGatewayClient) []string {
-	var addrs []string
-	for _, c := range clients {
-		addrs = append(addrs, c.(*storeGatewayClient).conn.Target())
+func getStoreGatewayClientAddrs(clients map[BlocksStoreClient][]ulid.ULID) map[string][]ulid.ULID {
+	addrs := map[string][]ulid.ULID{}
+	for c, blockIDs := range clients {
+		addrs[c.RemoteAddress()] = blockIDs
 	}
 	return addrs
 }

@@ -25,9 +25,11 @@ const (
 )
 
 var (
-	errInvalidSchemaVersion = errors.New("invalid schema version")
-	errInvalidTablePeriod   = errors.New("the table period must be a multiple of 24h (1h for schema v1)")
-	errConfigFileNotSet     = errors.New("schema config file needs to be set")
+	errInvalidSchemaVersion     = errors.New("invalid schema version")
+	errInvalidTablePeriod       = errors.New("the table period must be a multiple of 24h (1h for schema v1)")
+	errConfigFileNotSet         = errors.New("schema config file needs to be set")
+	errConfigChunkPrefixNotSet  = errors.New("schema config for chunks is missing the 'prefix' setting")
+	errSchemaIncreasingFromTime = errors.New("from time in schemas must be distinct and in increasing order")
 )
 
 // PeriodConfig defines the schema and tables to use for a period of time
@@ -49,7 +51,7 @@ type DayTime struct {
 
 // MarshalYAML implements yaml.Marshaller.
 func (d DayTime) MarshalYAML() (interface{}, error) {
-	return d.Time.Time().Format("2006-01-02"), nil
+	return d.String(), nil
 }
 
 // UnmarshalYAML implements yaml.Unmarshaller.
@@ -66,6 +68,10 @@ func (d *DayTime) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+func (d *DayTime) String() string {
+	return d.Time.Time().Format("2006-01-02")
+}
+
 // SchemaConfig contains the config for our chunk index schemas
 type SchemaConfig struct {
 	Configs []PeriodConfig `yaml:"configs"`
@@ -76,9 +82,9 @@ type SchemaConfig struct {
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *SchemaConfig) RegisterFlags(f *flag.FlagSet) {
-	flag.StringVar(&cfg.fileName, "schema-config-file", "", "The path to the schema config file.")
+	f.StringVar(&cfg.fileName, "schema-config-file", "", "The path to the schema config file.")
 	// TODO(gouthamve): Add a metric for this.
-	flag.StringVar(&cfg.legacyFileName, "config-yaml", "", "DEPRECATED(use -schema-config-file) The path to the schema config file.")
+	f.StringVar(&cfg.legacyFileName, "config-yaml", "", "DEPRECATED(use -schema-config-file) The path to the schema config file.")
 }
 
 // loadFromFile loads the schema config from a yaml file
@@ -115,6 +121,12 @@ func (cfg *SchemaConfig) Validate() error {
 		if err := periodCfg.validate(); err != nil {
 			return err
 		}
+
+		if i+1 < len(cfg.Configs) {
+			if cfg.Configs[i].From.Time.Unix() >= cfg.Configs[i+1].From.Time.Unix() {
+				return errSchemaIncreasingFromTime
+			}
+		}
 	}
 	return nil
 }
@@ -141,6 +153,22 @@ func (cfg *SchemaConfig) ForEachAfter(t model.Time, f func(config *PeriodConfig)
 		if cfg.Configs[i].From.Time >= t {
 			f(&cfg.Configs[i])
 		}
+	}
+}
+
+func validateChunks(cfg PeriodConfig) error {
+	objectStore := cfg.IndexType
+	if cfg.ObjectType != "" {
+		objectStore = cfg.ObjectType
+	}
+	switch objectStore {
+	case "cassandra", "aws-dynamo", "bigtable-hashed", "gcp", "gcp-columnkey", "bigtable", "grpc-store":
+		if cfg.ChunkTables.Prefix == "" {
+			return errConfigChunkPrefixNotSet
+		}
+		return nil
+	default:
+		return nil
 	}
 }
 
@@ -205,6 +233,11 @@ func (cfg *PeriodConfig) applyDefaults() {
 
 // Validate the period config.
 func (cfg PeriodConfig) validate() error {
+	validateError := validateChunks(cfg)
+	if validateError != nil {
+		return validateError
+	}
+
 	_, err := cfg.CreateSchema()
 	return err
 }
@@ -367,34 +400,13 @@ func (cfg *PeriodicTableConfig) periodicTables(from, through model.Time, pCfg Pr
 		firstTable = lastTable - tablesToKeep
 	}
 	for i := firstTable; i <= lastTable; i++ {
-		table := TableDesc{
-			Name:              cfg.tableForPeriod(i),
-			ProvisionedRead:   pCfg.InactiveReadThroughput,
-			ProvisionedWrite:  pCfg.InactiveWriteThroughput,
-			UseOnDemandIOMode: pCfg.InactiveThroughputOnDemandMode,
-			Tags:              cfg.Tags,
-		}
-		level.Debug(util.Logger).Log("msg", "Expected Table", "tableName", table.Name,
-			"provisionedRead", table.ProvisionedRead,
-			"provisionedWrite", table.ProvisionedWrite,
-			"useOnDemandMode", table.UseOnDemandIOMode,
-		)
+		tableName := cfg.tableForPeriod(i)
+		table := TableDesc{}
 
 		// if now is within table [start - grace, end + grace), then we need some write throughput
 		if (i*periodSecs)-beginGraceSecs <= now && now < (i*periodSecs)+periodSecs+endGraceSecs {
-			table.ProvisionedRead = pCfg.ProvisionedReadThroughput
-			table.ProvisionedWrite = pCfg.ProvisionedWriteThroughput
-			table.UseOnDemandIOMode = pCfg.ProvisionedThroughputOnDemandMode
+			table = pCfg.ActiveTableProvisionConfig.BuildTableDesc(tableName, cfg.Tags)
 
-			if pCfg.WriteScale.Enabled {
-				table.WriteScale = pCfg.WriteScale
-				table.UseOnDemandIOMode = false
-			}
-
-			if pCfg.ReadScale.Enabled {
-				table.ReadScale = pCfg.ReadScale
-				table.UseOnDemandIOMode = false
-			}
 			level.Debug(util.Logger).Log("msg", "Table is Active",
 				"tableName", table.Name,
 				"provisionedRead", table.ProvisionedRead,
@@ -403,18 +415,12 @@ func (cfg *PeriodicTableConfig) periodicTables(from, through model.Time, pCfg Pr
 				"useWriteAutoScale", table.WriteScale.Enabled,
 				"useReadAutoScale", table.ReadScale.Enabled)
 
-		} else if pCfg.InactiveWriteScale.Enabled || pCfg.InactiveReadScale.Enabled {
+		} else {
 			// Autoscale last N tables
 			// this is measured against "now", since the lastWeek is the final week in the schema config range
 			// the N last tables in that range will always be set to the inactive scaling settings.
-			if pCfg.InactiveWriteScale.Enabled && i >= (nowWeek-pCfg.InactiveWriteScaleLastN) {
-				table.WriteScale = pCfg.InactiveWriteScale
-				table.UseOnDemandIOMode = false
-			}
-			if pCfg.InactiveReadScale.Enabled && i >= (nowWeek-pCfg.InactiveReadScaleLastN) {
-				table.ReadScale = pCfg.InactiveReadScale
-				table.UseOnDemandIOMode = false
-			}
+			disableAutoscale := i < (nowWeek - pCfg.InactiveWriteScaleLastN)
+			table = pCfg.InactiveTableProvisionConfig.BuildTableDesc(tableName, cfg.Tags, disableAutoscale)
 
 			level.Debug(util.Logger).Log("msg", "Table is Inactive",
 				"tableName", table.Name,

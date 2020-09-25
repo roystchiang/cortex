@@ -2,18 +2,21 @@ package querier
 
 import (
 	"math"
+	"sort"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 
-	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/util"
 )
 
 func TestBlockQuerierSeries(t *testing.T) {
@@ -34,10 +37,9 @@ func TestBlockQuerierSeries(t *testing.T) {
 			expectedMetric: labels.Labels(nil),
 			expectedErr:    "no chunks",
 		},
-		"should remove the external label added by the shipper": {
+		"should return series on success": {
 			series: &storepb.Series{
 				Labels: []storepb.Label{
-					{Name: tsdb.TenantIDExternalLabel, Value: "test"},
 					{Name: "foo", Value: "bar"},
 				},
 				Chunks: []storepb.AggrChunk{
@@ -115,30 +117,30 @@ func TestBlockQuerierSeriesSet(t *testing.T) {
 
 	bss := &blockQuerierSeriesSet{
 		series: []*storepb.Series{
-			// labels here are not sorted, but blockQuerierSeriesSet will sort it.
+			// first, with one chunk.
 			{
-				Labels: mkLabels("a", "a", "__name__", "first"),
+				Labels: mkLabels("__name__", "first", "a", "a"),
 				Chunks: []storepb.AggrChunk{
-					createChunkWithSineSamples(now, now.Add(100*time.Second), 3*time.Millisecond), // ceil(100 / 0.003) samples (= 33334)
+					createAggrChunkWithSineSamples(now, now.Add(100*time.Second), 3*time.Millisecond), // ceil(100 / 0.003) samples (= 33334)
 				},
 			},
 
 			// continuation of previous series. Must have exact same labels.
 			{
-				Labels: mkLabels("a", "a", "__name__", "first"),
+				Labels: mkLabels("__name__", "first", "a", "a"),
 				Chunks: []storepb.AggrChunk{
-					createChunkWithSineSamples(now.Add(100*time.Second), now.Add(200*time.Second), 3*time.Millisecond), // ceil(100 / 0.003) samples more, 66668 in total
+					createAggrChunkWithSineSamples(now.Add(100*time.Second), now.Add(200*time.Second), 3*time.Millisecond), // ceil(100 / 0.003) samples more, 66668 in total
 				},
 			},
 
 			// second, with multiple chunks
 			{
-				Labels: mkLabels("__name__", "second", tsdb.TenantIDExternalLabel, "to be removed"),
+				Labels: mkLabels("__name__", "second"),
 				Chunks: []storepb.AggrChunk{
 					// unordered chunks
-					createChunkWithSineSamples(now.Add(400*time.Second), now.Add(600*time.Second), 5*time.Millisecond), // 200 / 0.005 (= 40000 samples, = 120000 in total)
-					createChunkWithSineSamples(now.Add(200*time.Second), now.Add(400*time.Second), 5*time.Millisecond), // 200 / 0.005 (= 40000 samples)
-					createChunkWithSineSamples(now, now.Add(200*time.Second), 5*time.Millisecond),                      // 200 / 0.005 (= 40000 samples)
+					createAggrChunkWithSineSamples(now.Add(400*time.Second), now.Add(600*time.Second), 5*time.Millisecond), // 200 / 0.005 (= 40000 samples, = 120000 in total)
+					createAggrChunkWithSineSamples(now.Add(200*time.Second), now.Add(400*time.Second), 5*time.Millisecond), // 200 / 0.005 (= 40000 samples)
+					createAggrChunkWithSineSamples(now, now.Add(200*time.Second), 5*time.Millisecond),                      // 200 / 0.005 (= 40000 samples)
 				},
 			},
 
@@ -146,14 +148,14 @@ func TestBlockQuerierSeriesSet(t *testing.T) {
 			{
 				Labels: mkLabels("__name__", "overlapping"),
 				Chunks: []storepb.AggrChunk{
-					createChunkWithSineSamples(now, now.Add(10*time.Second), 5*time.Millisecond), // 10 / 0.005 = 2000 samples
+					createAggrChunkWithSineSamples(now, now.Add(10*time.Second), 5*time.Millisecond), // 10 / 0.005 = 2000 samples
 				},
 			},
 			{
 				Labels: mkLabels("__name__", "overlapping"),
 				Chunks: []storepb.AggrChunk{
 					// 10 / 0.005 = 2000 samples, but first 1000 are overlapping with previous series, so this chunk only contributes 1000
-					createChunkWithSineSamples(now.Add(5*time.Second), now.Add(15*time.Second), 5*time.Millisecond),
+					createAggrChunkWithSineSamples(now.Add(5*time.Second), now.Add(15*time.Second), 5*time.Millisecond),
 				},
 			},
 
@@ -162,21 +164,21 @@ func TestBlockQuerierSeriesSet(t *testing.T) {
 				Labels: mkLabels("__name__", "overlapping2"),
 				Chunks: []storepb.AggrChunk{
 					// entire range overlaps with the next chunk, so this chunks contributes 0 samples (it will be sorted as second)
-					createChunkWithSineSamples(now.Add(3*time.Second), now.Add(7*time.Second), 5*time.Millisecond),
+					createAggrChunkWithSineSamples(now.Add(3*time.Second), now.Add(7*time.Second), 5*time.Millisecond),
 				},
 			},
 			{
 				Labels: mkLabels("__name__", "overlapping2"),
 				Chunks: []storepb.AggrChunk{
 					// this chunk has completely overlaps previous chunk. Since its minTime is lower, it will be sorted as first.
-					createChunkWithSineSamples(now, now.Add(10*time.Second), 5*time.Millisecond), // 10 / 0.005 = 2000 samples
+					createAggrChunkWithSineSamples(now, now.Add(10*time.Second), 5*time.Millisecond), // 10 / 0.005 = 2000 samples
 				},
 			},
 			{
 				Labels: mkLabels("__name__", "overlapping2"),
 				Chunks: []storepb.AggrChunk{
 					// no samples
-					createChunkWithSineSamples(now, now, 5*time.Millisecond),
+					createAggrChunkWithSineSamples(now, now, 5*time.Millisecond),
 				},
 			},
 
@@ -184,7 +186,7 @@ func TestBlockQuerierSeriesSet(t *testing.T) {
 				Labels: mkLabels("__name__", "overlapping2"),
 				Chunks: []storepb.AggrChunk{
 					// 2000 samples more (10 / 0.005)
-					createChunkWithSineSamples(now.Add(20*time.Second), now.Add(30*time.Second), 5*time.Millisecond),
+					createAggrChunkWithSineSamples(now.Add(20*time.Second), now.Add(30*time.Second), 5*time.Millisecond),
 				},
 			},
 		},
@@ -216,24 +218,43 @@ func verifyNextSeries(t *testing.T, ss storage.SeriesSet, labels labels.Labels, 
 	require.Equal(t, samples, count)
 }
 
-func createChunkWithSineSamples(minTime, maxTime time.Time, step time.Duration) storepb.AggrChunk {
-	chunk := chunkenc.NewXORChunk()
-	appender, err := chunk.Appender()
-	if err != nil {
-		panic(err)
-	}
+func createAggrChunkWithSineSamples(minTime, maxTime time.Time, step time.Duration) storepb.AggrChunk {
+	var samples []promql.Point
 
 	minT := minTime.Unix() * 1000
 	maxT := maxTime.Unix() * 1000
 	stepMillis := step.Milliseconds()
 
 	for t := minT; t < maxT; t += stepMillis {
-		appender.Append(t, math.Sin(float64(t)))
+		samples = append(samples, promql.Point{T: t, V: math.Sin(float64(t))})
+	}
+
+	return createAggrChunk(minT, maxT, samples...)
+}
+
+func createAggrChunkWithSamples(samples ...promql.Point) storepb.AggrChunk {
+	return createAggrChunk(samples[0].T, samples[len(samples)-1].T, samples...)
+}
+
+func createAggrChunk(minTime, maxTime int64, samples ...promql.Point) storepb.AggrChunk {
+	// Ensure samples are sorted by timestamp.
+	sort.Slice(samples, func(i, j int) bool {
+		return samples[i].T < samples[j].T
+	})
+
+	chunk := chunkenc.NewXORChunk()
+	appender, err := chunk.Appender()
+	if err != nil {
+		panic(err)
+	}
+
+	for _, s := range samples {
+		appender.Append(s.T, s.V)
 	}
 
 	return storepb.AggrChunk{
-		MinTime: minT,
-		MaxTime: maxT,
+		MinTime: minTime,
+		MaxTime: maxTime,
 		Raw: &storepb.Chunk{
 			Type: storepb.Chunk_XOR,
 			Data: chunk.Bytes(),
@@ -252,4 +273,64 @@ func mkLabels(s ...string) []storepb.Label {
 	}
 
 	return result
+}
+
+func Benchmark_newBlockQuerierSeries(b *testing.B) {
+	lbls := mkLabels(
+		"__name__", "test",
+		"label_1", "value_1",
+		"label_2", "value_2",
+		"label_3", "value_3",
+		"label_4", "value_4",
+		"label_5", "value_5",
+		"label_6", "value_6",
+		"label_7", "value_7",
+		"label_8", "value_8",
+		"label_9", "value_9")
+
+	chunks := []storepb.AggrChunk{
+		createAggrChunkWithSineSamples(time.Now(), time.Now().Add(-time.Hour), time.Minute),
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		newBlockQuerierSeries(lbls, chunks)
+	}
+}
+
+func Benchmark_blockQuerierSeriesSet_iteration(b *testing.B) {
+	const (
+		numSeries          = 8000
+		numSamplesPerChunk = 240
+		numChunksPerSeries = 24
+	)
+
+	// Generate series.
+	series := make([]*storepb.Series, 0, numSeries)
+	for seriesID := 0; seriesID < numSeries; seriesID++ {
+		lbls := mkLabels("__name__", "test", "series_id", strconv.Itoa(seriesID))
+		chunks := make([]storepb.AggrChunk, 0, numChunksPerSeries)
+
+		// Create chunks with 1 sample per second.
+		for minT := int64(0); minT < numChunksPerSeries*numSamplesPerChunk; minT += numSamplesPerChunk {
+			chunks = append(chunks, createAggrChunkWithSineSamples(util.TimeFromMillis(minT), util.TimeFromMillis(minT+numSamplesPerChunk), time.Millisecond))
+		}
+
+		series = append(series, &storepb.Series{
+			Labels: lbls,
+			Chunks: chunks,
+		})
+	}
+
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		set := blockQuerierSeriesSet{series: series}
+
+		for set.Next() {
+			for t := set.At().Iterator(); t.Next(); {
+				t.At()
+			}
+		}
+	}
 }

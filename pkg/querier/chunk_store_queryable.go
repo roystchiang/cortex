@@ -5,8 +5,8 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
@@ -15,7 +15,7 @@ import (
 	seriesset "github.com/cortexproject/cortex/pkg/querier/series"
 )
 
-type chunkIteratorFunc func(chunks []chunk.Chunk, from, through model.Time) storage.SeriesIterator
+type chunkIteratorFunc func(chunks []chunk.Chunk, from, through model.Time) chunkenc.Iterator
 
 func newChunkStoreQueryable(store chunkstore.ChunkStore, chunkIteratorFunc chunkIteratorFunc) storage.Queryable {
 	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
@@ -36,29 +36,27 @@ type chunkStoreQuerier struct {
 	mint, maxt        int64
 }
 
-func (q *chunkStoreQuerier) SelectSorted(sp *storage.SelectParams, matchers ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+// Select implements storage.Querier interface.
+// The bool passed is ignored because the series is always sorted.
+func (q *chunkStoreQuerier) Select(_ bool, sp *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	userID, err := user.ExtractOrgID(q.ctx)
 	if err != nil {
-		return nil, nil, err
+		return storage.ErrSeriesSet(err)
 	}
 	chunks, err := q.store.Get(q.ctx, userID, model.Time(sp.Start), model.Time(sp.End), matchers...)
 	if err != nil {
-		return nil, nil, promql.ErrStorage{Err: err}
+		return storage.ErrSeriesSet(err)
 	}
 
-	return partitionChunks(chunks, q.mint, q.maxt, q.chunkIteratorFunc), nil, nil
-}
-
-func (q *chunkStoreQuerier) Select(sp *storage.SelectParams, matchers ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	return q.SelectSorted(sp, matchers...)
+	return partitionChunks(chunks, q.mint, q.maxt, q.chunkIteratorFunc)
 }
 
 // Series in the returned set are sorted alphabetically by labels.
 func partitionChunks(chunks []chunk.Chunk, mint, maxt int64, iteratorFunc chunkIteratorFunc) storage.SeriesSet {
-	chunksBySeries := map[model.Fingerprint][]chunk.Chunk{}
+	chunksBySeries := map[string][]chunk.Chunk{}
 	for _, c := range chunks {
-		fp := client.Fingerprint(c.Metric)
-		chunksBySeries[fp] = append(chunksBySeries[fp], c)
+		key := client.LabelsToKeyString(c.Metric)
+		chunksBySeries[key] = append(chunksBySeries[key], c)
 	}
 
 	series := make([]storage.Series, 0, len(chunksBySeries))
@@ -100,7 +98,7 @@ func (s *chunkSeries) Labels() labels.Labels {
 }
 
 // Iterator returns a new iterator of the data of the series.
-func (s *chunkSeries) Iterator() storage.SeriesIterator {
+func (s *chunkSeries) Iterator() chunkenc.Iterator {
 	return s.chunkIteratorFunc(s.chunks, model.Time(s.mint), model.Time(s.maxt))
 }
 

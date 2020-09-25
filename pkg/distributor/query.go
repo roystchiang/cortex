@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/weaveworks/common/instrument"
 	"github.com/weaveworks/common/user"
 
@@ -24,12 +24,16 @@ func (d *Distributor) Query(ctx context.Context, from, to model.Time, matchers .
 	err := instrument.CollectedRequest(ctx, "Distributor.Query", queryDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		replicationSet, req, err := d.queryPrep(ctx, from, to, matchers...)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
 		}
 
 		matrix, err = d.queryIngesters(ctx, replicationSet, req)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
+		}
+
+		if s := opentracing.SpanFromContext(ctx); s != nil {
+			s.LogKV("series", len(matrix))
 		}
 		return nil
 	})
@@ -42,12 +46,16 @@ func (d *Distributor) QueryStream(ctx context.Context, from, to model.Time, matc
 	err := instrument.CollectedRequest(ctx, "Distributor.QueryStream", queryDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		replicationSet, req, err := d.queryPrep(ctx, from, to, matchers...)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
 		}
 
 		result, err = d.queryIngesterStream(ctx, replicationSet, req)
 		if err != nil {
-			return promql.ErrStorage{Err: err}
+			return err
+		}
+
+		if s := opentracing.SpanFromContext(ctx); s != nil {
+			s.LogKV("chunk-series", len(result.GetChunkseries()), "time-series", len(result.GetTimeseries()))
 		}
 		return nil
 	})
@@ -162,32 +170,32 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 		return nil, err
 	}
 
-	hashToChunkseries := map[model.Fingerprint]ingester_client.TimeSeriesChunk{}
-	hashToTimeSeries := map[model.Fingerprint]ingester_client.TimeSeries{}
+	hashToChunkseries := map[string]ingester_client.TimeSeriesChunk{}
+	hashToTimeSeries := map[string]ingester_client.TimeSeries{}
 
 	for _, result := range results {
 		response := result.(*ingester_client.QueryStreamResponse)
 
 		// Parse any chunk series
 		for _, series := range response.Chunkseries {
-			hash := client.FastFingerprint(series.Labels)
-			existing := hashToChunkseries[hash]
+			key := client.LabelsToKeyString(client.FromLabelAdaptersToLabels(series.Labels))
+			existing := hashToChunkseries[key]
 			existing.Labels = series.Labels
 			existing.Chunks = append(existing.Chunks, series.Chunks...)
-			hashToChunkseries[hash] = existing
+			hashToChunkseries[key] = existing
 		}
 
 		// Parse any time series
 		for _, series := range response.Timeseries {
-			hash := client.FastFingerprint(series.Labels)
-			existing := hashToTimeSeries[hash]
+			key := client.LabelsToKeyString(client.FromLabelAdaptersToLabels(series.Labels))
+			existing := hashToTimeSeries[key]
 			existing.Labels = series.Labels
 			if existing.Samples == nil {
 				existing.Samples = series.Samples
 			} else {
 				existing.Samples = mergeSamples(existing.Samples, series.Samples)
 			}
-			hashToTimeSeries[hash] = existing
+			hashToTimeSeries[key] = existing
 		}
 	}
 

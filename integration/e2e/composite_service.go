@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -39,13 +41,21 @@ func (s *CompositeHTTPService) Instances() []*HTTPService {
 // WaitSumMetrics waits for at least one instance of each given metric names to be present and their sums, returning true
 // when passed to given isExpected(...).
 func (s *CompositeHTTPService) WaitSumMetrics(isExpected func(sums ...float64) bool, metricNames ...string) error {
+	return s.WaitSumMetricsWithOptions(isExpected, metricNames)
+}
+
+func (s *CompositeHTTPService) WaitSumMetricsWithOptions(isExpected func(sums ...float64) bool, metricNames []string, opts ...MetricsOption) error {
 	var (
-		sums []float64
-		err  error
+		sums    []float64
+		err     error
+		options = buildMetricsOptions(opts)
 	)
 
 	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
-		sums, err = s.SumMetrics(metricNames...)
+		sums, err = s.SumMetrics(metricNames, opts...)
+		if options.WaitMissingMetrics && errors.Is(err, errMissingMetric) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -57,15 +67,15 @@ func (s *CompositeHTTPService) WaitSumMetrics(isExpected func(sums ...float64) b
 		s.retryBackoff.Wait()
 	}
 
-	return fmt.Errorf("unable to find metrics %s with expected values. Last values: %v", metricNames, sums)
+	return fmt.Errorf("unable to find metrics %s with expected values. Last error: %v. Last values: %v", metricNames, err, sums)
 }
 
 // SumMetrics returns the sum of the values of each given metric names.
-func (s *CompositeHTTPService) SumMetrics(metricNames ...string) ([]float64, error) {
+func (s *CompositeHTTPService) SumMetrics(metricNames []string, opts ...MetricsOption) ([]float64, error) {
 	sums := make([]float64, len(metricNames))
 
 	for _, service := range s.services {
-		partials, err := service.SumMetrics(metricNames...)
+		partials, err := service.SumMetrics(metricNames, opts...)
 		if err != nil {
 			return nil, err
 		}

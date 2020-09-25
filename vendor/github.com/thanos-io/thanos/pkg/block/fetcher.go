@@ -25,13 +25,13 @@ import (
 	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/tsdb"
 	tsdberrors "github.com/prometheus/prometheus/tsdb/errors"
-	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v2"
 )
 
 type fetcherMetrics struct {
@@ -367,7 +367,11 @@ func (f *BaseFetcher) fetchMetadata(ctx context.Context) (interface{}, error) {
 
 	// Best effort cleanup of disk-cached metas.
 	if f.cacheDir != "" {
-		names, err := fileutil.ReadDir(f.cacheDir)
+		fis, err := ioutil.ReadDir(f.cacheDir)
+		names := make([]string, 0, len(fis))
+		for _, fi := range fis {
+			names = append(names, fi.Name())
+		}
 		if err != nil {
 			level.Warn(f.logger).Log("msg", "best effort remove of not needed cached dirs failed; ignoring", "err", err)
 		} else {
@@ -522,14 +526,14 @@ func NewLabelShardedMetaFilter(relabelConfig []*relabel.Config) *LabelShardedMet
 }
 
 // Special label that will have an ULID of the meta.json being referenced to.
-const blockIDLabel = "__block_id"
+const BlockIDLabel = "__block_id"
 
 // Filter filters out blocks that have no labels after relabelling of each block external (Thanos) labels.
 func (f *LabelShardedMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
 	var lbls labels.Labels
 	for id, m := range metas {
 		lbls = lbls[:0]
-		lbls = append(lbls, labels.Label{Name: blockIDLabel, Value: id.String()})
+		lbls = append(lbls, labels.Label{Name: BlockIDLabel, Value: id.String()})
 		for k, v := range m.Thanos.Labels {
 			lbls = append(lbls, labels.Label{Name: k, Value: v})
 		}
@@ -679,6 +683,10 @@ func NewReplicaLabelRemover(logger log.Logger, replicaLabels []string) *ReplicaL
 
 // Modify modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
 func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*metadata.Meta, modified *extprom.TxGaugeVec) error {
+	if len(r.replicaLabels) == 0 {
+		return nil
+	}
+
 	for u, meta := range metas {
 		l := meta.Thanos.Labels
 		for _, replicaLabel := range r.replicaLabels {
@@ -687,6 +695,10 @@ func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*met
 				delete(l, replicaLabel)
 				modified.WithLabelValues(replicaRemovedMeta).Inc()
 			}
+		}
+		if len(l) == 0 {
+			level.Warn(r.logger).Log("msg", "block has no labels left, creating one", r.replicaLabels[0], "deduped")
+			l[r.replicaLabels[0]] = "deduped"
 		}
 		metas[u].Thanos.Labels = l
 	}
@@ -787,4 +799,21 @@ func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.UL
 		}
 	}
 	return nil
+}
+
+// ParseRelabelConfig parses relabel configuration.
+func ParseRelabelConfig(contentYaml []byte) ([]*relabel.Config, error) {
+	var relabelConfig []*relabel.Config
+	if err := yaml.Unmarshal(contentYaml, &relabelConfig); err != nil {
+		return nil, errors.Wrap(err, "parsing relabel configuration")
+	}
+	supportedActions := map[relabel.Action]struct{}{relabel.Keep: {}, relabel.Drop: {}, relabel.HashMod: {}}
+
+	for _, cfg := range relabelConfig {
+		if _, ok := supportedActions[cfg.Action]; !ok {
+			return nil, errors.Errorf("unsupported relabel action: %v", cfg.Action)
+		}
+	}
+
+	return relabelConfig, nil
 }

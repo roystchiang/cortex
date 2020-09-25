@@ -33,6 +33,14 @@ var (
 		Step:  120 * 1e3,
 		Query: "sum(container_memory_rss) by (namespace)",
 	}
+	noCacheRequest = &PrometheusRequest{
+		Path:           "/api/v1/query_range",
+		Start:          1536673680 * 1e3,
+		End:            1536716898 * 1e3,
+		Step:           120 * 1e3,
+		Query:          "sum(container_memory_rss) by (namespace)",
+		CachingOptions: CachingOptions{Disabled: true},
+	}
 	respHeaders = []*PrometheusResponseHeader{
 		{
 			Name:   "Content-Type",
@@ -122,8 +130,8 @@ func TestShouldCache(t *testing.T) {
 			input: Response(&PrometheusResponse{
 				Headers: []*PrometheusResponseHeader{
 					{
-						Name:   cachecontrolHeader,
-						Values: []string{noCacheValue},
+						Name:   cacheControlHeader,
+						Values: []string{noStoreValue},
 					},
 				},
 			}),
@@ -134,8 +142,8 @@ func TestShouldCache(t *testing.T) {
 			input: Response(&PrometheusResponse{
 				Headers: []*PrometheusResponseHeader{
 					{
-						Name:   cachecontrolHeader,
-						Values: []string{"foo", noCacheValue},
+						Name:   cacheControlHeader,
+						Values: []string{"foo", noStoreValue},
 					},
 				},
 			}),
@@ -156,7 +164,7 @@ func TestShouldCache(t *testing.T) {
 		{
 			name: "had cacheControl header but no values",
 			input: Response(&PrometheusResponse{
-				Headers: []*PrometheusResponseHeader{{Name: cachecontrolHeader}},
+				Headers: []*PrometheusResponseHeader{{Name: cacheControlHeader}},
 			}),
 			expected: true,
 		},
@@ -230,8 +238,8 @@ func TestShouldCache(t *testing.T) {
 			input: Response(&PrometheusResponse{
 				Headers: []*PrometheusResponseHeader{
 					{
-						Name:   cachecontrolHeader,
-						Values: []string{noCacheValue},
+						Name:   cacheControlHeader,
+						Values: []string{noStoreValue},
 					},
 					{
 						Name:   ResultsCacheGenNumberHeaderName,
@@ -342,7 +350,9 @@ func TestPartiton(t *testing.T) {
 	}
 }
 
-type fakeLimits struct{}
+type fakeLimits struct {
+	maxCacheFreshness time.Duration
+}
 
 func (fakeLimits) MaxQueryLength(string) time.Duration {
 	return 0 // Disable.
@@ -350,6 +360,18 @@ func (fakeLimits) MaxQueryLength(string) time.Duration {
 
 func (fakeLimits) MaxQueryParallelism(string) int {
 	return 14 // Flag default.
+}
+
+func (f fakeLimits) MaxCacheFreshness(string) time.Duration {
+	return f.maxCacheFreshness
+}
+
+type fakeLimitsHighMaxCacheFreshness struct {
+	fakeLimits
+}
+
+func (fakeLimitsHighMaxCacheFreshness) MaxCacheFreshness(string) time.Duration {
+	return 10 * time.Minute
 }
 
 func TestResultsCache(t *testing.T) {
@@ -366,6 +388,8 @@ func TestResultsCache(t *testing.T) {
 		fakeLimits{},
 		PrometheusCodec,
 		PrometheusResponseExtractor{},
+		nil,
+		nil,
 		nil,
 	)
 	require.NoError(t, err)
@@ -397,7 +421,17 @@ func TestResultsCacheRecent(t *testing.T) {
 	var cfg ResultsCacheConfig
 	flagext.DefaultValues(&cfg)
 	cfg.CacheConfig.Cache = cache.NewMockCache()
-	rcm, _, err := NewResultsCacheMiddleware(log.NewNopLogger(), cfg, constSplitter(day), fakeLimits{}, PrometheusCodec, PrometheusResponseExtractor{}, nil)
+	rcm, _, err := NewResultsCacheMiddleware(
+		log.NewNopLogger(),
+		cfg,
+		constSplitter(day),
+		fakeLimitsHighMaxCacheFreshness{},
+		PrometheusCodec,
+		PrometheusResponseExtractor{},
+		nil,
+		nil,
+		nil,
+	)
 	require.NoError(t, err)
 
 	req := parsedRequest.WithStartEnd(int64(model.Now())-(60*1e3), int64(model.Now()))
@@ -423,6 +457,64 @@ func TestResultsCacheRecent(t *testing.T) {
 	require.Equal(t, parsedResponse, resp)
 }
 
+func TestResultsCacheMaxFreshness(t *testing.T) {
+	modelNow := model.Now()
+	for i, tc := range []struct {
+		fakeLimits       Limits
+		Handler          HandlerFunc
+		expectedResponse *PrometheusResponse
+	}{
+		{
+			fakeLimits:       fakeLimits{maxCacheFreshness: 5 * time.Second},
+			Handler:          nil,
+			expectedResponse: mkAPIResponse(int64(modelNow)-(50*1e3), int64(modelNow)-(10*1e3), 10),
+		},
+		{
+			// should not lookup cache because per-tenant override will be applied
+			fakeLimits: fakeLimitsHighMaxCacheFreshness{},
+			Handler: HandlerFunc(func(_ context.Context, _ Request) (Response, error) {
+				return parsedResponse, nil
+			}),
+			expectedResponse: parsedResponse,
+		},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			var cfg ResultsCacheConfig
+			flagext.DefaultValues(&cfg)
+			cfg.CacheConfig.Cache = cache.NewMockCache()
+
+			fakeLimits := tc.fakeLimits
+			rcm, _, err := NewResultsCacheMiddleware(
+				log.NewNopLogger(),
+				cfg,
+				constSplitter(day),
+				fakeLimits,
+				PrometheusCodec,
+				PrometheusResponseExtractor{},
+				nil,
+				nil,
+				nil,
+			)
+			require.NoError(t, err)
+
+			// create cache with handler
+			rc := rcm.Wrap(tc.Handler)
+			ctx := user.InjectOrgID(context.Background(), "1")
+
+			// create request with start end within the key extents
+			req := parsedRequest.WithStartEnd(int64(modelNow)-(50*1e3), int64(modelNow)-(10*1e3))
+
+			// fill cache
+			key := constSplitter(day).GenerateCacheKey("1", req)
+			rc.(*resultsCache).put(ctx, key, []Extent{mkExtent(int64(modelNow)-(60*1e3), int64(modelNow))})
+
+			resp, err := rc.Do(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedResponse, resp)
+		})
+	}
+}
+
 func Test_resultsCache_MissingData(t *testing.T) {
 	cfg := ResultsCacheConfig{
 		CacheConfig: cache.Config{
@@ -436,6 +528,8 @@ func Test_resultsCache_MissingData(t *testing.T) {
 		fakeLimits{},
 		PrometheusCodec,
 		PrometheusResponseExtractor{},
+		nil,
+		nil,
 		nil,
 	)
 	require.NoError(t, err)
@@ -491,6 +585,71 @@ func TestConstSplitter_generateCacheKey(t *testing.T) {
 			if got := constSplitter(tt.interval).GenerateCacheKey("fake", tt.r); got != tt.want {
 				t.Errorf("generateKey() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestResultsCacheShouldCacheFunc(t *testing.T) {
+	testcases := []struct {
+		name         string
+		shouldCache  ShouldCacheFn
+		requests     []Request
+		expectedCall int
+	}{
+		{
+			name:         "normal",
+			shouldCache:  nil,
+			requests:     []Request{parsedRequest, parsedRequest},
+			expectedCall: 1,
+		},
+		{
+			name: "always no cache",
+			shouldCache: func(r Request) bool {
+				return false
+			},
+			requests:     []Request{parsedRequest, parsedRequest},
+			expectedCall: 2,
+		},
+		{
+			name: "check cache based on request",
+			shouldCache: func(r Request) bool {
+				return !r.GetCachingOptions().Disabled
+			},
+			requests:     []Request{noCacheRequest, noCacheRequest},
+			expectedCall: 2,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			var cfg ResultsCacheConfig
+			flagext.DefaultValues(&cfg)
+			cfg.CacheConfig.Cache = cache.NewMockCache()
+			rcm, _, err := NewResultsCacheMiddleware(
+				log.NewNopLogger(),
+				cfg,
+				constSplitter(day),
+				fakeLimitsHighMaxCacheFreshness{},
+				PrometheusCodec,
+				PrometheusResponseExtractor{},
+				nil,
+				tc.shouldCache,
+				nil,
+			)
+			require.NoError(t, err)
+			rc := rcm.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
+				calls++
+				return parsedResponse, nil
+			}))
+
+			for _, req := range tc.requests {
+				ctx := user.InjectOrgID(context.Background(), "1")
+				_, err := rc.Do(ctx, req)
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tc.expectedCall, calls)
 		})
 	}
 }

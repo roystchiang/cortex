@@ -8,14 +8,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log/level"
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -37,6 +37,7 @@ type WALConfig struct {
 	Recover            bool          `yaml:"recover_from_wal"`
 	Dir                string        `yaml:"wal_dir"`
 	CheckpointDuration time.Duration `yaml:"checkpoint_duration"`
+	FlushOnShutdown    bool          `yaml:"flush_on_shutdown_with_wal_enabled"`
 	// We always checkpoint during shutdown. This option exists for the tests.
 	checkpointDuringShutdown bool
 }
@@ -48,6 +49,7 @@ func (cfg *WALConfig) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.WALEnabled, "ingester.wal-enabled", false, "Enable writing of ingested data into WAL.")
 	f.BoolVar(&cfg.CheckpointEnabled, "ingester.checkpoint-enabled", true, "Enable checkpointing of in-memory chunks. It should always be true when using normally. Set it to false iff you are doing some small tests as there is no mechanism to delete the old WAL yet if checkpoint is disabled.")
 	f.DurationVar(&cfg.CheckpointDuration, "ingester.checkpoint-duration", 30*time.Minute, "Interval at which checkpoints should be created.")
+	f.BoolVar(&cfg.FlushOnShutdown, "ingester.flush-on-shutdown-with-wal-enabled", false, "When WAL is enabled, should chunks be flushed to long-term storage on shutdown. Useful eg. for migration to blocks engine.")
 	cfg.checkpointDuringShutdown = true
 }
 
@@ -63,12 +65,6 @@ type WAL interface {
 type RecordType byte
 
 const (
-	// Currently we also support the old records without a type header.
-	// For that, we assume the record type does not cross 7 as the proto unmarshalling
-	// will produce an error if the first byte is less than 7 (thus we know its not the old record).
-	// The old record will be removed in the future releases, hence the record type should not cross
-	// '7' till then.
-
 	// WALRecordSeries is the type for the WAL record on Prometheus TSDB record for series.
 	WALRecordSeries RecordType = 1
 	// WALRecordSamples is the type for the WAL record based on Prometheus TSDB record for samples.
@@ -177,7 +173,7 @@ func (w *walWrapper) Stop() {
 }
 
 func (w *walWrapper) Log(record *WALRecord) error {
-	if record == nil {
+	if record == nil || (len(record.Series) == 0 && len(record.Samples) == 0) {
 		return nil
 	}
 	select {
@@ -333,6 +329,9 @@ func (w *walWrapper) performCheckpoint(immediate bool) (err error) {
 	}
 	records := [][]byte{}
 	totalSize := 0
+	ticker := time.NewTicker(perSeriesDuration)
+	defer ticker.Stop()
+	start := time.Now()
 	for userID, state := range us {
 		for pair := range state.fpToSeries.iter() {
 			state.fpLocker.Lock(pair.fp)
@@ -357,8 +356,17 @@ func (w *walWrapper) performCheckpoint(immediate bool) (err error) {
 			}
 
 			if !immediate {
+				if time.Since(start) > 2*w.cfg.CheckpointDuration {
+					// This could indicate a surge in number of series and continuing with
+					// the old estimation of ticker can make checkpointing run indefinitely in worst case
+					// and disk running out of space. Re-adjust the ticker might not solve the problem
+					// as there can be another surge again. Hence let's checkpoint this one immediately.
+					immediate = true
+					continue
+				}
+
 				select {
-				case <-time.After(perSeriesDuration):
+				case <-ticker.C:
 				case <-w.quit: // When we're trying to shutdown, finish the checkpoint as fast as possible.
 				}
 			}
@@ -411,15 +419,12 @@ func lastCheckpoint(dir string) (string, int, error) {
 	for i := 0; i < len(dirs); i++ {
 		di := dirs[i]
 
-		if !strings.HasPrefix(di.Name(), checkpointPrefix) {
+		idx, err := checkpointIndex(di.Name(), false)
+		if err != nil {
 			continue
 		}
 		if !di.IsDir() {
 			return "", -1, fmt.Errorf("checkpoint %s is not a directory", di.Name())
-		}
-		idx, err := strconv.Atoi(di.Name()[len(checkpointPrefix):])
-		if err != nil {
-			continue
 		}
 		if idx > maxIdx {
 			checkpointDir = di.Name()
@@ -448,10 +453,7 @@ func (w *walWrapper) deleteCheckpoints(maxIndex int) (err error) {
 		return err
 	}
 	for _, fi := range files {
-		if !strings.HasPrefix(fi.Name(), checkpointPrefix) {
-			continue
-		}
-		index, err := strconv.Atoi(fi.Name()[len(checkpointPrefix):])
+		index, err := checkpointIndex(fi.Name(), true)
 		if err != nil || index >= maxIndex {
 			continue
 		}
@@ -460,6 +462,23 @@ func (w *walWrapper) deleteCheckpoints(maxIndex int) (err error) {
 		}
 	}
 	return errs.Err()
+}
+
+var checkpointRe = regexp.MustCompile("^" + regexp.QuoteMeta(checkpointPrefix) + "(\\d+)(\\.tmp)?$")
+
+// checkpointIndex returns the index of a given checkpoint file. It handles
+// both regular and temporary checkpoints according to the includeTmp flag. If
+// the file is not a checkpoint it returns an error.
+func checkpointIndex(filename string, includeTmp bool) (int, error) {
+	result := checkpointRe.FindStringSubmatch(filename)
+	if len(result) < 2 {
+		return 0, errors.New("file is not a checkpoint")
+	}
+	// Filter out temporary checkpoints if desired.
+	if !includeTmp && len(result) == 3 && result[2] != "" {
+		return 0, errors.New("temporary checkpoint")
+	}
+	return strconv.Atoi(result[1])
 }
 
 // checkpointSeries write the chunks of the series to the checkpoint.
@@ -594,12 +613,12 @@ func processCheckpointWithRepair(params walRecoveryParameters) (*userStates, int
 // segmentsExist is a stripped down version of
 // https://github.com/prometheus/prometheus/blob/4c648eddf47d7e07fbc74d0b18244402200dca9e/tsdb/wal/wal.go#L739-L760.
 func segmentsExist(dir string) (bool, error) {
-	files, err := fileutil.ReadDir(dir)
+	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return false, err
 	}
-	for _, fn := range files {
-		if _, err := strconv.Atoi(fn); err == nil {
+	for _, f := range files {
+		if _, err := strconv.Atoi(f.Name()); err == nil {
 			// First filename which is a number.
 			// This is how Prometheus stores and this
 			// is how it checks too.
@@ -818,7 +837,6 @@ func processWAL(startSegment int, userStates *userStates, params walRecoveryPara
 
 	var (
 		capturedErr error
-		record      = &Record{}
 		walRecord   = &WALRecord{}
 		lp          labelPairs
 	)
@@ -832,51 +850,30 @@ Loop:
 		default:
 		}
 
-		record.Samples = record.Samples[:0]
-		record.Labels = record.Labels[:0]
-		// Only one of 'record' or 'walRecord' will have the data.
-		if err := decodeWALRecord(reader.Record(), record, walRecord); err != nil {
+		if err := decodeWALRecord(reader.Record(), walRecord); err != nil {
 			// We don't return here in order to close/drain all the channels and
 			// make sure all goroutines exit.
 			capturedErr = err
 			break Loop
 		}
 
-		if len(record.Labels) > 0 || len(walRecord.Series) > 0 {
-
-			var userID string
-			if len(walRecord.Series) > 0 {
-				userID = walRecord.UserID
-			} else {
-				userID = record.UserId
-			}
+		if len(walRecord.Series) > 0 {
+			userID := walRecord.UserID
 
 			state := userStates.getOrCreate(userID)
 
-			createSeries := func(fingerprint model.Fingerprint, lbls labelPairs) error {
-				_, ok := state.fpToSeries.get(fingerprint)
-				if ok {
-					return nil
-				}
-				_, err := state.createSeriesWithFingerprint(fingerprint, lbls, nil, true)
-				return err
-			}
-
-			for _, labels := range record.Labels {
-				if err := createSeries(model.Fingerprint(labels.Fingerprint), labels.Labels); err != nil {
-					// We don't return here in order to close/drain all the channels and
-					// make sure all goroutines exit.
-					capturedErr = err
-					break Loop
-				}
-			}
-
 			for _, s := range walRecord.Series {
+				fp := model.Fingerprint(s.Ref)
+				_, ok := state.fpToSeries.get(fp)
+				if ok {
+					continue
+				}
+
 				lp = lp[:0]
 				for _, l := range s.Labels {
 					lp = append(lp, client.LabelAdapter(l))
 				}
-				if err := createSeries(model.Fingerprint(s.Ref), lp); err != nil {
+				if _, err := state.createSeriesWithFingerprint(fp, lp, nil, true); err != nil {
 					// We don't return here in order to close/drain all the channels and
 					// make sure all goroutines exit.
 					capturedErr = err
@@ -889,20 +886,12 @@ Loop:
 		// With O(300 * #cores) in-flight sample batches, large scrapes could otherwise
 		// cause thousands of very large in flight buffers occupying large amounts
 		// of unused memory.
-		for len(record.Samples) > 0 || len(walRecord.Samples) > 0 {
+		walRecordSamples := walRecord.Samples
+		for len(walRecordSamples) > 0 {
 			m := 5000
-			var userID string
-			if len(record.Samples) > 0 {
-				userID = record.UserId
-				if len(record.Samples) < m {
-					m = len(record.Samples)
-				}
-			}
-			if len(walRecord.Samples) > 0 {
-				userID = walRecord.UserID
-				if len(walRecord.Samples) < m {
-					m = len(walRecord.Samples)
-				}
+			userID := walRecord.UserID
+			if len(walRecordSamples) < m {
+				m = len(walRecordSamples)
 			}
 
 			for i := 0; i < params.numWorkers; i++ {
@@ -924,21 +913,9 @@ Loop:
 				}
 			}
 
-			if len(record.Samples) > 0 {
-				for _, sam := range record.Samples[:m] {
-					mod := sam.Fingerprint % uint64(params.numWorkers)
-					shards[mod].samples = append(shards[mod].samples, tsdb_record.RefSample{
-						Ref: sam.Fingerprint,
-						T:   int64(sam.Timestamp),
-						V:   sam.Value,
-					})
-				}
-			}
-			if len(walRecord.Samples) > 0 {
-				for _, sam := range walRecord.Samples[:m] {
-					mod := sam.Ref % uint64(params.numWorkers)
-					shards[mod].samples = append(shards[mod].samples, sam)
-				}
+			for _, sam := range walRecordSamples[:m] {
+				mod := sam.Ref % uint64(params.numWorkers)
+				shards[mod].samples = append(shards[mod].samples, sam)
 			}
 
 			for i := 0; i < params.numWorkers; i++ {
@@ -947,12 +924,7 @@ Loop:
 				}
 			}
 
-			if len(record.Samples) > 0 {
-				record.Samples = record.Samples[m:]
-			}
-			if len(walRecord.Samples) > 0 {
-				walRecord.Samples = walRecord.Samples[m:]
-			}
+			walRecordSamples = walRecordSamples[m:]
 		}
 	}
 
@@ -1059,13 +1031,13 @@ func newWalReader(name string, startSegment int) (*wal.Reader, io.Closer, error)
 // If https://github.com/prometheus/prometheus/pull/6477 is merged, get rid of this
 // method and use from Prometheus directly.
 func SegmentRange(dir string) (int, int, error) {
-	files, err := fileutil.ReadDir(dir)
+	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return 0, 0, err
 	}
 	first, last := math.MaxInt32, math.MinInt32
-	for _, fn := range files {
-		k, err := strconv.Atoi(fn)
+	for _, f := range files {
+		k, err := strconv.Atoi(f.Name())
 		if err != nil {
 			continue
 		}
@@ -1146,7 +1118,7 @@ func (record *WALRecord) encodeSamples(b []byte) []byte {
 	return encoded
 }
 
-func decodeWALRecord(b []byte, rec *Record, walRec *WALRecord) (err error) {
+func decodeWALRecord(b []byte, walRec *WALRecord) (err error) {
 	var (
 		userID   string
 		dec      tsdb_record.Decoder
@@ -1167,10 +1139,7 @@ func decodeWALRecord(b []byte, rec *Record, walRec *WALRecord) (err error) {
 		userID = decbuf.UvarintStr()
 		rseries, err = dec.Series(decbuf.B, walRec.Series)
 	default:
-		// The legacy proto record will have it's first byte >7.
-		// Hence it does not match any of the existing record types.
-		err = proto.Unmarshal(b, rec)
-		return err
+		return errors.New("unknown record type")
 	}
 
 	// We reach here only if its a record with type header.
@@ -1178,12 +1147,13 @@ func decodeWALRecord(b []byte, rec *Record, walRec *WALRecord) (err error) {
 		return decbuf.Err()
 	}
 
-	if err == nil {
-		// There was no error decoding the records with type headers.
-		walRec.UserID = userID
-		walRec.Samples = rsamples
-		walRec.Series = rseries
+	if err != nil {
+		return err
 	}
 
-	return err
+	walRec.UserID = userID
+	walRec.Samples = rsamples
+	walRec.Series = rseries
+
+	return nil
 }

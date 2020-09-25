@@ -18,7 +18,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
@@ -369,7 +368,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 						KVStore:         kv.Config{Mock: mock},
 						UpdateTimeout:   100 * time.Millisecond,
 						FailoverTimeout: time.Second,
-					})
+					}, nil)
 					require.NoError(t, err)
 					require.NoError(t, services.StartAndAwaitRunning(context.Background(), r))
 					d.HATracker = r
@@ -430,7 +429,7 @@ func TestDistributor_PushQuery(t *testing.T) {
 						numIngesters:     numIngesters,
 						happyIngesters:   happyIngesters,
 						matchers:         []*labels.Matcher{nameMatcher, barMatcher},
-						expectedError:    promql.ErrStorage{Err: errFail},
+						expectedError:    errFail,
 						shardByAllLabels: shardByAllLabels,
 					})
 					continue
@@ -444,7 +443,7 @@ func TestDistributor_PushQuery(t *testing.T) {
 						numIngesters:     numIngesters,
 						happyIngesters:   happyIngesters,
 						matchers:         []*labels.Matcher{nameMatcher, barMatcher},
-						expectedError:    promql.ErrStorage{Err: errFail},
+						expectedError:    errFail,
 						shardByAllLabels: shardByAllLabels,
 					})
 					continue
@@ -734,7 +733,7 @@ func TestSlowQueries(t *testing.T) {
 			t.Run(fmt.Sprintf("%t/%d", shardByAllLabels, happy), func(t *testing.T) {
 				var expectedErr error
 				if nIngesters-happy > 1 {
-					expectedErr = promql.ErrStorage{Err: errFail}
+					expectedErr = errFail
 				}
 
 				ds, _, r := prepare(t, prepConfig{
@@ -936,7 +935,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		},
 		HeartbeatTimeout:  60 * time.Minute,
 		ReplicationFactor: 3,
-	}, ring.IngesterRingKey, ring.IngesterRingKey)
+	}, ring.IngesterRingKey, ring.IngesterRingKey, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingestersRing))
 
@@ -954,7 +953,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		var clientConfig client.Config
 		flagext.DefaultValues(&distributorCfg, &clientConfig)
 
-		distributorCfg.ingesterClientFactory = factory
+		distributorCfg.IngesterClientFactory = factory
 		distributorCfg.ShardByAllLabels = cfg.shardByAllLabels
 		distributorCfg.ExtraQueryDelay = 50 * time.Millisecond
 		distributorCfg.DistributorRing.HeartbeatPeriod = 100 * time.Millisecond
@@ -969,7 +968,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		overrides, err := validation.NewOverrides(*cfg.limits, nil)
 		require.NoError(t, err)
 
-		d, err := New(distributorCfg, clientConfig, overrides, ingestersRing, true)
+		d, err := New(distributorCfg, clientConfig, overrides, ingestersRing, true, nil)
 		require.NoError(t, err)
 		require.NoError(t, services.StartAndAwaitRunning(context.Background(), d))
 

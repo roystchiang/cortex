@@ -73,12 +73,14 @@ type DeleteStore struct {
 
 // DeleteStoreConfig holds configuration for delete store.
 type DeleteStoreConfig struct {
-	Store             string `yaml:"store"`
-	RequestsTableName string `yaml:"requests_table_name"`
+	Store             string                  `yaml:"store"`
+	RequestsTableName string                  `yaml:"requests_table_name"`
+	ProvisionConfig   TableProvisioningConfig `yaml:"table_provisioning"`
 }
 
 // RegisterFlags adds the flags required to configure this flag set.
 func (cfg *DeleteStoreConfig) RegisterFlags(f *flag.FlagSet) {
+	cfg.ProvisionConfig.RegisterFlags("deletes.table", f)
 	f.StringVar(&cfg.Store, "deletes.store", "", "Store for keeping delete request")
 	f.StringVar(&cfg.RequestsTableName, "deletes.requests-table-name", "delete_requests", "Name of the table which stores delete requests")
 }
@@ -95,6 +97,12 @@ func NewDeleteStore(cfg DeleteStoreConfig, indexClient chunk.IndexClient) (*Dele
 
 // Add creates entries for a new delete request.
 func (ds *DeleteStore) AddDeleteRequest(ctx context.Context, userID string, startTime, endTime model.Time, selectors []string) error {
+	return ds.addDeleteRequest(ctx, userID, model.Now(), startTime, endTime, selectors)
+
+}
+
+// addDeleteRequest is also used for tests to create delete requests with different createdAt time.
+func (ds *DeleteStore) addDeleteRequest(ctx context.Context, userID string, createdAt, startTime, endTime model.Time, selectors []string) error {
 	requestID := generateUniqueID(userID, selectors)
 
 	for {
@@ -120,7 +128,7 @@ func (ds *DeleteStore) AddDeleteRequest(ctx context.Context, userID string, star
 	writeBatch.Add(ds.cfg.RequestsTableName, string(deleteRequestID), []byte(userIDAndRequestID), []byte(StatusReceived))
 
 	// Add another entry with additional details like creation time, time range of delete request and selectors in value
-	rangeValue := fmt.Sprintf("%x:%x:%x", int64(model.Now()), int64(startTime), int64(endTime))
+	rangeValue := fmt.Sprintf("%x:%x:%x", int64(createdAt), int64(startTime), int64(endTime))
 	writeBatch.Add(ds.cfg.RequestsTableName, fmt.Sprintf("%s:%s", deleteRequestDetails, userIDAndRequestID),
 		[]byte(rangeValue), []byte(strings.Join(selectors, separator)))
 
@@ -291,6 +299,25 @@ func (ds *DeleteStore) queryCacheGenerationNumber(ctx context.Context, userID st
 	}
 
 	return genNumber, nil
+}
+
+// RemoveDeleteRequest removes a delete request and increments cache gen number
+func (ds *DeleteStore) RemoveDeleteRequest(ctx context.Context, userID, requestID string, createdAt, startTime, endTime model.Time) error {
+	userIDAndRequestID := fmt.Sprintf("%s:%s", userID, requestID)
+
+	writeBatch := ds.indexClient.NewWriteBatch()
+	writeBatch.Delete(ds.cfg.RequestsTableName, string(deleteRequestID), []byte(userIDAndRequestID))
+
+	// Add another entry with additional details like creation time, time range of delete request and selectors in value
+	rangeValue := fmt.Sprintf("%x:%x:%x", int64(createdAt), int64(startTime), int64(endTime))
+	writeBatch.Delete(ds.cfg.RequestsTableName, fmt.Sprintf("%s:%s", deleteRequestDetails, userIDAndRequestID),
+		[]byte(rangeValue))
+
+	// we need to invalidate results cache since removal of delete request would cause query results to change
+	writeBatch.Add(ds.cfg.RequestsTableName, fmt.Sprintf("%s:%s:%s", cacheGenNum, userID, CacheKindResults),
+		nil, []byte(strconv.FormatInt(time.Now().Unix(), 10)))
+
+	return ds.indexClient.BatchWrite(ctx, writeBatch)
 }
 
 func parseDeleteRequestTimestamps(rangeValue []byte, deleteRequest DeleteRequest) (DeleteRequest, error) {

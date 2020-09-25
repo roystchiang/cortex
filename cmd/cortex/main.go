@@ -1,12 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,11 +31,21 @@ var (
 	Revision string
 )
 
+// configHash exposes information about the loaded config
+var configHash *prometheus.GaugeVec = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "cortex_config_hash",
+		Help: "Hash of the currently active config file.",
+	},
+	[]string{"sha256"},
+)
+
 func init() {
 	version.Version = Version
 	version.Branch = Branch
 	version.Revision = Revision
 	prometheus.MustRegister(version.NewCollector("cortex"))
+	prometheus.MustRegister(configHash)
 }
 
 const (
@@ -69,45 +81,68 @@ func main() {
 
 	// Ignore -config.file and -config.expand-env here, since it was already parsed, but it's still present on command line.
 	flagext.IgnoredFlag(flag.CommandLine, configFileOption, "Configuration file to load.")
-	flagext.IgnoredFlag(flag.CommandLine, configExpandENV, "Expands ${var} or $var in config according to the values of the environment variables.")
+	_ = flag.CommandLine.Bool(configExpandENV, false, "Expands ${var} or $var in config according to the values of the environment variables.")
 
 	flag.IntVar(&eventSampleRate, "event.sample-rate", 0, "How often to sample observability events (0 = never).")
 	flag.IntVar(&ballastBytes, "mem-ballast-size-bytes", 0, "Size of memory ballast to allocate.")
 	flag.IntVar(&mutexProfileFraction, "debug.mutex-profile-fraction", 0, "Fraction at which mutex profile vents will be reported, 0 to disable")
 
-	if testMode {
-		// Don't exit on error in test mode. Just parse parameters, dump config and stop.
-		flag.CommandLine.Init(flag.CommandLine.Name(), flag.ContinueOnError)
-		flag.Parse()
+	usage := flag.CommandLine.Usage
+	flag.CommandLine.Usage = func() { /* don't do anything by default, we will print usage ourselves, but only when requested. */ }
+	flag.CommandLine.Init(flag.CommandLine.Name(), flag.ContinueOnError)
+
+	err := flag.CommandLine.Parse(os.Args[1:])
+	if err == flag.ErrHelp {
+		// Print available parameters to stdout, so that users can grep/less it easily.
+		flag.CommandLine.SetOutput(os.Stdout)
+		usage()
+		if !testMode {
+			os.Exit(2)
+		}
+	} else if err != nil {
+		fmt.Fprintln(flag.CommandLine.Output(), "Run with -help to get list of available parameters")
+		if !testMode {
+			os.Exit(2)
+		}
+	}
+
+	// Validate the config once both the config file has been loaded
+	// and CLI flags parsed.
+	err = cfg.Validate(util.Logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error validating config: %v\n", err)
+		if !testMode {
+			os.Exit(1)
+		}
+	}
+
+	// Continue on if -modules flag is given. Code handling the
+	// -modules flag will not start cortex.
+	if testMode && !cfg.ListModules {
 		DumpYaml(&cfg)
 		return
 	}
-
-	flag.Parse()
 
 	if mutexProfileFraction > 0 {
 		runtime.SetMutexProfileFraction(mutexProfileFraction)
 	}
 
 	util.InitLogger(&cfg.Server)
-	// Validate the config once both the config file has been loaded
-	// and CLI flags parsed.
-	err := cfg.Validate(util.Logger)
-	if err != nil {
-		fmt.Printf("error validating config: %v\n", err)
-		os.Exit(1)
-	}
 
 	// Allocate a block of memory to alter GC behaviour. See https://github.com/golang/go/issues/23044
 	ballast := make([]byte, ballastBytes)
 
 	util.InitEvents(eventSampleRate)
 
-	// Setting the environment variable JAEGER_AGENT_HOST enables tracing
-	if trace, err := tracing.NewFromEnv("cortex-" + cfg.Target.String()); err != nil {
-		level.Error(util.Logger).Log("msg", "Failed to setup tracing", "err", err.Error())
-	} else {
-		defer trace.Close()
+	// In testing mode skip JAEGER setup to avoid panic due to
+	// "duplicate metrics collector registration attempted"
+	if !testMode {
+		// Setting the environment variable JAEGER_AGENT_HOST enables tracing.
+		if trace, err := tracing.NewFromEnv("cortex-" + cfg.Target); err != nil {
+			level.Error(util.Logger).Log("msg", "Failed to setup tracing", "err", err.Error())
+		} else {
+			defer trace.Close()
+		}
 	}
 
 	// Initialise seed for randomness usage.
@@ -115,6 +150,30 @@ func main() {
 
 	t, err := cortex.New(cfg)
 	util.CheckFatal("initializing cortex", err)
+
+	if t.Cfg.ListModules {
+		allDeps := t.ModuleManager.DependenciesForModule(cortex.All)
+
+		for _, m := range t.ModuleManager.UserVisibleModuleNames() {
+			ix := sort.SearchStrings(allDeps, m)
+			included := ix < len(allDeps) && allDeps[ix] == m
+
+			if included {
+				fmt.Fprintln(os.Stdout, m, "*")
+			} else {
+				fmt.Fprintln(os.Stdout, m)
+			}
+		}
+
+		fmt.Fprintln(os.Stdout)
+		fmt.Fprintln(os.Stdout, "Modules marked with * are included in target All.")
+
+		// in test mode we cannot call os.Exit, it will stop to whole test process.
+		if testMode {
+			return
+		}
+		os.Exit(2)
+	}
 
 	level.Info(util.Logger).Log("msg", "Starting Cortex", "version", version.Info())
 
@@ -151,6 +210,12 @@ func LoadConfig(filename string, expandENV bool, cfg *cortex.Config) error {
 	if err != nil {
 		return errors.Wrap(err, "Error reading config file")
 	}
+
+	// create a sha256 hash of the config before expansion and expose it via
+	// the config_info metric
+	hash := sha256.Sum256(buf)
+	configHash.Reset()
+	configHash.WithLabelValues(fmt.Sprintf("%x", hash)).Set(1)
 
 	if expandENV {
 		buf = expandEnv(buf)

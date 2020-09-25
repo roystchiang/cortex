@@ -2,17 +2,18 @@ package purger
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/require"
 )
 
 func TestTombstonesLoader(t *testing.T) {
 	deleteRequestSelectors := []string{"foo"}
-	metric, err := promql.ParseMetric(deleteRequestSelectors[0])
+	metric, err := parser.ParseMetric(deleteRequestSelectors[0])
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
@@ -94,9 +95,7 @@ func TestTombstonesLoader(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			deleteStore, err := setupTestDeleteStore()
-			require.NoError(t, err)
-
+			deleteStore := setupTestDeleteStore(t)
 			tombstonesLoader := NewTombstonesLoader(deleteStore, nil)
 
 			// add delete requests
@@ -132,4 +131,28 @@ func TestTombstonesLoader(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTombstonesReloadDoesntDeadlockOnFailure(t *testing.T) {
+	s := &store{}
+	tombstonesLoader := NewTombstonesLoader(s, nil)
+	tombstonesLoader.getCacheGenNumbers("test")
+
+	s.err = errors.New("error")
+	require.NotNil(t, tombstonesLoader.reloadTombstones())
+
+	s.err = nil
+	require.NotNil(t, tombstonesLoader.getCacheGenNumbers("test2"))
+}
+
+type store struct {
+	err error
+}
+
+func (f *store) getCacheGenerationNumbers(ctx context.Context, user string) (*cacheGenNumbers, error) {
+	return &cacheGenNumbers{}, f.err
+}
+
+func (f *store) GetPendingDeleteRequestsForUser(ctx context.Context, id string) ([]DeleteRequest, error) {
+	return nil, nil
 }

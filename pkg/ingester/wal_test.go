@@ -2,18 +2,20 @@ package ingester
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
-	tsdb_record "github.com/prometheus/prometheus/tsdb/record"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -70,6 +72,39 @@ func TestWAL(t *testing.T) {
 
 		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ing))
 	}
+
+	cfg.WALConfig.WALEnabled = true
+	cfg.WALConfig.CheckpointEnabled = true
+
+	// Start a new ingester and recover the WAL.
+	_, ing = newTestStore(t, cfg, defaultClientTestConfig(), defaultLimitsTestConfig(), nil)
+
+	userID := userIDs[0]
+	sampleStream := testData[userID][0]
+	lastSample := sampleStream.Values[len(sampleStream.Values)-1]
+
+	// In-order and out of order sample in the same request.
+	metric := client.FromLabelAdaptersToLabels(client.FromMetricsToLabelAdapters(sampleStream.Metric))
+	outOfOrderSample := client.Sample{TimestampMs: int64(lastSample.Timestamp - 10), Value: 99}
+	inOrderSample := client.Sample{TimestampMs: int64(lastSample.Timestamp + 10), Value: 999}
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	_, err = ing.Push(ctx, client.ToWriteRequest(
+		[]labels.Labels{metric, metric},
+		[]client.Sample{outOfOrderSample, inOrderSample}, nil, client.API))
+	require.Equal(t, httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(makeMetricValidationError(sampleOutOfOrder, metric,
+		fmt.Errorf("sample timestamp out of order; last timestamp: %v, incoming timestamp: %v", lastSample.Timestamp, model.Time(outOfOrderSample.TimestampMs))), userID).Error()), err)
+
+	// We should have logged the in-order sample.
+	testData[userID][0].Values = append(testData[userID][0].Values, model.SamplePair{
+		Timestamp: model.Time(inOrderSample.TimestampMs),
+		Value:     model.SampleValue(inOrderSample.Value),
+	})
+
+	// Check samples after restart from WAL.
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ing))
+	_, ing = newTestStore(t, cfg, defaultClientTestConfig(), defaultLimitsTestConfig(), nil)
+	retrieveTestSamples(t, ing, userIDs, testData)
 }
 
 func TestCheckpointRepair(t *testing.T) {
@@ -188,101 +223,64 @@ func TestCheckpointRepair(t *testing.T) {
 
 }
 
-func TestMigrationToTypedRecord(t *testing.T) {
-	// WAL record migration.
-	walRecordOld := &Record{
-		UserId: "12345",
-		Labels: []Labels{
-			{Fingerprint: 7568176523, Labels: []client.LabelAdapter{{Name: "n1", Value: "v1"}}},
-			{Fingerprint: 5720984283, Labels: []client.LabelAdapter{{Name: "n2", Value: "v2"}}},
+func TestCheckpointIndex(t *testing.T) {
+	tcs := []struct {
+		filename    string
+		includeTmp  bool
+		index       int
+		shouldError bool
+	}{
+		{
+			filename:    "checkpoint.123456",
+			includeTmp:  false,
+			index:       123456,
+			shouldError: false,
 		},
-		Samples: []Sample{
-			{Fingerprint: 768276312, Timestamp: 10, Value: 10},
-			{Fingerprint: 326847234, Timestamp: 99, Value: 99},
+		{
+			filename:    "checkpoint.123456",
+			includeTmp:  true,
+			index:       123456,
+			shouldError: false,
 		},
-	}
-	walRecordNew := &WALRecord{
-		UserID: "12345",
-		Series: []tsdb_record.RefSeries{
-			{Ref: 7568176523, Labels: []labels.Label{{Name: "n1", Value: "v1"}}},
-			{Ref: 5720984283, Labels: []labels.Label{{Name: "n2", Value: "v2"}}},
+		{
+			filename:    "checkpoint.123456.tmp",
+			includeTmp:  true,
+			index:       123456,
+			shouldError: false,
 		},
-		Samples: []tsdb_record.RefSample{
-			{Ref: 768276312, T: 10, V: 10},
-			{Ref: 326847234, T: 99, V: 99},
+		{
+			filename:    "checkpoint.123456.tmp",
+			includeTmp:  false,
+			shouldError: true,
 		},
-	}
-
-	// Encoding old record.
-	oldRecordBytes, err := proto.Marshal(walRecordOld)
-	require.NoError(t, err)
-	// Series and samples are encoded separately in the new record.
-	newRecordSeriesBytes := walRecordNew.encodeSeries(nil)
-	newRecordSamples := walRecordNew.encodeSamples(nil)
-
-	// Test decoding of old record.
-	record, walRecord := &Record{}, &WALRecord{}
-	err = decodeWALRecord(oldRecordBytes, record, walRecord)
-	require.NoError(t, err)
-	require.Equal(t, walRecordOld, record)
-	require.Equal(t, &WALRecord{}, walRecord)
-
-	// Test series and samples of new record separately.
-	record, walRecord = &Record{}, &WALRecord{}
-	err = decodeWALRecord(newRecordSeriesBytes, record, walRecord)
-	require.NoError(t, err)
-	require.Equal(t, &Record{}, record)
-	require.Equal(t, walRecordNew.UserID, walRecord.UserID)
-	require.Equal(t, walRecordNew.Series, walRecord.Series)
-	require.Equal(t, 0, len(walRecord.Samples))
-
-	record, walRecord = &Record{}, &WALRecord{}
-	err = decodeWALRecord(newRecordSamples, record, walRecord)
-	require.NoError(t, err)
-	require.Equal(t, &Record{}, record)
-	require.Equal(t, walRecordNew.UserID, walRecord.UserID)
-	require.Equal(t, walRecordNew.Samples, walRecord.Samples)
-	require.Equal(t, 0, len(walRecord.Series))
-
-	// Checkpoint record migration.
-	checkpointRecord := &Series{
-		UserId:      "12345",
-		Fingerprint: 3479837401,
-		Labels: []client.LabelAdapter{
-			{Name: "n1", Value: "v1"},
-			{Name: "n2", Value: "v2"},
+		{
+			filename:    "not-checkpoint.123456.tmp",
+			includeTmp:  true,
+			shouldError: true,
 		},
-		Chunks: []client.Chunk{
-			{
-				StartTimestampMs: 12345,
-				EndTimestampMs:   23456,
-				Encoding:         3,
-				Data:             []byte{3, 3, 65, 23, 66},
-			},
-			{
-				StartTimestampMs: 34567,
-				EndTimestampMs:   45678,
-				Encoding:         2,
-				Data:             []byte{11, 22, 33, 44, 55, 66, 77, 88},
-			},
+		{
+			filename:    "checkpoint.123456.tmp2",
+			shouldError: true,
+		},
+		{
+			filename:    "checkpoints123456",
+			shouldError: true,
+		},
+		{
+			filename:    "012345",
+			shouldError: true,
 		},
 	}
+	for _, tc := range tcs {
+		index, err := checkpointIndex(tc.filename, tc.includeTmp)
+		if tc.shouldError {
+			require.Error(t, err, "filename: %s, includeTmp: %t", tc.filename, tc.includeTmp)
+			continue
+		}
 
-	oldRecordBytes, err = proto.Marshal(checkpointRecord)
-	require.NoError(t, err)
-	newRecordBytes, err := encodeWithTypeHeader(checkpointRecord, CheckpointRecord, nil)
-	require.NoError(t, err)
-
-	m, err := decodeCheckpointRecord(oldRecordBytes, &Series{})
-	require.NoError(t, err)
-	oldCheckpointRecordDecoded := m.(*Series)
-
-	m, err = decodeCheckpointRecord(newRecordBytes, &Series{})
-	require.NoError(t, err)
-	newCheckpointRecordDecoded := m.(*Series)
-
-	require.Equal(t, checkpointRecord, oldCheckpointRecordDecoded)
-	require.Equal(t, checkpointRecord, newCheckpointRecordDecoded)
+		require.NoError(t, err, "filename: %s, includeTmp: %t", tc.filename, tc.includeTmp)
+		require.Equal(t, tc.index, index)
+	}
 }
 
 func BenchmarkWALReplay(b *testing.B) {

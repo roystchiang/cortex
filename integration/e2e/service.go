@@ -22,6 +22,7 @@ import (
 
 var (
 	dockerPortPattern = regexp.MustCompile(`^.*:(\d+)$`)
+	errMissingMetric  = errors.New("metric not found")
 )
 
 // ConcreteService represents microservice with optional ports which will be discoverable from docker
@@ -284,7 +285,7 @@ func (s *ConcreteService) buildDockerRunArgs(networkName, sharedDir string) []st
 	args := []string{"run", "--rm", "--net=" + networkName, "--name=" + networkName + "-" + s.name, "--hostname=" + s.name}
 
 	// Mount the shared/ directory into the container
-	args = append(args, "-v", fmt.Sprintf("%s:%s:Z", sharedDir, ContainerSharedDir))
+	args = append(args, "-v", fmt.Sprintf("%s:%s:z", sharedDir, ContainerSharedDir))
 
 	// Environment variables
 	for name, value := range s.env {
@@ -315,7 +316,10 @@ func (s *ConcreteService) buildDockerRunArgs(networkName, sharedDir string) []st
 	return args
 }
 
-func (s *ConcreteService) Exec(command *Command) (string, error) {
+// Exec runs the provided against a the docker container specified by this
+// service. It returns the stdout, stderr, and error response from attempting
+// to run the command.
+func (s *ConcreteService) Exec(command *Command) (string, string, error) {
 	args := []string{"exec", s.containerName()}
 	args = append(args, command.cmd)
 	args = append(args, command.args...)
@@ -324,12 +328,12 @@ func (s *ConcreteService) Exec(command *Command) (string, error) {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
-	err := cmd.Run()
-	if err != nil {
-		return "", err
-	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	return stdout.String(), nil
+	err := cmd.Run()
+
+	return stdout.String(), stderr.String(), err
 }
 
 type Command struct {
@@ -393,7 +397,8 @@ func (p *HTTPReadinessProbe) Ready(service *ConcreteService) (err error) {
 		return nil
 	}
 
-	return fmt.Errorf("got status code: %v, expected code in range: [%v, %v]", res.StatusCode, p.expectedStatusRangeStart, p.expectedStatusRangeEnd)
+	body, _ := ioutil.ReadAll(res.Body)
+	return fmt.Errorf("expected code in range: [%v, %v], got status code: %v and body: %v", p.expectedStatusRangeStart, p.expectedStatusRangeEnd, res.StatusCode, string(body))
 }
 
 // TCPReadinessProbe checks readiness by ensure a TCP connection can be established.
@@ -433,7 +438,7 @@ func NewCmdReadinessProbe(cmd *Command) *CmdReadinessProbe {
 }
 
 func (p *CmdReadinessProbe) Ready(service *ConcreteService) error {
-	_, err := service.Exec(p.cmd)
+	_, _, err := service.Exec(p.cmd)
 	return err
 }
 
@@ -521,13 +526,21 @@ func (s *HTTPService) NetworkHTTPEndpointFor(networkName string) string {
 // WaitSumMetrics waits for at least one instance of each given metric names to be present and their sums, returning true
 // when passed to given isExpected(...).
 func (s *HTTPService) WaitSumMetrics(isExpected func(sums ...float64) bool, metricNames ...string) error {
+	return s.WaitSumMetricsWithOptions(isExpected, metricNames)
+}
+
+func (s *HTTPService) WaitSumMetricsWithOptions(isExpected func(sums ...float64) bool, metricNames []string, opts ...MetricsOption) error {
 	var (
-		sums []float64
-		err  error
+		sums    []float64
+		err     error
+		options = buildMetricsOptions(opts)
 	)
 
 	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
-		sums, err = s.SumMetrics(metricNames...)
+		sums, err = s.SumMetrics(metricNames, opts...)
+		if options.WaitMissingMetrics && errors.Is(err, errMissingMetric) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -539,11 +552,12 @@ func (s *HTTPService) WaitSumMetrics(isExpected func(sums ...float64) bool, metr
 		s.retryBackoff.Wait()
 	}
 
-	return fmt.Errorf("unable to find metrics %s with expected values. Last values: %v", metricNames, sums)
+	return fmt.Errorf("unable to find metrics %s with expected values. Last error: %v. Last values: %v", metricNames, err, sums)
 }
 
 // SumMetrics returns the sum of the values of each given metric names.
-func (s *HTTPService) SumMetrics(metricNames ...string) ([]float64, error) {
+func (s *HTTPService) SumMetrics(metricNames []string, opts ...MetricsOption) ([]float64, error) {
+	options := buildMetricsOptions(opts)
 	sums := make([]float64, len(metricNames))
 
 	metrics, err := s.Metrics()
@@ -560,59 +574,55 @@ func (s *HTTPService) SumMetrics(metricNames ...string) ([]float64, error) {
 	for i, m := range metricNames {
 		sums[i] = 0.0
 
-		// Check if the metric is exported.
-		if mf, ok := families[m]; ok {
-			sums[i] = sumValues(mf)
-			continue
+		// Get the metric family.
+		mf, ok := families[m]
+		if !ok {
+			return nil, errors.Wrapf(errMissingMetric, "metric=%s service=%s", m, s.name)
 		}
-		return nil, errors.Errorf("metric %s not found in %s metric page", m, s.name)
+
+		// Filter metrics.
+		metrics := filterMetrics(mf.GetMetric(), options)
+		if len(metrics) == 0 {
+			return nil, errors.Wrapf(errMissingMetric, "metric=%s service=%s", m, s.name)
+		}
+
+		sums[i] = sumValues(getValues(metrics, options))
 	}
 
 	return sums, nil
 }
 
-// WaitForMetricWithLabels waits until given metric with matching labels passes `okFn`. If function returns false,
-// wait continues. If no such matching metric can be found or wait times out, function returns error.
-func (s *HTTPService) WaitForMetricWithLabels(okFn func(v float64) bool, metricName string, expectedLabels map[string]string) error {
+// WaitRemovedMetric waits until a metric disappear from the list of metrics exported by the service.
+func (s *HTTPService) WaitRemovedMetric(metricName string, opts ...MetricsOption) error {
+	options := buildMetricsOptions(opts)
+
 	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
+		// Fetch metrics.
 		metrics, err := s.Metrics()
 		if err != nil {
 			return err
 		}
 
+		// Parse metrics.
 		var tp expfmt.TextParser
 		families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
 		if err != nil {
 			return err
 		}
 
+		// Get the metric family.
 		mf, ok := families[metricName]
 		if !ok {
-			return errors.Errorf("metric %s not found in %s metric page", metricName, s.name)
+			return nil
 		}
 
-		for _, m := range mf.GetMetric() {
-			// check if some metric has all required labels
-			metricLabels := map[string]string{}
-			for _, lp := range m.GetLabel() {
-				metricLabels[lp.GetName()] = lp.GetValue()
-			}
-
-			matches := true
-			for k, v := range expectedLabels {
-				if mv, ok := metricLabels[k]; !ok || mv != v {
-					matches = false
-					break
-				}
-			}
-
-			if matches && okFn(getValue(m)) {
-				return nil
-			}
+		// Filter metrics.
+		if len(filterMetrics(mf.GetMetric(), options)) == 0 {
+			return nil
 		}
 
 		s.retryBackoff.Wait()
 	}
 
-	return fmt.Errorf("unable to find metric %s with labels %v with expected value", metricName, expectedLabels)
+	return fmt.Errorf("the metric %s is still exported by %s", metricName, s.name)
 }

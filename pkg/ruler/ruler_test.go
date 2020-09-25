@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
@@ -55,7 +57,13 @@ func defaultRulerConfig(store rules.RuleStore) (Config, func()) {
 	return cfg, cleanup
 }
 
-func newTestRuler(t *testing.T, cfg Config) (*Ruler, func()) {
+type ruleLimits time.Duration
+
+func (r ruleLimits) EvaluationDelay(_ string) time.Duration {
+	return time.Duration(r)
+}
+
+func testSetup(t *testing.T, cfg Config) (*promql.Engine, storage.QueryableFunc, Pusher, log.Logger, RulesLimits, func()) {
 	dir, err := ioutil.TempDir("", t.Name())
 	testutil.Ok(t, err)
 	cleanup := func() {
@@ -80,8 +88,42 @@ func newTestRuler(t *testing.T, cfg Config) (*Ruler, func()) {
 
 	l := log.NewLogfmtLogger(os.Stdout)
 	l = level.NewFilter(l, level.AllowInfo())
-	ruler, err := NewRuler(cfg, engine, noopQueryable, pusher, prometheus.NewRegistry(), l)
+
+	return engine, noopQueryable, pusher, l, ruleLimits(0), cleanup
+}
+
+func newManager(t *testing.T, cfg Config) (*DefaultMultiTenantManager, func()) {
+	engine, noopQueryable, pusher, logger, overrides, cleanup := testSetup(t, cfg)
+	manager, err := NewDefaultMultiTenantManager(cfg, DefaultTenantManagerFactory(cfg, pusher, noopQueryable, engine, overrides), prometheus.NewRegistry(), logger)
 	require.NoError(t, err)
+
+	return manager, cleanup
+}
+
+func newRuler(t *testing.T, cfg Config) (*Ruler, func()) {
+	engine, noopQueryable, pusher, logger, overrides, cleanup := testSetup(t, cfg)
+	storage, err := NewRuleStorage(cfg.StoreConfig)
+	require.NoError(t, err)
+
+	reg := prometheus.NewRegistry()
+	managerFactory := DefaultTenantManagerFactory(cfg, pusher, noopQueryable, engine, overrides)
+	manager, err := NewDefaultMultiTenantManager(cfg, managerFactory, reg, util.Logger)
+	require.NoError(t, err)
+
+	ruler, err := NewRuler(
+		cfg,
+		manager,
+		reg,
+		logger,
+		storage,
+	)
+	require.NoError(t, err)
+
+	return ruler, cleanup
+}
+
+func newTestRuler(t *testing.T, cfg Config) (*Ruler, func()) {
+	ruler, cleanup := newRuler(t, cfg)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ruler))
 
 	// Ensure all rules are loaded before usage
@@ -89,6 +131,8 @@ func newTestRuler(t *testing.T, cfg Config) (*Ruler, func()) {
 
 	return ruler, cleanup
 }
+
+var _ MultiTenantManager = &DefaultMultiTenantManager{}
 
 func TestNotifierSendsUserIDHeader(t *testing.T) {
 	var wg sync.WaitGroup
@@ -107,20 +151,16 @@ func TestNotifierSendsUserIDHeader(t *testing.T) {
 	cfg, cleanup := defaultRulerConfig(newMockRuleStore(nil))
 	defer cleanup()
 
-	err := cfg.AlertmanagerURL.Set(ts.URL)
-	require.NoError(t, err)
+	cfg.AlertmanagerURL = ts.URL
 	cfg.AlertmanagerDiscovery = false
 
-	r, rcleanup := newTestRuler(t, cfg)
+	manager, rcleanup := newManager(t, cfg)
 	defer rcleanup()
-	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
+	defer manager.Stop()
 
-	n, err := r.getOrCreateNotifier("1")
+	n, err := manager.getOrCreateNotifier("1")
 	require.NoError(t, err)
 
-	for _, not := range r.notifiers {
-		defer not.stop()
-	}
 	// Loop until notifier discovery syncs up
 	for len(n.Alertmanagers()) == 0 {
 		time.Sleep(10 * time.Millisecond)
@@ -130,6 +170,13 @@ func TestNotifierSendsUserIDHeader(t *testing.T) {
 	})
 
 	wg.Wait()
+
+	// Ensure we have metrics in the notifier.
+	assert.NoError(t, prom_testutil.GatherAndCompare(manager.registry.(*prometheus.Registry), strings.NewReader(`
+		# HELP cortex_prometheus_notifications_dropped_total Total number of alerts dropped due to errors when sending to Alertmanager.
+		# TYPE cortex_prometheus_notifications_dropped_total counter
+		cortex_prometheus_notifications_dropped_total{user="1"} 0
+	`), "cortex_prometheus_notifications_dropped_total"))
 }
 
 func TestRuler_Rules(t *testing.T) {
