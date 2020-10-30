@@ -126,16 +126,23 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 }
 
 type multitenantAlertmanagerMetrics struct {
-	invalidConfig *prometheus.GaugeVec
+	lastReloadSuccessful          *prometheus.GaugeVec
+	lastReloadSuccessfulTimestamp *prometheus.GaugeVec
 }
 
 func newMultitenantAlertmanagerMetrics(reg prometheus.Registerer) *multitenantAlertmanagerMetrics {
 	m := &multitenantAlertmanagerMetrics{}
 
-	m.invalidConfig = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+	m.lastReloadSuccessful = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "cortex",
-		Name:      "alertmanager_config_invalid",
-		Help:      "Boolean set to 1 whenever the Alertmanager config is invalid for a user.",
+		Name:      "alertmanager_config_last_reload_successful",
+		Help:      "Boolean set to 1 whenever the last configuration reload attempt was successful.",
+	}, []string{"user"})
+
+	m.lastReloadSuccessfulTimestamp = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "cortex",
+		Name:      "alertmanager_config_last_reload_successful_seconds",
+		Help:      "Timestamp of the last successful configuration reload.",
 	}, []string{"user"})
 
 	return m
@@ -314,12 +321,13 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alerts.AlertConfi
 	for user, cfg := range cfgs {
 		err := am.setConfig(cfg)
 		if err != nil {
-			am.multitenantMetrics.invalidConfig.WithLabelValues(user).Set(float64(1))
+			am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(0))
 			level.Warn(am.logger).Log("msg", "error applying config", "err", err)
 			continue
 		}
 
-		am.multitenantMetrics.invalidConfig.WithLabelValues(user).Set(float64(0))
+		am.multitenantMetrics.lastReloadSuccessful.WithLabelValues(user).Set(float64(1))
+		am.multitenantMetrics.lastReloadSuccessfulTimestamp.WithLabelValues(user).SetToCurrentTime()
 	}
 
 	am.alertmanagersMtx.Lock()
@@ -332,7 +340,8 @@ func (am *MultitenantAlertmanager) syncConfigs(cfgs map[string]alerts.AlertConfi
 			level.Info(am.logger).Log("msg", "deactivating per-tenant alertmanager", "user", user)
 			userAM.Pause()
 			delete(am.cfgs, user)
-			am.multitenantMetrics.invalidConfig.DeleteLabelValues(user)
+			am.multitenantMetrics.lastReloadSuccessful.DeleteLabelValues(user)
+			am.multitenantMetrics.lastReloadSuccessfulTimestamp.DeleteLabelValues(user)
 			level.Info(am.logger).Log("msg", "deactivated per-tenant alertmanager", "user", user)
 		}
 	}
@@ -386,7 +395,7 @@ func (am *MultitenantAlertmanager) setConfig(cfg alerts.AlertConfigDesc) error {
 		if am.fallbackConfig == "" {
 			return fmt.Errorf("blank Alertmanager configuration for %v", cfg.User)
 		}
-		level.Info(am.logger).Log("msg", "blank Alertmanager configuration; using fallback", "user", cfg.User)
+		level.Debug(am.logger).Log("msg", "blank Alertmanager configuration; using fallback", "user", cfg.User)
 		userAmConfig, err = amconfig.Load(am.fallbackConfig)
 		if err != nil {
 			return fmt.Errorf("unable to load fallback configuration for %v: %v", cfg.User, err)
@@ -454,7 +463,7 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 
 // ServeHTTP serves the Alertmanager's web UI and API.
 func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	userID, _, err := user.ExtractOrgIDFromHTTPRequest(req)
+	userID, err := user.ExtractOrgID(req.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -465,6 +474,7 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 
 	if ok {
 		if !userAM.IsActive() {
+			level.Debug(am.logger).Log("msg", "the Alertmanager is not active", "user", userID)
 			http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 			return
 		}
@@ -476,6 +486,7 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 	if am.fallbackConfig != "" {
 		userAM, err = am.alertmanagerFromFallbackConfig(userID)
 		if err != nil {
+			level.Error(am.logger).Log("msg", "unable to initialize the Alertmanager with a fallback configuration", "user", userID, "err", err)
 			http.Error(w, "Failed to initialize the Alertmanager", http.StatusInternalServerError)
 			return
 		}
@@ -484,6 +495,7 @@ func (am *MultitenantAlertmanager) ServeHTTP(w http.ResponseWriter, req *http.Re
 		return
 	}
 
+	level.Debug(am.logger).Log("msg", "the Alertmanager has no configuration and no fallback specified", "user", userID)
 	http.Error(w, "the Alertmanager is not configured", http.StatusNotFound)
 }
 
@@ -528,6 +540,10 @@ func (s StatusHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func createTemplateFile(dataDir, userID, fn, content string) (bool, error) {
+	if fn != filepath.Base(fn) {
+		return false, fmt.Errorf("template file name '%s' is not not valid", fn)
+	}
+
 	dir := filepath.Join(dataDir, "templates", userID, filepath.Dir(fn))
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {

@@ -173,6 +173,15 @@ querier:
   # Default value 0 means secondary store is always queried.
   # CLI flag: -querier.use-second-store-before-time
   [use_second_store_before_time: <time> | default = 0]
+
+  # When distributor's sharding strategy is shuffle-sharding and this setting is
+  # > 0, queriers fetch in-memory series from the minimum set of required
+  # ingesters, selecting only ingesters which may have received series since
+  # 'now - lookback period'. The lookback period should be greater or equal than
+  # the configured 'query store after'. If this setting is 0, queriers always
+  # query all ingesters (ingesters shuffle sharding on read path is disabled).
+  # CLI flag: -querier.shuffle-sharding-ingesters-lookback-period
+  [shuffle_sharding_ingesters_lookback_period: <duration> | default = 0s]
 ```
 
 ### `blocks_storage_config`
@@ -181,7 +190,8 @@ The `blocks_storage_config` configures the blocks storage.
 
 ```yaml
 blocks_storage:
-  # Backend storage to use. Supported backends are: s3, gcs, azure, filesystem.
+  # Backend storage to use. Supported backends are: s3, gcs, azure, swift,
+  # filesystem.
   # CLI flag: -blocks-storage.backend
   [backend: <string> | default = "s3"]
 
@@ -209,6 +219,20 @@ blocks_storage:
     # S3-compatible backend storage, like Minio.
     # CLI flag: -blocks-storage.s3.insecure
     [insecure: <boolean> | default = false]
+
+    http:
+      # The time an idle connection will remain idle before closing.
+      # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
+      [idle_conn_timeout: <duration> | default = 1m30s]
+
+      # The amount of time the client will wait for a servers response headers.
+      # CLI flag: -blocks-storage.s3.http.response-header-timeout
+      [response_header_timeout: <duration> | default = 2m]
+
+      # If the client connects to S3 via HTTPS and this option is enabled, the
+      # client will accept any certificate and hostname.
+      # CLI flag: -blocks-storage.s3.http.insecure-skip-verify
+      [insecure_skip_verify: <boolean> | default = false]
 
   gcs:
     # GCS bucket name
@@ -242,6 +266,65 @@ blocks_storage:
     # Number of retries for recoverable errors
     # CLI flag: -blocks-storage.azure.max-retries
     [max_retries: <int> | default = 20]
+
+  swift:
+    # OpenStack Swift authentication URL
+    # CLI flag: -blocks-storage.swift.auth-url
+    [auth_url: <string> | default = ""]
+
+    # OpenStack Swift username.
+    # CLI flag: -blocks-storage.swift.username
+    [username: <string> | default = ""]
+
+    # OpenStack Swift user's domain name.
+    # CLI flag: -blocks-storage.swift.user-domain-name
+    [user_domain_name: <string> | default = ""]
+
+    # OpenStack Swift user's domain ID.
+    # CLI flag: -blocks-storage.swift.user-domain-id
+    [user_domain_id: <string> | default = ""]
+
+    # OpenStack Swift user ID.
+    # CLI flag: -blocks-storage.swift.user-id
+    [user_id: <string> | default = ""]
+
+    # OpenStack Swift API key.
+    # CLI flag: -blocks-storage.swift.password
+    [password: <string> | default = ""]
+
+    # OpenStack Swift user's domain ID.
+    # CLI flag: -blocks-storage.swift.domain-id
+    [domain_id: <string> | default = ""]
+
+    # OpenStack Swift user's domain name.
+    # CLI flag: -blocks-storage.swift.domain-name
+    [domain_name: <string> | default = ""]
+
+    # OpenStack Swift project ID (v2,v3 auth only).
+    # CLI flag: -blocks-storage.swift.project-id
+    [project_id: <string> | default = ""]
+
+    # OpenStack Swift project name (v2,v3 auth only).
+    # CLI flag: -blocks-storage.swift.project-name
+    [project_name: <string> | default = ""]
+
+    # ID of the OpenStack Swift project's domain (v3 auth only), only needed if
+    # it differs the from user domain.
+    # CLI flag: -blocks-storage.swift.project-domain-id
+    [project_domain_id: <string> | default = ""]
+
+    # Name of the OpenStack Swift project's domain (v3 auth only), only needed
+    # if it differs from the user domain.
+    # CLI flag: -blocks-storage.swift.project-domain-name
+    [project_domain_name: <string> | default = ""]
+
+    # OpenStack Swift Region to use (v2,v3 auth only).
+    # CLI flag: -blocks-storage.swift.region-name
+    [region_name: <string> | default = ""]
+
+    # Name of the OpenStack Swift container to put chunks in.
+    # CLI flag: -blocks-storage.swift.container-name
+    [container_name: <string> | default = ""]
 
   filesystem:
     # Local filesystem storage directory.

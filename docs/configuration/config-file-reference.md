@@ -24,6 +24,7 @@ To specify which configuration file to load, pass the `-config.file` flag at the
 * `<string>`: a regular string
 * `<url>`: an URL
 * `<prefix>`: a CLI flag prefix based on the context (look at the parent configuration block to see which CLI flags prefix should be used)
+* `<relabel_config>`: a [Prometheus relabeling configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config).
 * `<time>`: a timestamp, with available formats: `2006-01-20` (midnight, local timezone), `2006-01-20T15:04` (local timezone), and RFC 3339 formats: `2006-01-20T15:04:05Z` (UTC) or `2006-01-20T15:04:05+07:00` (explicit timezone)
 
 ### Use environment variables in the configuration
@@ -52,8 +53,10 @@ Where default_value is the value to use if the environment variable is undefined
 ### Supported contents and default values of the config file
 
 ```yaml
-# The Cortex module to run. Use "-modules" command line flag to get a list of
-# available modules, and to see which modules are included in "All".
+# Comma-separated list of Cortex modules to load. The alias 'all' can be used in
+# the list to load a number of core modules and will enable single-binary mode.
+# Use '-modules' command line flag to get a list of available modules, and to
+# see which modules are included in 'all'.
 # CLI flag: -target
 [target: <string> | default = "all"]
 
@@ -392,6 +395,10 @@ ha_tracker:
 # CLI flag: -distributor.extra-query-delay
 [extra_queue_delay: <duration> | default = 0s]
 
+# The sharding strategy to use. Supported values are: default, shuffle-sharding.
+# CLI flag: -distributor.sharding-strategy
+[sharding_strategy: <string> | default = "default"]
+
 # Distribute samples based on all labels, as opposed to solely by user and
 # metric name.
 # CLI flag: -distributor.shard-by-all-labels
@@ -441,6 +448,10 @@ ring:
   # within the ring.
   # CLI flag: -distributor.ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
+
+  # Name of network interface to read address from.
+  # CLI flag: -distributor.ring.instance-interface-names
+  [instance_interface_names: <list of string> | default = [eth0 en0]]
 ```
 
 ### `ingester_config`
@@ -519,6 +530,11 @@ lifecycler:
     # CLI flag: -distributor.replication-factor
     [replication_factor: <int> | default = 3]
 
+    # True to enable the zone-awareness and replicate ingested samples across
+    # different availability zones.
+    # CLI flag: -distributor.zone-awareness-enabled
+    [zone_awareness_enabled: <boolean> | default = false]
+
   # Number of tokens for each ingester.
   # CLI flag: -ingester.num-tokens
   [num_tokens: <int> | default = 128]
@@ -555,8 +571,7 @@ lifecycler:
   # CLI flag: -ingester.tokens-file-path
   [tokens_file_path: <string> | default = ""]
 
-  # The availability zone of the host, this instance is running on. Default is
-  # an empty string, which disables zone awareness for writes.
+  # The availability zone where this instance is running.
   # CLI flag: -ingester.availability-zone
   [availability_zone: <string> | default = ""]
 
@@ -613,6 +628,18 @@ lifecycler:
 # Period with which to update the per-user ingestion rates.
 # CLI flag: -ingester.rate-update-period
 [rate_update_period: <duration> | default = 15s]
+
+# Enable tracking of active series and export them as metrics.
+# CLI flag: -ingester.active-series-metrics-enabled
+[active_series_metrics_enabled: <boolean> | default = false]
+
+# How often to update active series metrics.
+# CLI flag: -ingester.active-series-metrics-update-period
+[active_series_metrics_update_period: <duration> | default = 1m]
+
+# After what time a series is considered to be inactive.
+# CLI flag: -ingester.active-series-metrics-idle-timeout
+[active_series_metrics_idle_timeout: <duration> | default = 10m]
 ```
 
 ### `querier_config`
@@ -714,6 +741,15 @@ store_gateway_client:
 # Default value 0 means secondary store is always queried.
 # CLI flag: -querier.use-second-store-before-time
 [use_second_store_before_time: <time> | default = 0]
+
+# When distributor's sharding strategy is shuffle-sharding and this setting is >
+# 0, queriers fetch in-memory series from the minimum set of required ingesters,
+# selecting only ingesters which may have received series since 'now - lookback
+# period'. The lookback period should be greater or equal than the configured
+# 'query store after'. If this setting is 0, queriers always query all ingesters
+# (ingesters shuffle sharding on read path is disabled).
+# CLI flag: -querier.shuffle-sharding-ingesters-lookback-period
+[shuffle_sharding_ingesters_lookback_period: <duration> | default = 0s]
 ```
 
 ### `query_frontend_config`
@@ -733,6 +769,10 @@ The `query_frontend_config` configures the Cortex query-frontend.
 # URL of downstream Prometheus.
 # CLI flag: -frontend.downstream-url
 [downstream_url: <string> | default = ""]
+
+# Max body size for downstream prometheus.
+# CLI flag: -frontend.max-body-size
+[max_body_size: <int> | default = 10485760]
 
 # Log queries that are slower than the specified duration. Set to 0 to disable.
 # Set to < 0 to enable on all queries.
@@ -796,6 +836,11 @@ results_cache:
     # The fifo_cache_config configures the local in-memory cache.
     # The CLI flags prefix for this block config is: frontend
     [fifocache: <fifo_cache_config>]
+
+  # Use compression in results cache. Supported values are: 'snappy' and ''
+  # (disable compression).
+  # CLI flag: -frontend.compression
+  [compression: <string> | default = ""]
 
 # Cache query results.
 # CLI flag: -querier.cache-results
@@ -912,7 +957,9 @@ storage:
     [max_retry_delay: <duration> | default = 500ms]
 
   gcs:
-    # Name of GCS bucket to put chunks in.
+    # Name of GCS bucket. Please refer to
+    # https://cloud.google.com/docs/authentication/production for more
+    # information about how to configure authentication.
     # CLI flag: -ruler.storage.gcs.bucketname
     [bucket_name: <string> | default = ""]
 
@@ -1092,6 +1139,10 @@ storage:
 # CLI flag: -ruler.enable-sharding
 [enable_sharding: <boolean> | default = false]
 
+# The sharding strategy to use. Supported values are: default, shuffle-sharding.
+# CLI flag: -ruler.sharding-strategy
+[sharding_strategy: <string> | default = "default"]
+
 # Time to spend searching for a pending ruler when shutting down.
 # CLI flag: -ruler.search-pending-for
 [search_pending_for: <duration> | default = 5m]
@@ -1140,6 +1191,10 @@ ring:
   # ring.
   # CLI flag: -ruler.ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
+
+  # Name of network interface to read address from.
+  # CLI flag: -ruler.ring.instance-interface-names
+  [instance_interface_names: <list of string> | default = [eth0 en0]]
 
   # Number of tokens for each ingester.
   # CLI flag: -ruler.ring.num-tokens
@@ -1220,7 +1275,9 @@ storage:
     [path: <string> | default = ""]
 
   gcs:
-    # Name of GCS bucket to put chunks in.
+    # Name of GCS bucket. Please refer to
+    # https://cloud.google.com/docs/authentication/production for more
+    # information about how to configure authentication.
     # CLI flag: -alertmanager.storage.gcs.bucketname
     [bucket_name: <string> | default = ""]
 
@@ -1815,7 +1872,9 @@ bigtable:
   # CLI flag: -bigtable.project
   [project: <string> | default = ""]
 
-  # Bigtable instance ID.
+  # Bigtable instance ID. Please refer to
+  # https://cloud.google.com/docs/authentication/production for more information
+  # about how to configure authentication.
   # CLI flag: -bigtable.instance
   [instance: <string> | default = ""]
 
@@ -1872,7 +1931,9 @@ bigtable:
   [table_cache_expiration: <duration> | default = 30m]
 
 gcs:
-  # Name of GCS bucket to put chunks in.
+  # Name of GCS bucket. Please refer to
+  # https://cloud.google.com/docs/authentication/production for more information
+  # about how to configure authentication.
   # CLI flag: -gcs.bucketname
   [bucket_name: <string> | default = ""]
 
@@ -1922,6 +1983,14 @@ cassandra:
   # Path to certificate file to verify the peer.
   # CLI flag: -cassandra.ca-path
   [CA_path: <string> | default = ""]
+
+  # Path to certificate file used by TLS.
+  # CLI flag: -cassandra.tls-cert-path
+  [tls_cert_path: <string> | default = ""]
+
+  # Path to private key file used by TLS.
+  # CLI flag: -cassandra.tls-key-path
+  [tls_key_path: <string> | default = ""]
 
   # Enable password authentication when connecting to cassandra.
   # CLI flag: -cassandra.auth
@@ -2402,6 +2471,11 @@ The `frontend_worker_config` configures the worker - running within the Cortex q
 # CLI flag: -querier.dns-lookup-period
 [dns_lookup_duration: <duration> | default = 10s]
 
+# Querier ID, sent to frontend service to identify requests from the same
+# querier. Defaults to hostname.
+# CLI flag: -querier.id
+[id: <string> | default = ""]
+
 grpc_client_config:
   # gRPC client max receive message size (bytes).
   # CLI flag: -querier.frontend-client.grpc-max-recv-msg-size
@@ -2731,9 +2805,17 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -validation.enforce-metric-name
 [enforce_metric_name: <boolean> | default = true]
 
-# Per-user subring to shard metrics to ingesters. 0 is disabled.
-# CLI flag: -experimental.distributor.user-subring-size
-[user_subring_size: <int> | default = 0]
+# The default tenant's shard size when the shuffle-sharding strategy is used.
+# Must be set both on ingesters and distributors. When this setting is specified
+# in the per-tenant overrides, a value of 0 disables shuffle sharding for the
+# tenant.
+# CLI flag: -distributor.ingestion-tenant-shard-size
+[ingestion_tenant_shard_size: <int> | default = 0]
+
+# List of metric relabel configurations. Note that in most situations, it is
+# more effective to use metrics relabeling directly in the Prometheus server,
+# e.g. remote_write.write_relabel_configs.
+[metric_relabel_configs: <relabel_config...> | default = ]
 
 # The maximum number of series for which a query can fetch samples from each
 # ingester. This limit is enforced only in the ingesters (when querying samples
@@ -2819,10 +2901,33 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -frontend.max-cache-freshness
 [max_cache_freshness: <duration> | default = 1m]
 
+# Maximum number of queriers that can handle requests for a single tenant. If
+# set to 0 or value higher than number of available queriers, *all* queriers
+# will handle requests for the tenant. Each frontend will select the same set of
+# queriers for the same tenant (given that all queriers are connected to all
+# frontends). This option only works with queriers connecting to the
+# query-frontend, not when using downstream URL.
+# CLI flag: -frontend.max-queriers-per-tenant
+[max_queriers_per_tenant: <int> | default = 0]
+
 # Duration to delay the evaluation of rules to ensure the underlying metrics
 # have been pushed to Cortex.
 # CLI flag: -ruler.evaluation-delay-duration
 [ruler_evaluation_delay_duration: <duration> | default = 0s]
+
+# The default tenant's shard size when the shuffle-sharding strategy is used by
+# ruler. When this setting is specified in the per-tenant overrides, a value of
+# 0 disables shuffle sharding for the tenant.
+# CLI flag: -ruler.tenant-shard-size
+[ruler_tenant_shard_size: <int> | default = 0]
+
+# Maximum number of rules per rule group per-tenant. 0 to disable.
+# CLI flag: -ruler.max-rules-per-rule-group
+[ruler_max_rules_per_rule_group: <int> | default = 0]
+
+# Maximum number of rule groups per-tenant. 0 to disable.
+# CLI flag: -ruler.max-rule-groups-per-tenant
+[ruler_max_rule_groups_per_tenant: <int> | default = 0]
 
 # The default tenant's shard size when the shuffle-sharding strategy is used.
 # Must be set when the store-gateway sharding is enabled with the
@@ -2865,7 +2970,7 @@ The `redis_config` configures the Redis backend cache. The supported CLI flags `
 
 # Maximum time to wait before giving up on redis requests.
 # CLI flag: -<prefix>.redis.timeout
-[timeout: <duration> | default = 100ms]
+[timeout: <duration> | default = 500ms]
 
 # How long keys stay in the redis.
 # CLI flag: -<prefix>.redis.expiration
@@ -2883,9 +2988,13 @@ The `redis_config` configures the Redis backend cache. The supported CLI flags `
 # CLI flag: -<prefix>.redis.password
 [password: <string> | default = ""]
 
-# Enables connecting to redis with TLS.
-# CLI flag: -<prefix>.redis.enable-tls
-[enable_tls: <boolean> | default = false]
+# Enable connecting to redis with TLS.
+# CLI flag: -<prefix>.redis.tls-enabled
+[tls_enabled: <boolean> | default = false]
+
+# Skip validating server certificate.
+# CLI flag: -<prefix>.redis.tls-insecure-skip-verify
+[tls_insecure_skip_verify: <boolean> | default = false]
 
 # Close connections after remaining idle for this duration. If the value is
 # zero, then idle connections are not closed.
@@ -3083,7 +3192,8 @@ The `configstore_config` configures the config database storing rules and alerts
 The `blocks_storage_config` configures the blocks storage.
 
 ```yaml
-# Backend storage to use. Supported backends are: s3, gcs, azure, filesystem.
+# Backend storage to use. Supported backends are: s3, gcs, azure, swift,
+# filesystem.
 # CLI flag: -blocks-storage.backend
 [backend: <string> | default = "s3"]
 
@@ -3111,6 +3221,20 @@ s3:
   # backend storage, like Minio.
   # CLI flag: -blocks-storage.s3.insecure
   [insecure: <boolean> | default = false]
+
+  http:
+    # The time an idle connection will remain idle before closing.
+    # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
+    [idle_conn_timeout: <duration> | default = 1m30s]
+
+    # The amount of time the client will wait for a servers response headers.
+    # CLI flag: -blocks-storage.s3.http.response-header-timeout
+    [response_header_timeout: <duration> | default = 2m]
+
+    # If the client connects to S3 via HTTPS and this option is enabled, the
+    # client will accept any certificate and hostname.
+    # CLI flag: -blocks-storage.s3.http.insecure-skip-verify
+    [insecure_skip_verify: <boolean> | default = false]
 
 gcs:
   # GCS bucket name
@@ -3144,6 +3268,65 @@ azure:
   # Number of retries for recoverable errors
   # CLI flag: -blocks-storage.azure.max-retries
   [max_retries: <int> | default = 20]
+
+swift:
+  # OpenStack Swift authentication URL
+  # CLI flag: -blocks-storage.swift.auth-url
+  [auth_url: <string> | default = ""]
+
+  # OpenStack Swift username.
+  # CLI flag: -blocks-storage.swift.username
+  [username: <string> | default = ""]
+
+  # OpenStack Swift user's domain name.
+  # CLI flag: -blocks-storage.swift.user-domain-name
+  [user_domain_name: <string> | default = ""]
+
+  # OpenStack Swift user's domain ID.
+  # CLI flag: -blocks-storage.swift.user-domain-id
+  [user_domain_id: <string> | default = ""]
+
+  # OpenStack Swift user ID.
+  # CLI flag: -blocks-storage.swift.user-id
+  [user_id: <string> | default = ""]
+
+  # OpenStack Swift API key.
+  # CLI flag: -blocks-storage.swift.password
+  [password: <string> | default = ""]
+
+  # OpenStack Swift user's domain ID.
+  # CLI flag: -blocks-storage.swift.domain-id
+  [domain_id: <string> | default = ""]
+
+  # OpenStack Swift user's domain name.
+  # CLI flag: -blocks-storage.swift.domain-name
+  [domain_name: <string> | default = ""]
+
+  # OpenStack Swift project ID (v2,v3 auth only).
+  # CLI flag: -blocks-storage.swift.project-id
+  [project_id: <string> | default = ""]
+
+  # OpenStack Swift project name (v2,v3 auth only).
+  # CLI flag: -blocks-storage.swift.project-name
+  [project_name: <string> | default = ""]
+
+  # ID of the OpenStack Swift project's domain (v3 auth only), only needed if it
+  # differs the from user domain.
+  # CLI flag: -blocks-storage.swift.project-domain-id
+  [project_domain_id: <string> | default = ""]
+
+  # Name of the OpenStack Swift project's domain (v3 auth only), only needed if
+  # it differs from the user domain.
+  # CLI flag: -blocks-storage.swift.project-domain-name
+  [project_domain_name: <string> | default = ""]
+
+  # OpenStack Swift Region to use (v2,v3 auth only).
+  # CLI flag: -blocks-storage.swift.region-name
+  [region_name: <string> | default = ""]
+
+  # Name of the OpenStack Swift container to put chunks in.
+  # CLI flag: -blocks-storage.swift.container-name
+  [container_name: <string> | default = ""]
 
 filesystem:
   # Local filesystem storage directory.
@@ -3506,6 +3689,18 @@ The `compactor_config` configures the compactor for the blocks storage.
 # CLI flag: -compactor.deletion-delay
 [deletion_delay: <duration> | default = 12h]
 
+# Comma separated list of tenants that can be compacted. If specified, only
+# these tenants will be compacted by compactor, otherwise all tenants can be
+# compacted. Subject to sharding.
+# CLI flag: -compactor.enabled-tenants
+[enabled_tenants: <string> | default = ""]
+
+# Comma separated list of tenants that cannot be compacted by this compactor. If
+# specified, and compactor would normally pick given tenant for compaction (via
+# -compactor.enabled-tenants or sharding), it will be ignored instead.
+# CLI flag: -compactor.disabled-tenants
+[disabled_tenants: <string> | default = ""]
+
 # Shard tenants across multiple compactor instances. Sharding is required if you
 # run multiple compactor instances, in order to coordinate compactions and avoid
 # race conditions leading to the same tenant blocks simultaneously compacted by
@@ -3557,6 +3752,10 @@ sharding_ring:
   # the ring.
   # CLI flag: -compactor.ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
+
+  # Name of network interface to read address from.
+  # CLI flag: -compactor.ring.instance-interface-names
+  [instance_interface_names: <list of string> | default = [eth0 en0]]
 ```
 
 ### `store_gateway_config`
@@ -3629,6 +3828,20 @@ sharding_ring:
   # shutdown and restored at startup.
   # CLI flag: -store-gateway.sharding-ring.tokens-file-path
   [tokens_file_path: <string> | default = ""]
+
+  # True to enable zone-awareness and replicate blocks across different
+  # availability zones.
+  # CLI flag: -store-gateway.sharding-ring.zone-awareness-enabled
+  [zone_awareness_enabled: <boolean> | default = false]
+
+  # Name of network interface to read address from.
+  # CLI flag: -store-gateway.sharding-ring.instance-interface-names
+  [instance_interface_names: <list of string> | default = [eth0 en0]]
+
+  # The availability zone where this instance is running. Required if
+  # zone-awareness is enabled.
+  # CLI flag: -store-gateway.sharding-ring.instance-availability-zone
+  [instance_availability_zone: <string> | default = ""]
 
 # The sharding strategy to use. Supported values are: default, shuffle-sharding.
 # CLI flag: -store-gateway.sharding-strategy

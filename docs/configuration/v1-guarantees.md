@@ -37,7 +37,7 @@ Currently experimental features are:
 
 - Azure blob storage.
 - Zone awareness based replication.
-- User subrings.
+- Shuffle sharding (both read and write path).
 - Ruler API (to PUT rules).
 - Alertmanager API
 - Memcached client DNS-based service discovery.
@@ -46,6 +46,10 @@ Currently experimental features are:
 - Openstack Swift storage.
 - gRPC Store.
 - Querier support for querying chunks and blocks store at the same time.
+- Tracking of active series and exporting them as metrics (`-ingester.active-series-metrics-enabled` and related flags)
+- Shuffle-sharding of queriers in the query-frontend (i.e. use of `-frontend.max-queriers-per-tenant` flag with non-zero value).
 - TLS configuration in gRPC and HTTP clients.
 - TLS configuration in Etcd client.
 - Blocksconvert tools
+- OpenStack Swift storage support.
+- Metric relabeling in the distributor.

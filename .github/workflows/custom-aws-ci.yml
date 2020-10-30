@@ -69,13 +69,17 @@ jobs:
           touch build-image/.uptodate
           make BUILD_IN_CONTAINER=false
       - name: Save Image
+        shell: bash
         run: |
           mkdir docker-images
-          export CORTEX_IMAGE="quay.io/cortexproject/cortex:${TAG:-$(./tools/image-tag)}"
+          REF="$(cut -d'/' -f 3 <<< $GH_REF)"
+          [[ $REF = "master" ]] && TAG="" || TAG="$REF"
+          CORTEX_IMAGE="quay.io/cortexproject/cortex:${TAG:-$(./tools/image-tag)}"
+          echo $CORTEX_IMAGE
           docker save $CORTEX_IMAGE -o docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
           echo "${TAG:-$(./tools/image-tag)}" > docker-images/tag
         env:
-          TAG: ${{ github.event.push.tag_name }}
+          GH_REF: ${{ github.ref }}
       - name: Create Docker Images Archive
         run: tar -cvf images.tar docker-images
       - name: Upload Docker Images Artifact
@@ -120,4 +124,3 @@ jobs:
           docker tag $CORTEX_IMAGE $DEPLOY_IMAGE
           docker push $DEPLOY_IMAGE
           rm -rf docker-images/
-

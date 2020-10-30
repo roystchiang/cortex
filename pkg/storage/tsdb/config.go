@@ -9,12 +9,14 @@ import (
 
 	"github.com/alecthomas/units"
 	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/store"
 
 	"github.com/cortexproject/cortex/pkg/storage/backend/azure"
 	"github.com/cortexproject/cortex/pkg/storage/backend/filesystem"
 	"github.com/cortexproject/cortex/pkg/storage/backend/gcs"
 	"github.com/cortexproject/cortex/pkg/storage/backend/s3"
+	"github.com/cortexproject/cortex/pkg/storage/backend/swift"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -27,6 +29,9 @@ const (
 
 	// BackendAzure is the value for the Azure storage backend
 	BackendAzure = "azure"
+
+	// BackendSwift is the value for the Openstack Swift storage backend
+	BackendSwift = "swift"
 
 	// BackendFilesystem is the value for the filesystem storge backend
 	BackendFilesystem = "filesystem"
@@ -46,10 +51,11 @@ const (
 
 // Validation errors
 var (
-	supportedBackends = []string{BackendS3, BackendGCS, BackendAzure, BackendFilesystem}
+	supportedBackends = []string{BackendS3, BackendGCS, BackendAzure, BackendSwift, BackendFilesystem}
 
 	errUnsupportedStorageBackend    = errors.New("unsupported TSDB storage backend")
 	errInvalidShipConcurrency       = errors.New("invalid TSDB ship concurrency")
+	errInvalidOpeningConcurrency    = errors.New("invalid TSDB opening concurrency")
 	errInvalidCompactionInterval    = errors.New("invalid TSDB compaction interval")
 	errInvalidCompactionConcurrency = errors.New("invalid TSDB compaction concurrency")
 	errInvalidStripeSize            = errors.New("invalid TSDB stripe size")
@@ -63,7 +69,12 @@ type BucketConfig struct {
 	S3         s3.Config         `yaml:"s3"`
 	GCS        gcs.Config        `yaml:"gcs"`
 	Azure      azure.Config      `yaml:"azure"`
+	Swift      swift.Config      `yaml:"swift"`
 	Filesystem filesystem.Config `yaml:"filesystem"`
+
+	// Not used internally, meant to allow callers to wrap Buckets
+	// created using this config
+	Middlewares []func(objstore.Bucket) (objstore.Bucket, error) `yaml:"-"`
 }
 
 // BlocksStorageConfig holds the config information for the blocks storage.
@@ -116,6 +127,7 @@ func (cfg *BucketConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.S3.RegisterFlags(f)
 	cfg.GCS.RegisterFlags(f)
 	cfg.Azure.RegisterFlags(f)
+	cfg.Swift.RegisterFlags(f)
 	cfg.Filesystem.RegisterFlags(f)
 
 	f.StringVar(&cfg.Backend, "blocks-storage.backend", "s3", fmt.Sprintf("Backend storage to use. Supported backends are: %s.", strings.Join(supportedBackends, ", ")))
@@ -196,6 +208,10 @@ func (cfg *TSDBConfig) RegisterFlags(f *flag.FlagSet) {
 func (cfg *TSDBConfig) Validate() error {
 	if cfg.ShipInterval > 0 && cfg.ShipConcurrency <= 0 {
 		return errInvalidShipConcurrency
+	}
+
+	if cfg.MaxTSDBOpeningConcurrencyOnStartup <= 0 {
+		return errInvalidOpeningConcurrency
 	}
 
 	if cfg.HeadCompactionInterval <= 0 || cfg.HeadCompactionInterval > 5*time.Minute {
