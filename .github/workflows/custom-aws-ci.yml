@@ -29,6 +29,23 @@ jobs:
         run: make BUILD_IN_CONTAINER=false check-doc
       - name: Check White Noise.
         run: make BUILD_IN_CONTAINER=false check-white-noise
+  secure:
+    # TODO: should be [self-hosted, prod] for production
+    runs-on: [self-hosted, dev]
+    container:
+      image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Run Gosec Security Scanner
+        continue-on-error: true
+        uses: securego/gosec@master
+        with:
+          args: ./...
   test:
     # TODO: should be [self-hosted, prod] for production
     runs-on: [self-hosted, dev]
@@ -40,7 +57,7 @@ jobs:
         env:
           JVM_OPTS: "-Xms1024M -Xmx1024M"
         ports:
-        - 9042:9042
+          - 9042:9042
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -88,7 +105,7 @@ jobs:
           name: Docker Images
           path: ./images.tar
   deploy:
-    needs: [lint, test, build]
+    needs: [lint, secure, test, build]
     if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'aws-observability/cortex-dev'
     # TODO: should be [self-hosted, prod] for production
     runs-on: [self-hosted, dev]
