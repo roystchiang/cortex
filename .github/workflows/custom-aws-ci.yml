@@ -6,6 +6,12 @@ on:
     # will run on all new tags, with image tag being the same as the GitHub tag
     tags:
       - v[0-9]+.[0-9]+.[0-9]+**
+env:
+  # TODO: Deploy image account should be 095566055637 instead of 595926772921 for production
+  ECR: 595926772921.dkr.ecr.us-west-2.amazonaws.com/cortex
+  GH_REF: ${{ github.ref }}
+  IMAGE_DOWNLOAD_LOCATION: /actions-runner/_work/cortex_images/
+
 jobs:
   lint:
     # TODO: should be [self-hosted, prod] for production
@@ -75,6 +81,9 @@ jobs:
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
+      - name: Generate Tag
+        shell: bash
+        run: ./.github/workflows/scripts/generate-tag.sh          
       - name: Install Docker Client
         run: ./.github/workflows/scripts/install-docker.sh
       - name: Sym Link Expected Path to Workspace
@@ -88,15 +97,13 @@ jobs:
       - name: Save Image
         shell: bash
         run: |
+          CORTEX_LOCAL_IMAGE="quay.io/cortexproject/cortex:$DOCKER_IMAGE_TAG"
+          CORTEX_IMAGE=$ECR:$DOCKER_IMAGE_TAG
           mkdir docker-images
-          REF="$(cut -d'/' -f 3 <<< $GH_REF)"
-          [[ $REF = "master" ]] && TAG="" || TAG="$REF"
-          CORTEX_IMAGE="quay.io/cortexproject/cortex:${TAG:-$(./tools/image-tag)}"
-          echo $CORTEX_IMAGE
+          echo "$CORTEX_LOCAL_IMAGE  ->  $CORTEX_IMAGE"
+          docker tag $CORTEX_LOCAL_IMAGE $CORTEX_IMAGE
           docker save $CORTEX_IMAGE -o docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
-          echo "${TAG:-$(./tools/image-tag)}" > docker-images/tag
-        env:
-          GH_REF: ${{ github.ref }}
+          echo $CORTEX_IMAGE > docker-images/image-name
       - name: Create Docker Images Archive
         run: tar -cvf images.tar docker-images
       - name: Upload Docker Images Artifact
@@ -113,31 +120,29 @@ jobs:
       # we use this directory instead of /actions-runner/_work/cortex-dev/cortex-dev
       # because of folder ownership issues
       - name: Make Directory
-        run: |
-          if [ ! -d "/actions-runner/_work/image_downloads/" ] 
-          then
-            mkdir /actions-runner/_work/image_downloads/
-          fi
+        run: mkdir -p $IMAGE_DOWNLOAD_LOCATION
       - name: Download Docker Images Artifact
         uses: actions/download-artifact@v2
         with:
           name: Docker Images
-          path: /actions-runner/_work/image_downloads/
+          path: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
       - name: Load Docker Image
         run: |
-          cd /actions-runner/_work/image_downloads/
+          cd $IMAGE_DOWNLOAD_LOCATION
           tar -xvf images.tar
-          export TAG=$(cat docker-images/tag)
-          docker load -i docker-images/quay.io_cortexproject_cortex:$TAG
+          CORTEX_IMAGE=$(cat docker-images/image-name)
+          echo "CORTEX_IMAGE=$CORTEX_IMAGE" >> $GITHUB_ENV
+          docker load -i docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
+          docker images
       - name: Push to ECR
-        # TODO: Deploy image account should be 095566055637 instead of 595926772921 for production
         # Self hosted runner manages authentication, no need to worry about docker login
         run: |
-          cd /actions-runner/_work/image_downloads/
-          export TAG=$(cat docker-images/tag)
-          export CORTEX_IMAGE="quay.io/cortexproject/cortex:$TAG"
-          export DEPLOY_IMAGE="595926772921.dkr.ecr.us-west-2.amazonaws.com/cortex:$TAG"
-          echo "$CORTEX_IMAGE  ->  $DEPLOY_IMAGE"
-          docker tag $CORTEX_IMAGE $DEPLOY_IMAGE
-          docker push $DEPLOY_IMAGE
+          cd $IMAGE_DOWNLOAD_LOCATION
+          echo "Pushing $CORTEX_IMAGE"
+          docker push $CORTEX_IMAGE
+      - name: Cleanup
+        run: |
+          cd $IMAGE_DOWNLOAD_LOCATION
           rm -rf docker-images/
+          rm images.tar
+          docker system prune -af
