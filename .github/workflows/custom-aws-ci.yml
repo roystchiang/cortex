@@ -7,15 +7,13 @@ on:
     tags:
       - v[0-9]+.[0-9]+.[0-9]+**
 env:
-  # TODO: Deploy image account should be 095566055637 instead of 595926772921 for production
-  ECR: 595926772921.dkr.ecr.us-west-2.amazonaws.com/cortex
+  ECR: 396262249347.dkr.ecr.us-west-2.amazonaws.com/cortex
   GH_REF: ${{ github.ref }}
   IMAGE_DOWNLOAD_LOCATION: /actions-runner/_work/cortex_images/
 
 jobs:
   lint:
-    # TODO: should be [self-hosted, prod] for production
-    runs-on: [self-hosted, dev]
+    runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
     steps:
@@ -36,8 +34,7 @@ jobs:
       - name: Check White Noise.
         run: make BUILD_IN_CONTAINER=false check-white-noise
   secure:
-    # TODO: should be [self-hosted, prod] for production
-    runs-on: [self-hosted, dev]
+    runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
     steps:
@@ -53,8 +50,7 @@ jobs:
         with:
           args: ./...
   test:
-    # TODO: should be [self-hosted, prod] for production
-    runs-on: [self-hosted, dev]
+    runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
     services:
@@ -74,8 +70,7 @@ jobs:
       - name: Run Tests
         run: CASSANDRA_TEST_ADDRESSES=cassandra:9042 make BUILD_IN_CONTAINER=false test
   build:
-    # TODO: should be [self-hosted, prod] for production
-    runs-on: [self-hosted, dev]
+    runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
     steps:
@@ -114,8 +109,7 @@ jobs:
   deploy:
     needs: [lint, secure, test, build]
     if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'aws-observability/cortex-dev'
-    # TODO: should be [self-hosted, prod] for production
-    runs-on: [self-hosted, dev]
+    runs-on: [self-hosted, prod]
     steps:
       # we use this directory instead of /actions-runner/_work/cortex-dev/cortex-dev
       # because of folder ownership issues
