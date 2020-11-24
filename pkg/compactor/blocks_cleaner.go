@@ -11,7 +11,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
@@ -19,6 +18,7 @@ import (
 
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -27,6 +27,7 @@ type BlocksCleanerConfig struct {
 	MetaSyncConcurrency int
 	DeletionDelay       time.Duration
 	CleanupInterval     time.Duration
+	CleanupConcurrency  int
 }
 
 type BlocksCleaner struct {
@@ -35,7 +36,7 @@ type BlocksCleaner struct {
 	cfg          BlocksCleanerConfig
 	logger       log.Logger
 	bucketClient objstore.Bucket
-	usersScanner *UsersScanner
+	usersScanner *cortex_tsdb.UsersScanner
 
 	// Metrics.
 	runsStarted        prometheus.Counter
@@ -46,7 +47,7 @@ type BlocksCleaner struct {
 	blocksFailedTotal  prometheus.Counter
 }
 
-func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, usersScanner *UsersScanner, logger log.Logger, reg prometheus.Registerer) *BlocksCleaner {
+func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, usersScanner *cortex_tsdb.UsersScanner, logger log.Logger, reg prometheus.Registerer) *BlocksCleaner {
 	c := &BlocksCleaner{
 		cfg:          cfg,
 		bucketClient: bucketClient,
@@ -120,20 +121,9 @@ func (c *BlocksCleaner) cleanUsers(ctx context.Context) error {
 		return errors.Wrap(err, "failed to discover users from bucket")
 	}
 
-	errs := tsdb_errors.MultiError{}
-	for _, userID := range users {
-		// Ensure the context has not been canceled (ie. shutdown has been triggered).
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		if err = c.cleanUser(ctx, userID); err != nil {
-			errs.Add(errors.Wrapf(err, "failed to delete user blocks (user: %s)", userID))
-			continue
-		}
-	}
-
-	return errs.Err()
+	return concurrency.ForEachUser(ctx, users, c.cfg.CleanupConcurrency, func(ctx context.Context, userID string) error {
+		return errors.Wrapf(c.cleanUser(ctx, userID), "failed to delete user blocks (user: %s)", userID)
+	})
 }
 
 func (c *BlocksCleaner) cleanUser(ctx context.Context, userID string) error {
@@ -196,8 +186,8 @@ func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map
 		}
 
 		// We can safely delete only partial blocks with a deletion mark.
-		_, err := metadata.ReadDeletionMark(ctx, userBucket, userLogger, blockID.String())
-		if err == metadata.ErrorDeletionMarkNotFound {
+		err := metadata.ReadMarker(ctx, userLogger, userBucket, blockID.String(), &metadata.DeletionMark{})
+		if err == metadata.ErrorMarkerNotFound {
 			continue
 		}
 		if err != nil {

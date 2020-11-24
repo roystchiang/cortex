@@ -137,7 +137,6 @@ func buildS3Config(cfg S3Config) (*aws.Config, []string, error) {
 	} else {
 		s3Config = &aws.Config{}
 		s3Config = s3Config.WithRegion("dummy")
-		s3Config = s3Config.WithCredentials(credentials.AnonymousCredentials)
 	}
 
 	s3Config = s3Config.WithMaxRetries(0)                          // We do our own retries, so we can monitor them
@@ -317,11 +316,14 @@ func (a *S3ObjectClient) List(ctx context.Context, prefix, delimiter string) ([]
 					commonPrefixes = append(commonPrefixes, chunk.StorageCommonPrefix(aws.StringValue(commonPrefix.Prefix)))
 				}
 
-				if !*output.IsTruncated {
+				if output.IsTruncated == nil || !*output.IsTruncated {
 					// No more results to fetch
 					break
 				}
-
+				if output.NextContinuationToken == nil {
+					// No way to continue
+					break
+				}
 				input.SetContinuationToken(*output.NextContinuationToken)
 			}
 

@@ -78,13 +78,15 @@ $(foreach exe, $(EXES), $(eval $(call dep_exe, $(exe))))
 pkg/ingester/client/cortex.pb.go: pkg/ingester/client/cortex.proto
 pkg/ingester/wal.pb.go: pkg/ingester/wal.proto
 pkg/ring/ring.pb.go: pkg/ring/ring.proto
-pkg/querier/frontend/frontend.pb.go: pkg/querier/frontend/frontend.proto
+pkg/frontend/v1/frontendv1pb/frontend.pb.go: pkg/frontend/v1/frontendv1pb/frontend.proto
+pkg/frontend/v2/frontendv2pb/frontend.pb.go: pkg/frontend/v2/frontendv2pb/frontend.proto
 pkg/querier/queryrange/queryrange.pb.go: pkg/querier/queryrange/queryrange.proto
 pkg/chunk/storage/caching_index_client.pb.go: pkg/chunk/storage/caching_index_client.proto
 pkg/distributor/ha_tracker.pb.go: pkg/distributor/ha_tracker.proto
 pkg/ruler/rules/rules.pb.go: pkg/ruler/rules/rules.proto
 pkg/ruler/ruler.pb.go: pkg/ruler/rules/rules.proto
 pkg/ring/kv/memberlist/kv.pb.go: pkg/ring/kv/memberlist/kv.proto
+pkg/scheduler/schedulerpb/scheduler.pb.go: pkg/scheduler/schedulerpb/scheduler.proto
 pkg/chunk/grpc/grpc.pb.go: pkg/chunk/grpc/grpc.proto
 tools/blocksconvert/scheduler.pb.go: tools/blocksconvert/scheduler.proto
 
@@ -111,9 +113,9 @@ GO_FLAGS := -ldflags "-X main.Branch=$(GIT_BRANCH) -X main.Revision=$(GIT_REVISI
 
 ifeq ($(BUILD_IN_CONTAINER),true)
 
-GOVOLUMES=	-v $(shell pwd)/.cache:/go/cache:delegated \
-			-v $(shell pwd)/.pkg:/go/pkg:delegated \
-			-v $(shell pwd):/go/src/github.com/cortexproject/cortex:delegated
+GOVOLUMES=	-v $(shell pwd)/.cache:/go/cache:delegated,z \
+			-v $(shell pwd)/.pkg:/go/pkg:delegated,z \
+			-v $(shell pwd):/go/src/github.com/cortexproject/cortex:delegated,z
 
 exes $(EXES) protos $(PROTO_GOS) lint test shell mod-check check-protos web-build web-pre web-deploy doc: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
@@ -129,7 +131,7 @@ configs-integration-test: build-image/$(UPTODATE)
 	echo ; \
 	echo ">>>> Entering build container: $@"; \
 	$(SUDO) docker run $(RM) $(TTY) -i $(GOVOLUMES) \
-		-v $(shell pwd)/cmd/cortex/migrations:/migrations \
+		-v $(shell pwd)/cmd/cortex/migrations:/migrations:z \
 		--workdir /go/src/github.com/cortexproject/cortex \
 		--link "$$DB_CONTAINER":configs-db.cortex.local \
 		-e DB_ADDR=configs-db.cortex.local \
@@ -159,12 +161,22 @@ lint:
 	golangci-lint run
 
 	# Ensure no blacklisted package is imported.
-	faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
+	GOFLAGS="-tags=requires_docker" faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
 		golang.org/x/net/context=context,\
 		sync/atomic=go.uber.org/atomic" ./pkg/... ./cmd/... ./tools/... ./integration/...
 
+	# Ensure clean pkg structure.
+	faillint -paths "\
+		github.com/cortexproject/cortex/pkg/scheduler,\
+		github.com/cortexproject/cortex/pkg/frontend,\
+		github.com/cortexproject/cortex/pkg/frontend/transport,\
+		github.com/cortexproject/cortex/pkg/frontend/v1,\
+		github.com/cortexproject/cortex/pkg/frontend/v2" \
+		./pkg/querier/...
+	faillint -paths "github.com/cortexproject/cortex/pkg/querier/..." ./pkg/scheduler/...
+
 	# Validate Kubernetes spec files. Requires:
-	# https://kubeval.instrumenta.dev
+	# https://kubeval.instrumenta.dev
 	kubeval ./k8s/*
 
 test:
@@ -282,7 +294,7 @@ packages: dist/cortex-linux-amd64 packaging/fpm/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.cache
 	@echo ">>>> Entering build container: $@"
 	@$(SUDO) time docker run $(RM) $(TTY) \
-		-v  $(shell pwd):/src/github.com/cortexproject/cortex:delegated \
+		-v  $(shell pwd):/src/github.com/cortexproject/cortex:delegated,z \
 		-i $(PACKAGE_IMAGE) $@;
 
 else

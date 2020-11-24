@@ -111,7 +111,8 @@ api:
 [limits: <limits_config>]
 
 # The frontend_worker_config configures the worker - running within the Cortex
-# querier - picking up and executing queries enqueued by the query-frontend.
+# querier - picking up and executing queries enqueued by the query-frontend or
+# query-scheduler.
 [frontend_worker: <frontend_worker_config>]
 
 # The query_frontend_config configures the Cortex query-frontend.
@@ -157,6 +158,78 @@ runtime_config:
 
 # The memberlist_config configures the Gossip memberlist.
 [memberlist: <memberlist_config>]
+
+query_scheduler:
+  # Maximum number of outstanding requests per tenant per query-scheduler.
+  # In-flight requests above this limit will fail with HTTP response status code
+  # 429.
+  # CLI flag: -query-scheduler.max-outstanding-requests-per-tenant
+  [max_outstanding_requests_per_tenant: <int> | default = 100]
+
+  # This configures the gRPC client used to report errors back to the
+  # query-frontend.
+  grpc_client_config:
+    # gRPC client max receive message size (bytes).
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-max-recv-msg-size
+    [max_recv_msg_size: <int> | default = 104857600]
+
+    # gRPC client max send message size (bytes).
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-max-send-msg-size
+    [max_send_msg_size: <int> | default = 16777216]
+
+    # Deprecated: Use gzip compression when sending messages.  If true,
+    # overrides grpc-compression flag.
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-use-gzip-compression
+    [use_gzip_compression: <boolean> | default = false]
+
+    # Use compression when sending messages. Supported values are: 'gzip',
+    # 'snappy' and '' (disable compression)
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-compression
+    [grpc_compression: <string> | default = ""]
+
+    # Rate limit for gRPC client; 0 means disabled.
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-client-rate-limit
+    [rate_limit: <float> | default = 0]
+
+    # Rate limit burst for gRPC client.
+    # CLI flag: -query-scheduler.grpc-client-config.grpc-client-rate-limit-burst
+    [rate_limit_burst: <int> | default = 0]
+
+    # Enable backoff and retry when we hit ratelimits.
+    # CLI flag: -query-scheduler.grpc-client-config.backoff-on-ratelimits
+    [backoff_on_ratelimits: <boolean> | default = false]
+
+    backoff_config:
+      # Minimum delay when backing off.
+      # CLI flag: -query-scheduler.grpc-client-config.backoff-min-period
+      [min_period: <duration> | default = 100ms]
+
+      # Maximum delay when backing off.
+      # CLI flag: -query-scheduler.grpc-client-config.backoff-max-period
+      [max_period: <duration> | default = 10s]
+
+      # Number of times to backoff and retry before failing.
+      # CLI flag: -query-scheduler.grpc-client-config.backoff-retries
+      [max_retries: <int> | default = 10]
+
+    # Path to the client certificate file, which will be used for authenticating
+    # with the server. Also requires the key path to be configured.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-cert-path
+    [tls_cert_path: <string> | default = ""]
+
+    # Path to the key file for the client certificate. Also requires the client
+    # certificate to be configured.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-key-path
+    [tls_key_path: <string> | default = ""]
+
+    # Path to the CA certificates file to validate server certificate against.
+    # If not set, the host's root CA certificates are used.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-ca-path
+    [tls_ca_path: <string> | default = ""]
+
+    # Skip validating server certificate.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-insecure-skip-verify
+    [tls_insecure_skip_verify: <boolean> | default = false]
 ```
 
 ### `server_config`
@@ -278,6 +351,18 @@ grpc_tls_config:
 # connection should be closed, Default: 20s
 # CLI flag: -server.grpc.keepalive.timeout
 [grpc_server_keepalive_timeout: <duration> | default = 20s]
+
+# Minimum amount of time a client should wait before sending a keepalive ping.
+# If client sends keepalive ping more often, server will send GOAWAY and close
+# the connection.
+# CLI flag: -server.grpc.keepalive.min-time-between-pings
+[grpc_server_min_time_between_pings: <duration> | default = 5m]
+
+# If true, server allows keepalive pings even when there are no active
+# streams(RPCs). If false, and client sends ping when there are no active
+# streams, server will send GOAWAY and close the connection.
+# CLI flag: -server.grpc.keepalive.ping-without-stream-allowed
+[grpc_server_ping_without_stream_allowed: <boolean> | default = false]
 
 # Output log messages in the given format. Valid formats: [logfmt, json]
 # CLI flag: -log.format
@@ -535,6 +620,13 @@ lifecycler:
     # CLI flag: -distributor.zone-awareness-enabled
     [zone_awareness_enabled: <boolean> | default = false]
 
+    # Try writing to an additional ingester in the presence of an ingester not
+    # in the ACTIVE state. It is useful to disable this along with
+    # -ingester.unregister-on-shutdown=false in order to not spread samples to
+    # extra ingesters during rolling restarts with consistent naming.
+    # CLI flag: -distributor.extend-writes
+    [extend_writes: <boolean> | default = true]
+
   # Number of tokens for each ingester.
   # CLI flag: -ingester.num-tokens
   [num_tokens: <int> | default = 128]
@@ -574,6 +666,12 @@ lifecycler:
   # The availability zone where this instance is running.
   # CLI flag: -ingester.availability-zone
   [availability_zone: <string> | default = ""]
+
+  # Unregister from the ring upon clean shutdown. It can be useful to disable
+  # for rolling restarts with consistent naming in conjunction with
+  # -distributor.extend-writes=false.
+  # CLI flag: -ingester.unregister-on-shutdown
+  [unregister_on_shutdown: <boolean> | default = true]
 
 # Number of times to try and transfer chunks before falling back to flushing.
 # Negative value or zero disables hand-over. This feature is supported only by
@@ -678,6 +776,11 @@ The `querier_config` configures the Cortex querier.
 # CLI flag: -querier.query-ingesters-within
 [query_ingesters_within: <duration> | default = 0s]
 
+# Query long-term store for series, label values and label names APIs. Works
+# only with blocks engine.
+# CLI flag: -querier.query-store-for-labels-enabled
+[query_store_for_labels_enabled: <boolean> | default = false]
+
 # The time after which a metric should only be queried from storage and not just
 # ingesters. 0 means all queries are sent to store. When running the blocks
 # storage, if this option is enabled, the time range of the query sent to the
@@ -757,10 +860,101 @@ store_gateway_client:
 The `query_frontend_config` configures the Cortex query-frontend.
 
 ```yaml
+# Log queries that are slower than the specified duration. Set to 0 to disable.
+# Set to < 0 to enable on all queries.
+# CLI flag: -frontend.log-queries-longer-than
+[log_queries_longer_than: <duration> | default = 0s]
+
+# Max body size for downstream prometheus.
+# CLI flag: -frontend.max-body-size
+[max_body_size: <int> | default = 10485760]
+
 # Maximum number of outstanding requests per tenant per frontend; requests
 # beyond this error with HTTP 429.
 # CLI flag: -querier.max-outstanding-requests-per-tenant
 [max_outstanding_per_tenant: <int> | default = 100]
+
+# DNS hostname used for finding query-schedulers.
+# CLI flag: -frontend.scheduler-address
+[scheduler_address: <string> | default = ""]
+
+# How often to resolve the scheduler-address, in order to look for new
+# query-scheduler instances.
+# CLI flag: -frontend.scheduler-dns-lookup-period
+[scheduler_dns_lookup_period: <duration> | default = 10s]
+
+# Number of concurrent workers forwarding queries to single query-scheduler.
+# CLI flag: -frontend.scheduler-worker-concurrency
+[scheduler_worker_concurrency: <int> | default = 5]
+
+grpc_client_config:
+  # gRPC client max receive message size (bytes).
+  # CLI flag: -frontend.grpc-client-config.grpc-max-recv-msg-size
+  [max_recv_msg_size: <int> | default = 104857600]
+
+  # gRPC client max send message size (bytes).
+  # CLI flag: -frontend.grpc-client-config.grpc-max-send-msg-size
+  [max_send_msg_size: <int> | default = 16777216]
+
+  # Deprecated: Use gzip compression when sending messages.  If true, overrides
+  # grpc-compression flag.
+  # CLI flag: -frontend.grpc-client-config.grpc-use-gzip-compression
+  [use_gzip_compression: <boolean> | default = false]
+
+  # Use compression when sending messages. Supported values are: 'gzip',
+  # 'snappy' and '' (disable compression)
+  # CLI flag: -frontend.grpc-client-config.grpc-compression
+  [grpc_compression: <string> | default = ""]
+
+  # Rate limit for gRPC client; 0 means disabled.
+  # CLI flag: -frontend.grpc-client-config.grpc-client-rate-limit
+  [rate_limit: <float> | default = 0]
+
+  # Rate limit burst for gRPC client.
+  # CLI flag: -frontend.grpc-client-config.grpc-client-rate-limit-burst
+  [rate_limit_burst: <int> | default = 0]
+
+  # Enable backoff and retry when we hit ratelimits.
+  # CLI flag: -frontend.grpc-client-config.backoff-on-ratelimits
+  [backoff_on_ratelimits: <boolean> | default = false]
+
+  backoff_config:
+    # Minimum delay when backing off.
+    # CLI flag: -frontend.grpc-client-config.backoff-min-period
+    [min_period: <duration> | default = 100ms]
+
+    # Maximum delay when backing off.
+    # CLI flag: -frontend.grpc-client-config.backoff-max-period
+    [max_period: <duration> | default = 10s]
+
+    # Number of times to backoff and retry before failing.
+    # CLI flag: -frontend.grpc-client-config.backoff-retries
+    [max_retries: <int> | default = 10]
+
+  # Path to the client certificate file, which will be used for authenticating
+  # with the server. Also requires the key path to be configured.
+  # CLI flag: -frontend.grpc-client-config.tls-cert-path
+  [tls_cert_path: <string> | default = ""]
+
+  # Path to the key file for the client certificate. Also requires the client
+  # certificate to be configured.
+  # CLI flag: -frontend.grpc-client-config.tls-key-path
+  [tls_key_path: <string> | default = ""]
+
+  # Path to the CA certificates file to validate server certificate against. If
+  # not set, the host's root CA certificates are used.
+  # CLI flag: -frontend.grpc-client-config.tls-ca-path
+  [tls_ca_path: <string> | default = ""]
+
+  # Skip validating server certificate.
+  # CLI flag: -frontend.grpc-client-config.tls-insecure-skip-verify
+  [tls_insecure_skip_verify: <boolean> | default = false]
+
+# Name of network interface to read address from. This address is sent to
+# query-scheduler and querier, which uses it to send the query response back to
+# query-frontend.
+# CLI flag: -frontend.instance-interface-names
+[instance_interface_names: <list of string> | default = [eth0 en0]]
 
 # Compress HTTP responses.
 # CLI flag: -querier.compress-http-responses
@@ -769,15 +963,6 @@ The `query_frontend_config` configures the Cortex query-frontend.
 # URL of downstream Prometheus.
 # CLI flag: -frontend.downstream-url
 [downstream_url: <string> | default = ""]
-
-# Max body size for downstream prometheus.
-# CLI flag: -frontend.max-body-size
-[max_body_size: <int> | default = 10485760]
-
-# Log queries that are slower than the specified duration. Set to 0 to disable.
-# Set to < 0 to enable on all queries.
-# CLI flag: -frontend.log-queries-longer-than
-[log_queries_longer_than: <duration> | default = 0s]
 ```
 
 ### `query_range_config`
@@ -1362,8 +1547,9 @@ The `table_manager_config` configures the Cortex table-manager.
 # CLI flag: -table-manager.retention-deletes-enabled
 [retention_deletes_enabled: <boolean> | default = false]
 
-# Tables older than this retention period are deleted. Note: This setting is
-# destructive to data!(default: 0, which disables deletion)
+# Tables older than this retention period are deleted. Must be either 0
+# (disabled) or a multiple of 24h. When enabled, be aware this setting is
+# destructive to data!
 # CLI flag: -table-manager.retention-period
 [retention_period: <duration> | default = 0s]
 
@@ -2375,7 +2561,8 @@ write_dedupe_cache_config:
 # CLI flag: -store.cache-lookups-older-than
 [cache_lookups_older_than: <duration> | default = 0s]
 
-# Limit how long back data can be queried
+# Deprecated: use -querier.max-query-lookback instead. Limit how long back data
+# can be queried. This setting applies to chunks storage only.
 # CLI flag: -store.max-look-back-period
 [max_look_back_period: <duration> | default = 0s]
 ```
@@ -2451,14 +2638,29 @@ grpc_client_config:
 
 ### `frontend_worker_config`
 
-The `frontend_worker_config` configures the worker - running within the Cortex querier - picking up and executing queries enqueued by the query-frontend.
+The `frontend_worker_config` configures the worker - running within the Cortex querier - picking up and executing queries enqueued by the query-frontend or query-scheduler.
 
 ```yaml
-# Address of query frontend service, in host:port format.
+# Address of query frontend service, in host:port format. If
+# -querier.scheduler-address is set as well, querier will use scheduler instead.
+# Only one of -querier.frontend-address or -querier.scheduler-address can be
+# set. If neither is set, queries are only received via HTTP endpoint.
 # CLI flag: -querier.frontend-address
 [frontend_address: <string> | default = ""]
 
-# Number of simultaneous queries to process per query frontend.
+# Hostname (and port) of scheduler that querier will periodically resolve,
+# connect to and receive queries from. Only one of -querier.frontend-address or
+# -querier.scheduler-address can be set. If neither is set, queries are only
+# received via HTTP endpoint.
+# CLI flag: -querier.scheduler-address
+[scheduler_address: <string> | default = ""]
+
+# How often to query DNS for query-frontend or query-scheduler address.
+# CLI flag: -querier.dns-lookup-period
+[dns_lookup_duration: <duration> | default = 10s]
+
+# Number of simultaneous queries to process per query-frontend or
+# query-scheduler.
 # CLI flag: -querier.worker-parallelism
 [parallelism: <int> | default = 10]
 
@@ -2466,10 +2668,6 @@ The `frontend_worker_config` configures the worker - running within the Cortex q
 # Overrides querier.worker-parallelism.
 # CLI flag: -querier.worker-match-max-concurrent
 [match_max_concurrent: <boolean> | default = false]
-
-# How often to query DNS.
-# CLI flag: -querier.dns-lookup-period
-[dns_lookup_duration: <duration> | default = 10s]
 
 # Querier ID, sent to frontend service to identify requests from the same
 # querier. Defaults to hostname.
@@ -2881,13 +3079,21 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -store.query-chunk-limit
 [max_chunks_per_query: <int> | default = 2000000]
 
+# Limit how long back data (series and metadata) can be queried, up until
+# <lookback> duration ago. This limit is enforced in the query-frontend, querier
+# and ruler. If the requested time range is outside the allowed range, the
+# request will not fail but will be manipulated to only query data within the
+# allowed time range. 0 to disable.
+# CLI flag: -querier.max-query-lookback
+[max_query_lookback: <duration> | default = 0s]
+
 # Limit the query time range (end - start time). This limit is enforced in the
 # query-frontend (on the received query), in the querier (on the query possibly
 # split by the query-frontend) and in the chunks storage. 0 to disable.
 # CLI flag: -store.max-query-length
 [max_query_length: <duration> | default = 0s]
 
-# Maximum number of queries will be scheduled in parallel by the frontend.
+# Maximum number of split queries will be scheduled in parallel by the frontend.
 # CLI flag: -querier.max-query-parallelism
 [max_query_parallelism: <int> | default = 14]
 
@@ -2903,10 +3109,11 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 
 # Maximum number of queriers that can handle requests for a single tenant. If
 # set to 0 or value higher than number of available queriers, *all* queriers
-# will handle requests for the tenant. Each frontend will select the same set of
-# queriers for the same tenant (given that all queriers are connected to all
-# frontends). This option only works with queriers connecting to the
-# query-frontend, not when using downstream URL.
+# will handle requests for the tenant. Each frontend (or query-scheduler, if
+# used) will select the same set of queriers for the same tenant (given that all
+# queriers are connected to all frontends / query-schedulers). This option only
+# works with queriers connecting to the query-frontend / query-scheduler, not
+# when using downstream URL.
 # CLI flag: -frontend.max-queriers-per-tenant
 [max_queriers_per_tenant: <int> | default = 0]
 
@@ -3416,7 +3623,7 @@ bucket_store:
       [max_get_multi_concurrency: <int> | default = 100]
 
       # The maximum number of keys a single underlying get operation should run.
-      # If more keys are specified, internally keys are splitted into multiple
+      # If more keys are specified, internally keys are split into multiple
       # batches and fetched concurrently, honoring the max concurrency. If set
       # to 0, the max batch size is unlimited.
       # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-get-multi-batch-size
@@ -3467,7 +3674,7 @@ bucket_store:
       [max_get_multi_concurrency: <int> | default = 100]
 
       # The maximum number of keys a single underlying get operation should run.
-      # If more keys are specified, internally keys are splitted into multiple
+      # If more keys are specified, internally keys are split into multiple
       # batches and fetched concurrently, honoring the max concurrency. If set
       # to 0, the max batch size is unlimited.
       # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.max-get-multi-batch-size
@@ -3490,7 +3697,7 @@ bucket_store:
 
     # TTL for caching object attributes for chunks.
     # CLI flag: -blocks-storage.bucket-store.chunks-cache.attributes-ttl
-    [attributes_ttl: <duration> | default = 24h]
+    [attributes_ttl: <duration> | default = 168h]
 
     # TTL for caching individual chunks subranges.
     # CLI flag: -blocks-storage.bucket-store.chunks-cache.subrange-ttl
@@ -3532,7 +3739,7 @@ bucket_store:
       [max_get_multi_concurrency: <int> | default = 100]
 
       # The maximum number of keys a single underlying get operation should run.
-      # If more keys are specified, internally keys are splitted into multiple
+      # If more keys are specified, internally keys are split into multiple
       # batches and fetched concurrently, honoring the max concurrency. If set
       # to 0, the max batch size is unlimited.
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.max-get-multi-batch-size
@@ -3570,6 +3777,10 @@ bucket_store:
     # Maximum size of metafile content to cache in bytes.
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-max-size-bytes
     [metafile_max_size_bytes: <int> | default = 1048576]
+
+    # How long to cache attributes of the block metafile.
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl
+    [metafile_attributes_ttl: <duration> | default = 168h]
 
   # Duration after which the blocks marked for deletion will be filtered out
   # while fetching blocks. The idea of ignore-deletion-marks-delay is to ignore
@@ -3618,6 +3829,12 @@ tsdb:
   # CLI flag: -blocks-storage.tsdb.head-compaction-idle-timeout
   [head_compaction_idle_timeout: <duration> | default = 1h]
 
+  # The write buffer size used by the head chunks mapper. Lower values reduce
+  # memory utilisation on clusters with a large number of tenants at the cost of
+  # increased disk I/O operations.
+  # CLI flag: -blocks-storage.tsdb.head-chunks-write-buffer-size-bytes
+  [head_chunks_write_buffer_size_bytes: <int> | default = 4194304]
+
   # The number of shards of series to use in TSDB (must be a power of 2).
   # Reducing this will decrease memory footprint, but can negatively impact
   # performance.
@@ -3627,6 +3844,10 @@ tsdb:
   # True to enable TSDB WAL compression.
   # CLI flag: -blocks-storage.tsdb.wal-compression-enabled
   [wal_compression_enabled: <boolean> | default = false]
+
+  # TSDB WAL segments files max size (bytes).
+  # CLI flag: -blocks-storage.tsdb.wal-segment-size-bytes
+  [wal_segment_size_bytes: <int> | default = 134217728]
 
   # True to flush blocks to storage on shutdown. If false, incomplete blocks
   # will be reused after restart.
@@ -3679,6 +3900,11 @@ The `compactor_config` configures the compactor for the blocks storage.
 # Max number of concurrent compactions running.
 # CLI flag: -compactor.compaction-concurrency
 [compaction_concurrency: <int> | default = 1]
+
+# Max number of tenants for which blocks should be cleaned up concurrently
+# (deletion of blocks previously marked for deletion).
+# CLI flag: -compactor.cleanup-concurrency
+[cleanup_concurrency: <int> | default = 20]
 
 # Time before a block marked for deletion is deleted from bucket. If not 0,
 # blocks will be marked for deletion and compactor component will delete blocks
@@ -3752,6 +3978,15 @@ sharding_ring:
   # the ring.
   # CLI flag: -compactor.ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
+
+  # Minimum time to wait for ring stability at startup. 0 to disable.
+  # CLI flag: -compactor.ring.wait-stability-min-duration
+  [wait_stability_min_duration: <duration> | default = 1m]
+
+  # Maximum time to wait for ring stability at startup. If the compactor ring
+  # keep changing after this period of time, the compactor will start anyway.
+  # CLI flag: -compactor.ring.wait-stability-max-duration
+  [wait_stability_max_duration: <duration> | default = 5m]
 
   # Name of network interface to read address from.
   # CLI flag: -compactor.ring.instance-interface-names

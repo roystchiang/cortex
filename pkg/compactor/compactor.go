@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"math/rand"
 	"path"
 	"strings"
 	"time"
@@ -28,6 +29,10 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
+var (
+	errInvalidBlockRanges = "compactor block range periods should be divisible by the previous one, but %s is not divisible by %s"
+)
+
 // Config holds the Compactor config.
 type Config struct {
 	BlockRanges           cortex_tsdb.DurationList `yaml:"block_ranges"`
@@ -38,6 +43,7 @@ type Config struct {
 	CompactionInterval    time.Duration            `yaml:"compaction_interval"`
 	CompactionRetries     int                      `yaml:"compaction_retries"`
 	CompactionConcurrency int                      `yaml:"compaction_concurrency"`
+	CleanupConcurrency    int                      `yaml:"cleanup_concurrency"`
 	DeletionDelay         time.Duration            `yaml:"deletion_delay"`
 
 	EnabledTenants  flagext.StringSliceCSV `yaml:"enabled_tenants"`
@@ -70,6 +76,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.CompactionInterval, "compactor.compaction-interval", time.Hour, "The frequency at which the compaction runs")
 	f.IntVar(&cfg.CompactionRetries, "compactor.compaction-retries", 3, "How many times to retry a failed compaction during a single compaction interval")
 	f.IntVar(&cfg.CompactionConcurrency, "compactor.compaction-concurrency", 1, "Max number of concurrent compactions running.")
+	f.IntVar(&cfg.CleanupConcurrency, "compactor.cleanup-concurrency", 20, "Max number of tenants for which blocks should be cleaned up concurrently (deletion of blocks previously marked for deletion).")
 	f.BoolVar(&cfg.ShardingEnabled, "compactor.sharding-enabled", false, "Shard tenants across multiple compactor instances. Sharding is required if you run multiple compactor instances, in order to coordinate compactions and avoid race conditions leading to the same tenant blocks simultaneously compacted by different instances.")
 	f.DurationVar(&cfg.DeletionDelay, "compactor.deletion-delay", 12*time.Hour, "Time before a block marked for deletion is deleted from bucket. "+
 		"If not 0, blocks will be marked for deletion and compactor component will delete blocks marked for deletion from the bucket. "+
@@ -78,6 +85,17 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 	f.Var(&cfg.EnabledTenants, "compactor.enabled-tenants", "Comma separated list of tenants that can be compacted. If specified, only these tenants will be compacted by compactor, otherwise all tenants can be compacted. Subject to sharding.")
 	f.Var(&cfg.DisabledTenants, "compactor.disabled-tenants", "Comma separated list of tenants that cannot be compacted by this compactor. If specified, and compactor would normally pick given tenant for compaction (via -compactor.enabled-tenants or sharding), it will be ignored instead.")
+}
+
+func (cfg *Config) Validate() error {
+	// Each block range period should be divisible by the previous one.
+	for i := 1; i < len(cfg.BlockRanges); i++ {
+		if cfg.BlockRanges[i]%cfg.BlockRanges[i-1] != 0 {
+			return errors.Errorf(errInvalidBlockRanges, cfg.BlockRanges[i].String(), cfg.BlockRanges[i-1].String())
+		}
+	}
+
+	return nil
 }
 
 // Compactor is a multi-tenant TSDB blocks compactor based on Thanos.
@@ -96,18 +114,19 @@ type Compactor struct {
 	// If empty, no users are disabled. If not empty, users in the map are disabled (not owned by this compactor).
 	disabledUsers map[string]struct{}
 
-	// Function that creates bucket client and TSDB compactor using the context.
+	// Function that creates bucket client, TSDB planner and compactor using the context.
 	// Useful for injecting mock objects from tests.
-	createBucketClientAndTsdbCompactor func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, error)
+	createDependencies func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error)
 
 	// Users scanner, used to discover users from the bucket.
-	usersScanner *UsersScanner
+	usersScanner *cortex_tsdb.UsersScanner
 
 	// Blocks cleaner is responsible to hard delete blocks marked for deletion.
 	blocksCleaner *BlocksCleaner
 
-	// Underlying compactor used to compact TSDB blocks.
+	// Underlying compactor and planner used to compact TSDB blocks.
 	tsdbCompactor tsdb.Compactor
+	tsdbPlanner   compact.Planner
 
 	// Client used to run operations on the bucket storing blocks.
 	bucketClient objstore.Bucket
@@ -132,17 +151,22 @@ type Compactor struct {
 
 // NewCompactor makes a new Compactor.
 func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfig, logger log.Logger, registerer prometheus.Registerer) (*Compactor, error) {
-	createBucketClientAndTsdbCompactor := func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, error) {
+	createDependencies := func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error) {
 		bucketClient, err := cortex_tsdb.NewBucketClient(ctx, storageCfg.Bucket, "compactor", logger, registerer)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "failed to create the bucket client")
+			return nil, nil, nil, errors.Wrap(err, "failed to create the bucket client")
 		}
 
 		compactor, err := tsdb.NewLeveledCompactor(ctx, registerer, logger, compactorCfg.BlockRanges.ToMilliseconds(), downsample.NewPool())
-		return bucketClient, compactor, err
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		planner := compact.NewTSDBBasedPlanner(logger, compactorCfg.BlockRanges.ToMilliseconds())
+		return bucketClient, compactor, planner, nil
 	}
 
-	cortexCompactor, err := newCompactor(compactorCfg, storageCfg, logger, registerer, createBucketClientAndTsdbCompactor)
+	cortexCompactor, err := newCompactor(compactorCfg, storageCfg, logger, registerer, createDependencies)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create Cortex blocks compactor")
 	}
@@ -155,16 +179,16 @@ func newCompactor(
 	storageCfg cortex_tsdb.BlocksStorageConfig,
 	logger log.Logger,
 	registerer prometheus.Registerer,
-	createBucketClientAndTsdbCompactor func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, error),
+	createDependencies func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error),
 ) (*Compactor, error) {
 	c := &Compactor{
-		compactorCfg:                       compactorCfg,
-		storageCfg:                         storageCfg,
-		parentLogger:                       logger,
-		logger:                             log.With(logger, "component", "compactor"),
-		registerer:                         registerer,
-		syncerMetrics:                      newSyncerMetrics(registerer),
-		createBucketClientAndTsdbCompactor: createBucketClientAndTsdbCompactor,
+		compactorCfg:       compactorCfg,
+		storageCfg:         storageCfg,
+		parentLogger:       logger,
+		logger:             log.With(logger, "component", "compactor"),
+		registerer:         registerer,
+		syncerMetrics:      newSyncerMetrics(registerer),
+		createDependencies: createDependencies,
 
 		compactionRunsStarted: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_compactor_runs_started_total",
@@ -220,13 +244,13 @@ func (c *Compactor) starting(ctx context.Context) error {
 	var err error
 
 	// Create bucket client and compactor.
-	c.bucketClient, c.tsdbCompactor, err = c.createBucketClientAndTsdbCompactor(ctx)
+	c.bucketClient, c.tsdbCompactor, c.tsdbPlanner, err = c.createDependencies(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to initialize compactor objects")
 	}
 
 	// Create the users scanner.
-	c.usersScanner = NewUsersScanner(c.bucketClient, c.ownUser, c.parentLogger)
+	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUser, c.parentLogger)
 
 	// Initialize the compactors ring if sharding is enabled.
 	if c.compactorCfg.ShardingEnabled {
@@ -263,6 +287,22 @@ func (c *Compactor) starting(ctx context.Context) error {
 			return err
 		}
 		level.Info(c.logger).Log("msg", "compactor is ACTIVE in the ring")
+
+		// In the event of a cluster cold start or scale up of 2+ compactor instances at the same
+		// time, we may end up in a situation where each new compactor instance starts at a slightly
+		// different time and thus each one starts with on a different state of the ring. It's better
+		// to just wait the ring stability for a short time.
+		if c.compactorCfg.ShardingRing.WaitStabilityMinDuration > 0 {
+			minWaiting := c.compactorCfg.ShardingRing.WaitStabilityMinDuration
+			maxWaiting := c.compactorCfg.ShardingRing.WaitStabilityMaxDuration
+
+			level.Info(c.logger).Log("msg", "waiting until compactor ring topology is stable", "min_waiting", minWaiting.String(), "max_waiting", maxWaiting.String())
+			if err := ring.WaitRingStability(ctx, c.ring, ring.Compactor, minWaiting, maxWaiting); err != nil {
+				level.Warn(c.logger).Log("msg", "compactor is ring topology is not stable after the max waiting time, proceeding anyway")
+			} else {
+				level.Info(c.logger).Log("msg", "compactor is ring topology is stable")
+			}
+		}
 	}
 
 	// Create the blocks cleaner (service).
@@ -270,7 +310,8 @@ func (c *Compactor) starting(ctx context.Context) error {
 		DataDir:             c.compactorCfg.DataDir,
 		MetaSyncConcurrency: c.compactorCfg.MetaSyncConcurrency,
 		DeletionDelay:       c.compactorCfg.DeletionDelay,
-		CleanupInterval:     util.DurationWithJitter(c.compactorCfg.CompactionInterval, 0.05),
+		CleanupInterval:     util.DurationWithJitter(c.compactorCfg.CompactionInterval, 0.1),
+		CleanupConcurrency:  c.compactorCfg.CleanupConcurrency,
 	}, c.bucketClient, c.usersScanner, c.parentLogger, c.registerer)
 
 	// Ensure an initial cleanup occurred before starting the compactor.
@@ -344,7 +385,14 @@ func (c *Compactor) compactUsers(ctx context.Context) error {
 	}
 	level.Info(c.logger).Log("msg", "discovered users from bucket", "users", len(users))
 
-	errs := tsdb_errors.MultiError{}
+	// When starting multiple compactor replicas nearly at the same time, running in a cluster with
+	// a large number of tenants, we may end up in a situation where the 1st user is compacted by
+	// multiple replicas at the same time. Shuffling users helps reduce the likelihood this will happen.
+	rand.Shuffle(len(users), func(i, j int) {
+		users[i], users[j] = users[j], users[i]
+	})
+
+	errs := tsdb_errors.NewMulti()
 
 	for _, userID := range users {
 		// Ensure the context has not been canceled (ie. compactor shutdown has been triggered).
@@ -445,6 +493,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		ulogger,
 		syncer,
 		grouper,
+		c.tsdbPlanner,
 		c.tsdbCompactor,
 		path.Join(c.compactorCfg.DataDir, "compact"),
 		bucket,

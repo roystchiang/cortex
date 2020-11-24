@@ -154,7 +154,7 @@ func (u *BucketStores) syncUsersBlocks(ctx context.Context, f func(context.Conte
 
 	wg := &sync.WaitGroup{}
 	jobs := make(chan job)
-	errs := tsdb_errors.MultiError{}
+	errs := tsdb_errors.NewMulti()
 	errsMx := sync.Mutex{}
 
 	// Scan users in the bucket. In case of error, it may return a subset of users. If we sync a subset of users
@@ -347,6 +347,8 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 		u.cfg.BucketStore.IndexCache.PostingsCompression,
 		u.cfg.BucketStore.PostingOffsetsInMemSampling,
 		true, // Enable series hints.
+		u.cfg.BucketStore.IndexHeaderLazyLoadingEnabled,
+		u.cfg.BucketStore.IndexHeaderLazyLoadingIdleTimeout,
 	)
 	if err != nil {
 		return nil, err

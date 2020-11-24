@@ -153,7 +153,6 @@ func (c *Client) QueryRaw(query string) (*http.Response, []byte, error) {
 }
 
 func (c *Client) query(addr string) (*http.Response, []byte, error) {
-
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -184,16 +183,14 @@ func (c *Client) Series(matches []string, start, end time.Time) ([]model.LabelSe
 }
 
 // LabelValues gets label values
-func (c *Client) LabelValues(label string) (model.LabelValues, error) {
-	// Cortex currently doesn't support start/end time.
-	result, _, err := c.querierClient.LabelValues(context.Background(), label, time.Time{}, time.Time{})
+func (c *Client) LabelValues(label string, start, end time.Time) (model.LabelValues, error) {
+	result, _, err := c.querierClient.LabelValues(context.Background(), label, start, end)
 	return result, err
 }
 
 // LabelNames gets label names
-func (c *Client) LabelNames() ([]string, error) {
-	// Cortex currently doesn't support start/end time.
-	result, _, err := c.querierClient.LabelNames(context.Background(), time.Time{}, time.Time{})
+func (c *Client) LabelNames(start, end time.Time) ([]string, error) {
+	result, _, err := c.querierClient.LabelNames(context.Background(), start, end)
 	return result, err
 }
 

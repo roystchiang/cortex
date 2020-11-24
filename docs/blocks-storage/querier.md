@@ -110,6 +110,11 @@ querier:
   # CLI flag: -querier.query-ingesters-within
   [query_ingesters_within: <duration> | default = 0s]
 
+  # Query long-term store for series, label values and label names APIs. Works
+  # only with blocks engine.
+  # CLI flag: -querier.query-store-for-labels-enabled
+  [query_store_for_labels_enabled: <boolean> | default = false]
+
   # The time after which a metric should only be queried from storage and not
   # just ingesters. 0 means all queries are sent to store. When running the
   # blocks storage, if this option is enabled, the time range of the query sent
@@ -414,7 +419,7 @@ blocks_storage:
         [max_get_multi_concurrency: <int> | default = 100]
 
         # The maximum number of keys a single underlying get operation should
-        # run. If more keys are specified, internally keys are splitted into
+        # run. If more keys are specified, internally keys are split into
         # multiple batches and fetched concurrently, honoring the max
         # concurrency. If set to 0, the max batch size is unlimited.
         # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-get-multi-batch-size
@@ -465,7 +470,7 @@ blocks_storage:
         [max_get_multi_concurrency: <int> | default = 100]
 
         # The maximum number of keys a single underlying get operation should
-        # run. If more keys are specified, internally keys are splitted into
+        # run. If more keys are specified, internally keys are split into
         # multiple batches and fetched concurrently, honoring the max
         # concurrency. If set to 0, the max batch size is unlimited.
         # CLI flag: -blocks-storage.bucket-store.chunks-cache.memcached.max-get-multi-batch-size
@@ -489,7 +494,7 @@ blocks_storage:
 
       # TTL for caching object attributes for chunks.
       # CLI flag: -blocks-storage.bucket-store.chunks-cache.attributes-ttl
-      [attributes_ttl: <duration> | default = 24h]
+      [attributes_ttl: <duration> | default = 168h]
 
       # TTL for caching individual chunks subranges.
       # CLI flag: -blocks-storage.bucket-store.chunks-cache.subrange-ttl
@@ -531,7 +536,7 @@ blocks_storage:
         [max_get_multi_concurrency: <int> | default = 100]
 
         # The maximum number of keys a single underlying get operation should
-        # run. If more keys are specified, internally keys are splitted into
+        # run. If more keys are specified, internally keys are split into
         # multiple batches and fetched concurrently, honoring the max
         # concurrency. If set to 0, the max batch size is unlimited.
         # CLI flag: -blocks-storage.bucket-store.metadata-cache.memcached.max-get-multi-batch-size
@@ -569,6 +574,10 @@ blocks_storage:
       # Maximum size of metafile content to cache in bytes.
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-max-size-bytes
       [metafile_max_size_bytes: <int> | default = 1048576]
+
+      # How long to cache attributes of the block metafile.
+      # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl
+      [metafile_attributes_ttl: <duration> | default = 168h]
 
     # Duration after which the blocks marked for deletion will be filtered out
     # while fetching blocks. The idea of ignore-deletion-marks-delay is to
@@ -618,6 +627,12 @@ blocks_storage:
     # CLI flag: -blocks-storage.tsdb.head-compaction-idle-timeout
     [head_compaction_idle_timeout: <duration> | default = 1h]
 
+    # The write buffer size used by the head chunks mapper. Lower values reduce
+    # memory utilisation on clusters with a large number of tenants at the cost
+    # of increased disk I/O operations.
+    # CLI flag: -blocks-storage.tsdb.head-chunks-write-buffer-size-bytes
+    [head_chunks_write_buffer_size_bytes: <int> | default = 4194304]
+
     # The number of shards of series to use in TSDB (must be a power of 2).
     # Reducing this will decrease memory footprint, but can negatively impact
     # performance.
@@ -627,6 +642,10 @@ blocks_storage:
     # True to enable TSDB WAL compression.
     # CLI flag: -blocks-storage.tsdb.wal-compression-enabled
     [wal_compression_enabled: <boolean> | default = false]
+
+    # TSDB WAL segments files max size (bytes).
+    # CLI flag: -blocks-storage.tsdb.wal-segment-size-bytes
+    [wal_segment_size_bytes: <int> | default = 134217728]
 
     # True to flush blocks to storage on shutdown. If false, incomplete blocks
     # will be reused after restart.

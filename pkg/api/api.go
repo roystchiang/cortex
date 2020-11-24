@@ -19,11 +19,16 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/purger"
 	"github.com/cortexproject/cortex/pkg/compactor"
 	"github.com/cortexproject/cortex/pkg/distributor"
+	frontendv1 "github.com/cortexproject/cortex/pkg/frontend/v1"
+	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	frontendv2 "github.com/cortexproject/cortex/pkg/frontend/v2"
+	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier"
-	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/scheduler"
+	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util/push"
@@ -309,9 +314,21 @@ func (a *API) RegisterQueryAPI(handler http.Handler) {
 // RegisterQueryFrontend registers the Prometheus routes supported by the
 // Cortex querier service. Currently this can not be registered simultaneously
 // with the Querier.
-func (a *API) RegisterQueryFrontend(f *frontend.Frontend) {
-	frontend.RegisterFrontendServer(a.server.GRPC, f)
-	a.RegisterQueryAPI(f.Handler())
+func (a *API) RegisterQueryFrontendHandler(h http.Handler) {
+	a.RegisterQueryAPI(h)
+}
+
+func (a *API) RegisterQueryFrontend1(f *frontendv1.Frontend) {
+	frontendv1pb.RegisterFrontendServer(a.server.GRPC, f)
+}
+
+func (a *API) RegisterQueryFrontend2(f *frontendv2.Frontend) {
+	frontendv2pb.RegisterFrontendForQuerierServer(a.server.GRPC, f)
+}
+
+func (a *API) RegisterQueryScheduler(f *scheduler.Scheduler) {
+	schedulerpb.RegisterSchedulerForFrontendServer(a.server.GRPC, f)
+	schedulerpb.RegisterSchedulerForQuerierServer(a.server.GRPC, f)
 }
 
 // RegisterServiceMapHandler registers the Cortex structs service handler

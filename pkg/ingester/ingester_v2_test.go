@@ -72,14 +72,14 @@ func TestIngester_v2Push(t *testing.T) {
 					[]labels.Labels{metricLabels},
 					[]client.Sample{{Value: 1, TimestampMs: 9}},
 					[]*client.MetricMetadata{
-						{MetricName: "metric_name_1", Help: "a help for metric_name_1", Unit: "", Type: client.COUNTER},
+						{MetricFamilyName: "metric_name_1", Help: "a help for metric_name_1", Unit: "", Type: client.COUNTER},
 					},
 					client.API),
 				client.ToWriteRequest(
 					[]labels.Labels{metricLabels},
 					[]client.Sample{{Value: 2, TimestampMs: 10}},
 					[]*client.MetricMetadata{
-						{MetricName: "metric_name_2", Help: "a help for metric_name_2", Unit: "", Type: client.GAUGE},
+						{MetricFamilyName: "metric_name_2", Help: "a help for metric_name_2", Unit: "", Type: client.GAUGE},
 					},
 					client.API),
 			},
@@ -88,8 +88,8 @@ func TestIngester_v2Push(t *testing.T) {
 				{Labels: metricLabelAdapters, Samples: []client.Sample{{Value: 1, TimestampMs: 9}, {Value: 2, TimestampMs: 10}}},
 			},
 			expectedMetadataIngested: []*client.MetricMetadata{
-				{MetricName: "metric_name_2", Help: "a help for metric_name_2", Unit: "", Type: client.GAUGE},
-				{MetricName: "metric_name_1", Help: "a help for metric_name_1", Unit: "", Type: client.COUNTER},
+				{MetricFamilyName: "metric_name_2", Help: "a help for metric_name_2", Unit: "", Type: client.GAUGE},
+				{MetricFamilyName: "metric_name_1", Help: "a help for metric_name_1", Unit: "", Type: client.COUNTER},
 			},
 			additionalMetrics: []string{
 				// Metadata.
@@ -1765,7 +1765,7 @@ func TestIngester_shipBlocks(t *testing.T) {
 	defer cleanup()
 
 	// Wait until it's ACTIVE
-	test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
@@ -1860,12 +1860,12 @@ func TestIngester_flushing(t *testing.T) {
 				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
 
 				// Flush handler only triggers compactions, but doesn't wait for them to finish. Let's wait for a moment, and then verify.
-				test.Poll(t, 1*time.Second, true, func() interface{} {
+				test.Poll(t, 5*time.Second, uint64(0), func() interface{} {
 					db := i.getTSDB(userID)
 					if db == nil {
 						return false
 					}
-					return db.Head().NumSeries() == 0
+					return db.Head().NumSeries()
 				})
 
 				// The above waiting only ensures compaction, waiting another second to register the Sync call.
@@ -1900,12 +1900,12 @@ func TestIngester_flushing(t *testing.T) {
 				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
 
 				// Flush handler only triggers compactions, but doesn't wait for them to finish. Let's wait for a moment, and then verify.
-				test.Poll(t, 1*time.Second, true, func() interface{} {
+				test.Poll(t, 5*time.Second, uint64(0), func() interface{} {
 					db := i.getTSDB(userID)
 					if db == nil {
 						return false
 					}
-					return db.Head().NumSeries() == 0
+					return db.Head().NumSeries()
 				})
 
 				// The above waiting only ensures compaction, waiting another second to register the Sync call.
@@ -1953,7 +1953,7 @@ func TestIngester_flushing(t *testing.T) {
 			})
 
 			// Wait until it's ACTIVE
-			test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+			test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 				return i.lifecycler.GetState()
 			})
 
@@ -1983,7 +1983,7 @@ func TestIngester_ForFlush(t *testing.T) {
 	})
 
 	// Wait until it's ACTIVE
-	test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
@@ -2162,7 +2162,7 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 	})
 
 	// Wait until it's ACTIVE
-	test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
@@ -2321,7 +2321,7 @@ func TestIngester_CloseTSDBsOnShutdown(t *testing.T) {
 	})
 
 	// Wait until it's ACTIVE
-	test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
@@ -2358,7 +2358,7 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	})
 
 	// Wait until it's ACTIVE
-	test.Poll(t, 10*time.Millisecond, ring.ACTIVE, func() interface{} {
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
@@ -2421,4 +2421,101 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 		// Second block is not one among old blocks.
 		require.NotEqual(t, b.Meta().ULID, newBlocks2[1].Meta().ULID)
 	}
+}
+
+func TestIngesterPushErrorDuringForcedCompaction(t *testing.T) {
+	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	t.Cleanup(func() {
+		_ = services.StopAndAwaitTerminated(context.Background(), i)
+	})
+
+	// Wait until it's ACTIVE
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	// Push a sample, it should succeed.
+	pushSingleSample(t, i)
+
+	// We mock a flushing by setting the boolean.
+	db := i.getTSDB(userID)
+	require.NotNil(t, db)
+	db.forcedCompactionInProgressMtx.Lock()
+	require.False(t, db.forcedCompactionInProgress)
+	db.forcedCompactionInProgress = true
+	db.forcedCompactionInProgressMtx.Unlock()
+
+	// Ingestion should fail with a 503.
+	req, _, _ := mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "test"}}, 0, util.TimeToMillis(time.Now()))
+	ctx := user.InjectOrgID(context.Background(), userID)
+	_, err = i.v2Push(ctx, req)
+	require.Equal(t, httpgrpc.Errorf(http.StatusServiceUnavailable, wrapWithUser(errors.New("forced compaction in progress"), userID).Error()), err)
+
+	// Ingestion is successful after a flush.
+	db.forcedCompactionInProgressMtx.Lock()
+	require.True(t, db.forcedCompactionInProgress)
+	db.forcedCompactionInProgress = false
+	db.forcedCompactionInProgressMtx.Unlock()
+	pushSingleSample(t, i)
+}
+
+func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), registry)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	t.Cleanup(func() {
+		_ = services.StopAndAwaitTerminated(context.Background(), i)
+	})
+
+	// Wait until it's ACTIVE
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	// Push few samples.
+	for j := 0; j < 5; j++ {
+		pushSingleSample(t, i)
+	}
+
+	// Verifying that compaction won't happen when a request is in flight.
+
+	// This mocks a request in flight.
+	db := i.getTSDB(userID)
+	require.NoError(t, db.acquireAppendLock())
+
+	// Flush handler only triggers compactions, but doesn't wait for them to finish.
+	i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
+
+	// Flushing should not have succeeded even after 5 seconds.
+	time.Sleep(5 * time.Second)
+	require.NoError(t, testutil.GatherAndCompare(registry, strings.NewReader(`
+		# HELP cortex_ingester_tsdb_compactions_total Total number of TSDB compactions that were executed.
+		# TYPE cortex_ingester_tsdb_compactions_total counter
+		cortex_ingester_tsdb_compactions_total 0
+	`), "cortex_ingester_tsdb_compactions_total"))
+
+	// No requests in flight after this.
+	db.releaseAppendLock()
+
+	// Let's wait until all head series have been flushed.
+	test.Poll(t, 5*time.Second, uint64(0), func() interface{} {
+		db := i.getTSDB(userID)
+		if db == nil {
+			return false
+		}
+		return db.Head().NumSeries()
+	})
+
+	require.NoError(t, testutil.GatherAndCompare(registry, strings.NewReader(`
+		# HELP cortex_ingester_tsdb_compactions_total Total number of TSDB compactions that were executed.
+		# TYPE cortex_ingester_tsdb_compactions_total counter
+		cortex_ingester_tsdb_compactions_total 1
+	`), "cortex_ingester_tsdb_compactions_total"))
 }

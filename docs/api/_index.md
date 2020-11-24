@@ -1,7 +1,7 @@
 ---
 title: "HTTP API"
 linkTitle: "HTTP API"
-weight: 5
+weight: 7
 slug: api
 menu:
 no_section_index_title: true
@@ -22,6 +22,8 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Services status](#services-status) | _All services_ | `GET /services` |
 | [Readiness probe](#readiness-probe) | _All services_ | `GET /ready` |
 | [Metrics](#metrics) | _All services_ | `GET /metrics` |
+| [Pprof](#pprof) | _All services_ | `GET /debug/pprof` |
+| [Fgprof](#fgprof) | _All services_ | `GET /debug/fgprof` |
 | [Remote write](#remote-write) | Distributor | `POST /api/v1/push` |
 | [Tenants stats](#tenants-stats) | Distributor | `GET /distributor/all_user_stats` |
 | [HA tracker status](#ha-tracker-status) | Distributor | `GET /distributor/ha_tracker` |
@@ -83,7 +85,7 @@ When multi-tenancy is enabled, endpoints requiring authentication are expected t
 
 Multi-tenancy can be enabled/disabled via the CLI flag `-auth.enabled` or its respective YAML config option.
 
-_For more information, please refer to the dedicated [Authentication and Authorisation](../production/auth.md) guide._
+_For more information, please refer to the dedicated [Authentication and Authorisation](../guides/authentication-and-authorisation.md) guide._
 
 ## All services
 
@@ -129,6 +131,31 @@ GET /metrics
 
 Returns the metrics for the running Cortex service in the Prometheus exposition format.
 
+### Pprof
+
+```
+GET /debug/pprof/heap
+GET /debug/pprof/block
+GET /debug/pprof/profile
+GET /debug/pprof/trace
+GET /debug/pprof/goroutine
+GET /debug/pprof/mutex
+```
+
+Returns the runtime profiling data in the format expected by the pprof visualization tool. There are many things which can be profiled using this including heap, trace, goroutine, etc.
+
+_For more information, please check out the official documentation of [pprof](https://golang.org/pkg/net/http/pprof/)._
+
+### Fgprof
+
+```
+GET /debug/fgprof
+```
+
+Returns the sampling Go profiling data which allows you to analyze On-CPU as well as Off-CPU (e.g. I/O) time together.
+
+_For more information, please check out the official documentation of [fgprof](https://github.com/felixge/fgprof)._
+
 ## Distributor
 
 ### Remote write
@@ -170,6 +197,7 @@ GET /ha-tracker
 
 Displays a web page with the current status of the HA tracker, including the elected replica for each Prometheus HA cluster.
 
+
 ## Ingester
 
 ### Flush chunks / blocks
@@ -192,7 +220,7 @@ GET,POST /ingester/shutdown
 GET,POST /shutdown
 ```
 
-Flushes in-memory time series data from ingester to the long-term storage, and shuts down the ingester service. Notice that the other Cortex services are still running, and the operator (or any automation) is expected to terminate the process with a `SIGINT` / `SIGTERM` signal after the shutdown endpoint returns. In the meantime, `/ready` will not return 200.
+Flushes in-memory time series data from ingester to the long-term storage, and shuts down the ingester service. Notice that the other Cortex services are still running, and the operator (or any automation) is expected to terminate the process with a `SIGINT` / `SIGTERM` signal after the shutdown endpoint returns. In the meantime, `/ready` will not return 200. This endpoint will unregister the ingester from the ring even if `-ingester.unregister-on-shutdown` is disabled.
 
 _This API endpoint is usually used by scale down automations._
 
@@ -251,7 +279,7 @@ GET,POST <prometheus-http-prefix>/api/v1/series
 GET,POST <legacy-http-prefix>/api/v1/series
 ```
 
-Find series by label matchers. Differently than Prometheus and due to scalability and performances reasons, Cortex currently ignores the `start` and `end` request parameters and always fetches the series from in-memory data stored in the ingesters.
+Find series by label matchers. Differently than Prometheus and due to scalability and performances reasons, Cortex currently ignores the `start` and `end` request parameters and always fetches the series from in-memory data stored in the ingesters. There is experimental support to query the long-term store with the *blocks* storage engine when `-querier.query-store-for-labels-enabled` is set.
 
 _For more information, please check out the Prometheus [series endpoint](https://prometheus.io/docs/prometheus/latest/querying/api/#finding-series-by-label-matchers) documentation._
 
