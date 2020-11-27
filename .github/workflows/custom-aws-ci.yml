@@ -7,9 +7,9 @@ on:
     tags:
       - v[0-9]+.[0-9]+.[0-9]+**
 env:
-  ECR: 396262249347.dkr.ecr.us-east-1.amazonaws.com/cortex
+  ECR: 595926772921.dkr.ecr.us-west-2.amazonaws.com/cortex
   GH_REF: ${{ github.ref }}
-  IMAGE_DOWNLOAD_LOCATION: /actions-runner/_work/cortex_images/
+  IMAGE_DOWNLOAD_LOCATION: ../downloaded_images
 
 jobs:
   lint:
@@ -78,7 +78,7 @@ jobs:
         uses: actions/checkout@v2
       - name: Generate Tag
         shell: bash
-        run: ./.github/workflows/scripts/generate-tag.sh          
+        run: ./.github/workflows/scripts/generate-tag.sh
       - name: Install Docker Client
         run: ./.github/workflows/scripts/install-docker.sh
       - name: Sym Link Expected Path to Workspace
@@ -92,27 +92,32 @@ jobs:
       - name: Save Image
         shell: bash
         run: |
+          cd ..
           CORTEX_LOCAL_IMAGE="quay.io/cortexproject/cortex:$DOCKER_IMAGE_TAG"
           CORTEX_IMAGE=$ECR:$DOCKER_IMAGE_TAG
-          mkdir docker-images
+          mkdir -p docker-images
           echo "$CORTEX_LOCAL_IMAGE  ->  $CORTEX_IMAGE"
           docker tag $CORTEX_LOCAL_IMAGE $CORTEX_IMAGE
           docker save $CORTEX_IMAGE -o docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
           echo $CORTEX_IMAGE > docker-images/image-name
       - name: Create Docker Images Archive
-        run: tar -cvf images.tar docker-images
+        run: cd .. && tar -cvf images.tar docker-images
       - name: Upload Docker Images Artifact
         uses: actions/upload-artifact@v2
         with:
           name: Docker Images
-          path: ./images.tar
+          path: ${{ runner.workspace }}/images.tar
+      - name: Cleanup
+        continue-on-error: true
+        run: |
+          rm ../images.tar
+          rm -rf ../docker-images
+          docker rmi "$ECR:$DOCKER_IMAGE_TAG" -f
+          docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep 'quay.io/cortexproject/')
   deploy:
     needs: [lint, secure, test, build]
-    if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'aws-observability/cortex-dev'
     runs-on: [self-hosted, prod]
     steps:
-      # we use this directory instead of /actions-runner/_work/cortex-dev/cortex-dev
-      # because of folder ownership issues
       - name: Make Directory
         run: mkdir -p $IMAGE_DOWNLOAD_LOCATION
       - name: Download Docker Images Artifact
@@ -130,6 +135,7 @@ jobs:
           docker tag $CORTEX_IMAGE $ECR:latest
           docker images
       - name: Push to ECR
+        continue-on-error: true
         # Self hosted runner manages authentication, no need to worry about docker login
         run: |
           cd $IMAGE_DOWNLOAD_LOCATION
@@ -137,8 +143,8 @@ jobs:
           docker push $CORTEX_IMAGE
           docker push $ECR:latest
       - name: Cleanup
+        continue-on-error: true
         run: |
-          cd $IMAGE_DOWNLOAD_LOCATION
-          rm -rf docker-images/
-          rm images.tar
-          docker system prune -af
+          rm -rf $IMAGE_DOWNLOAD_LOCATION
+          docker rmi $ECR:latest -f
+          docker rmi $CORTEX_IMAGE -f
