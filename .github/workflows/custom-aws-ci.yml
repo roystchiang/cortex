@@ -135,7 +135,6 @@ jobs:
           docker tag $CORTEX_IMAGE $ECR:latest
           docker images
       - name: Push to ECR
-        continue-on-error: true
         # Self hosted runner manages authentication, no need to worry about docker login
         run: |
           cd $IMAGE_DOWNLOAD_LOCATION
