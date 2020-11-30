@@ -275,6 +275,11 @@ blocks_storage:
     # CLI flag: -blocks-storage.s3.insecure
     [insecure: <boolean> | default = false]
 
+    # The signature version to use for authenticating against S3. Supported
+    # values are: v4, v2.
+    # CLI flag: -blocks-storage.s3.signature-version
+    [signature_version: <string> | default = "v4"]
+
     http:
       # The time an idle connection will remain idle before closing.
       # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
@@ -480,7 +485,8 @@ blocks_storage:
         # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-item-size
         [max_item_size: <int> | default = 1048576]
 
-      # Compress postings before storing them to postings cache.
+      # Deprecated: compress postings before storing them to postings cache.
+      # This option is unused and postings compression is always enabled.
       # CLI flag: -blocks-storage.bucket-store.index-cache.postings-compression-enabled
       [postings_compression_enabled: <boolean> | default = false]
 
@@ -701,6 +707,15 @@ blocks_storage:
     # will be reused after restart.
     # CLI flag: -blocks-storage.tsdb.flush-blocks-on-shutdown
     [flush_blocks_on_shutdown: <boolean> | default = false]
+
+    # If TSDB has not received any data for this duration, and all blocks from
+    # TSDB have been shipped, TSDB is closed and deleted from local disk. If set
+    # to positive value, this value should be equal or higher than
+    # -querier.query-ingesters-within flag to make sure that TSDB is not closed
+    # prematurely, which could cause partial query results. 0 or negative value
+    # disables closing of idle TSDB.
+    # CLI flag: -blocks-storage.tsdb.close-idle-tsdb-timeout
+    [close_idle_tsdb_timeout: <duration> | default = 0s]
 
     # limit the number of concurrently opening TSDB's on startup
     # CLI flag: -blocks-storage.tsdb.max-tsdb-opening-concurrency-on-startup

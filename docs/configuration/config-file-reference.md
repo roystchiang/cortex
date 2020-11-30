@@ -69,6 +69,11 @@ Where default_value is the value to use if the environment variable is undefined
 [http_prefix: <string> | default = "/api/prom"]
 
 api:
+  # Use GZIP compression for API responses. Some endpoints serve large YAML or
+  # JSON blobs which can benefit from compression.
+  # CLI flag: -api.response-compression-enabled
+  [response_compression_enabled: <boolean> | default = false]
+
   # HTTP URL path under which the Alertmanager ui and api will be served.
   # CLI flag: -http.alertmanager-http-prefix
   [alertmanager_http_prefix: <string> | default = "/alertmanager"]
@@ -1052,6 +1057,49 @@ The `ruler_config` configures the Cortex ruler.
 [external_url: <url> | default = ]
 
 ruler_client:
+  # gRPC client max receive message size (bytes).
+  # CLI flag: -ruler.client.grpc-max-recv-msg-size
+  [max_recv_msg_size: <int> | default = 104857600]
+
+  # gRPC client max send message size (bytes).
+  # CLI flag: -ruler.client.grpc-max-send-msg-size
+  [max_send_msg_size: <int> | default = 16777216]
+
+  # Deprecated: Use gzip compression when sending messages.  If true, overrides
+  # grpc-compression flag.
+  # CLI flag: -ruler.client.grpc-use-gzip-compression
+  [use_gzip_compression: <boolean> | default = false]
+
+  # Use compression when sending messages. Supported values are: 'gzip',
+  # 'snappy' and '' (disable compression)
+  # CLI flag: -ruler.client.grpc-compression
+  [grpc_compression: <string> | default = ""]
+
+  # Rate limit for gRPC client; 0 means disabled.
+  # CLI flag: -ruler.client.grpc-client-rate-limit
+  [rate_limit: <float> | default = 0]
+
+  # Rate limit burst for gRPC client.
+  # CLI flag: -ruler.client.grpc-client-rate-limit-burst
+  [rate_limit_burst: <int> | default = 0]
+
+  # Enable backoff and retry when we hit ratelimits.
+  # CLI flag: -ruler.client.backoff-on-ratelimits
+  [backoff_on_ratelimits: <boolean> | default = false]
+
+  backoff_config:
+    # Minimum delay when backing off.
+    # CLI flag: -ruler.client.backoff-min-period
+    [min_period: <duration> | default = 100ms]
+
+    # Maximum delay when backing off.
+    # CLI flag: -ruler.client.backoff-max-period
+    [max_period: <duration> | default = 10s]
+
+    # Number of times to backoff and retry before failing.
+    # CLI flag: -ruler.client.backoff-retries
+    [max_retries: <int> | default = 10]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -ruler.client.tls-cert-path
@@ -3429,6 +3477,11 @@ s3:
   # CLI flag: -blocks-storage.s3.insecure
   [insecure: <boolean> | default = false]
 
+  # The signature version to use for authenticating against S3. Supported values
+  # are: v4, v2.
+  # CLI flag: -blocks-storage.s3.signature-version
+  [signature_version: <string> | default = "v4"]
+
   http:
     # The time an idle connection will remain idle before closing.
     # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
@@ -3634,7 +3687,8 @@ bucket_store:
       # CLI flag: -blocks-storage.bucket-store.index-cache.memcached.max-item-size
       [max_item_size: <int> | default = 1048576]
 
-    # Compress postings before storing them to postings cache.
+    # Deprecated: compress postings before storing them to postings cache. This
+    # option is unused and postings compression is always enabled.
     # CLI flag: -blocks-storage.bucket-store.index-cache.postings-compression-enabled
     [postings_compression_enabled: <boolean> | default = false]
 
@@ -3853,6 +3907,15 @@ tsdb:
   # will be reused after restart.
   # CLI flag: -blocks-storage.tsdb.flush-blocks-on-shutdown
   [flush_blocks_on_shutdown: <boolean> | default = false]
+
+  # If TSDB has not received any data for this duration, and all blocks from
+  # TSDB have been shipped, TSDB is closed and deleted from local disk. If set
+  # to positive value, this value should be equal or higher than
+  # -querier.query-ingesters-within flag to make sure that TSDB is not closed
+  # prematurely, which could cause partial query results. 0 or negative value
+  # disables closing of idle TSDB.
+  # CLI flag: -blocks-storage.tsdb.close-idle-tsdb-timeout
+  [close_idle_tsdb_timeout: <duration> | default = 0s]
 
   # limit the number of concurrently opening TSDB's on startup
   # CLI flag: -blocks-storage.tsdb.max-tsdb-opening-concurrency-on-startup
