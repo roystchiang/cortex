@@ -33,22 +33,29 @@
 * [ENHANCEMENT] Blocks storage: enabled caching of `meta.json` attributes, configurable via `-blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl`. #3528
 * [ENHANCEMENT] Compactor: added a config validation check to fail fast if the compactor has been configured invalid block range periods (each period is expected to be a multiple of the previous one). #3534
 * [ENHANCEMENT] Blocks storage: concurrently fetch deletion marks from object storage. #3538
-* [ENHANCEMENT] Blocks storage ingester: ingester can now close idle TSDB and delete local data. #3491
+* [ENHANCEMENT] Blocks storage ingester: ingester can now close idle TSDB and delete local data. #3491 #3552
 * [ENHANCEMENT] Blocks storage: add option to use V2 signatures for S3 authentication. #3540
 * [ENHANCEMENT] Exported process metrics to monitor the number of memory map areas allocated. #3537
   * - `process_memory_map_areas`
   * - `process_memory_map_areas_limit`
 * [ENHANCEMENT] Ruler: Expose gRPC client options. #3523
+* [ENHANCEMENT] Compactor: added metrics to track on-going compaction. #3535
+  * `cortex_compactor_tenants_discovered`
+  * `cortex_compactor_tenants_skipped`
+  * `cortex_compactor_tenants_processing_succeeded`
+  * `cortex_compactor_tenants_processing_failed`
 * [BUGFIX] Blocks storage ingester: fixed some cases leading to a TSDB WAL corruption after a partial write to disk. #3423
 * [BUGFIX] Blocks storage: Fix the race between ingestion and `/flush` call resulting in overlapping blocks. #3422
 * [BUGFIX] Querier: fixed `-querier.max-query-into-future` which wasn't correctly enforced on range queries. #3452
 * [BUGFIX] Fixed float64 precision stability when aggregating metrics before exposing them. This could have lead to false counters resets when querying some metrics exposed by Cortex. #3506
 * [BUGFIX] Querier: the meta.json sync concurrency done when running Cortex with the blocks storage is now controlled by `-blocks-storage.bucket-store.meta-sync-concurrency` instead of the incorrect `-blocks-storage.bucket-store.block-sync-concurrency` (default values are the same). #3531
+* [BUGFIX] Querier: fixed initialization order of querier module when using blocks storage. It now (again) waits until blocks have been synchronized. #3551
 
 ## Blocksconvert
 
 * [ENHANCEMENT] Scheduler: ability to ignore users based on regexp, using `-scheduler.ignore-users-regex` flag. #3477
 * [ENHANCEMENT] Builder: Parallelize reading chunks in the final stage of building block. #3470
+* [ENHANCEMENT] Builder: remove duplicate label names from chunk. #3547
 
 ## 1.5.0 / 2020-11-09
 
