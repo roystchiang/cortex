@@ -1,13 +1,11 @@
 name: cortex-prod-ci
 on:
   push:
-    # will run on all changes to master, with image tag being master-<commit sha>
     branches: [master]
-    # will run on all new tags, with image tag being the same as the GitHub tag
     tags:
       - v[0-9]+.[0-9]+.[0-9]+**
 env:
-  ECR: 396262249347.dkr.ecr.us-east-1.amazonaws.com/cortex
+  REPO: cortex
   GH_REF: ${{ github.ref }}
   IMAGE_DOWNLOAD_LOCATION: ../downloaded_images
 
@@ -16,6 +14,8 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -37,6 +37,8 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -53,6 +55,8 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
     services:
       cassandra:
         image: cassandra:3.11
@@ -73,6 +77,8 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -94,8 +100,8 @@ jobs:
         run: |
           cd ..
           CORTEX_LOCAL_IMAGE="quay.io/cortexproject/cortex:$DOCKER_IMAGE_TAG"
-          CORTEX_IMAGE=$ECR:$DOCKER_IMAGE_TAG
-          mkdir -p docker-images
+          CORTEX_IMAGE=$ECR/$REPO:$DOCKER_IMAGE_TAG
+          rm -rf docker-images; mkdir docker-images
           echo "$CORTEX_LOCAL_IMAGE  ->  $CORTEX_IMAGE"
           docker tag $CORTEX_LOCAL_IMAGE $CORTEX_IMAGE
           docker save $CORTEX_IMAGE -o docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
@@ -112,7 +118,7 @@ jobs:
         run: |
           rm ../images.tar
           rm -rf ../docker-images
-          docker rmi "$ECR:$DOCKER_IMAGE_TAG" -f
+          docker rmi "$ECR/$REPO:$DOCKER_IMAGE_TAG" -f
           docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep 'quay.io/cortexproject/')
   deploy:
     needs: [lint, secure, test, build]
@@ -132,18 +138,17 @@ jobs:
           CORTEX_IMAGE=$(cat docker-images/image-name)
           echo "CORTEX_IMAGE=$CORTEX_IMAGE" >> $GITHUB_ENV
           docker load -i docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
-          docker tag $CORTEX_IMAGE $ECR:latest
+          docker tag $CORTEX_IMAGE $ECR/$REPO:latest
           docker images
       - name: Push to ECR
-        # Self hosted runner manages authentication, no need to worry about docker login
         run: |
           cd $IMAGE_DOWNLOAD_LOCATION
-          echo "Pushing $CORTEX_IMAGE and $ECR:latest"
+          echo "Pushing $CORTEX_IMAGE and $ECR/$REPO:latest"
           docker push $CORTEX_IMAGE
-          docker push $ECR:latest
+          docker push $ECR/$REPO:latest
       - name: Cleanup
         continue-on-error: true
         run: |
           rm -rf $IMAGE_DOWNLOAD_LOCATION
-          docker rmi $ECR:latest -f
+          docker rmi $ECR/$REPO:latest -f
           docker rmi $CORTEX_IMAGE -f
