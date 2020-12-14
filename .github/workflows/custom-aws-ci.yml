@@ -6,7 +6,6 @@ on:
       - v[0-9]+.[0-9]+.[0-9]+**
 env:
   REPO: cortex
-  GH_REF: ${{ github.ref }}
   IMAGE_DOWNLOAD_LOCATION: ../downloaded_images
 
 jobs:
@@ -80,11 +79,22 @@ jobs:
       env:
         ECR: ${{ env.ECR }}
     steps:
+      - run: echo "ECR=$ECR" >> $GITHUB_ENV
       - name: Checkout Repo
         uses: actions/checkout@v2
+
+      - name: Check out amp-builds
+        uses: actions/checkout@v2
+        with:
+          repository: aws-observability/amp-builds
+          path: amp-builds
+          token: ${{ secrets.MACHINE_PAT }}
+      
       - name: Generate Tag
-        shell: bash
-        run: ./.github/workflows/scripts/generate-tag.sh
+        uses: ./amp-builds/actions/generate-tag
+        with:
+          branch: master
+          ref: ${{ github.ref }}
       - name: Install Docker Client
         run: ./.github/workflows/scripts/install-docker.sh
       - name: Sym Link Expected Path to Workspace
@@ -96,18 +106,12 @@ jobs:
           touch build-image/.uptodate
           make BUILD_IN_CONTAINER=false
       - name: Save Image
-        shell: bash
-        run: |
-          cd ..
-          CORTEX_LOCAL_IMAGE="quay.io/cortexproject/cortex:$DOCKER_IMAGE_TAG"
-          CORTEX_IMAGE=$ECR/$REPO:$DOCKER_IMAGE_TAG
-          rm -rf docker-images; mkdir docker-images
-          echo "$CORTEX_LOCAL_IMAGE  ->  $CORTEX_IMAGE"
-          docker tag $CORTEX_LOCAL_IMAGE $CORTEX_IMAGE
-          docker save $CORTEX_IMAGE -o docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
-          echo $CORTEX_IMAGE > docker-images/image-name
-      - name: Create Docker Images Archive
-        run: cd .. && tar -cvf images.tar docker-images
+        uses: ./amp-builds/actions/save-image
+        with:
+          builtImage: quay.io/cortexproject/cortex:${{ env.DOCKER_IMAGE_TAG }}
+          awsImage: ${{ env.ECR }}/${{ env.REPO }}:${{ env.DOCKER_IMAGE_TAG }}
+          path: ".."
+          fileName: images.tar
       - name: Upload Docker Images Artifact
         uses: actions/upload-artifact@v2
         with:
@@ -116,9 +120,8 @@ jobs:
       - name: Cleanup
         continue-on-error: true
         run: |
+          rm -rf amp-builds
           rm ../images.tar
-          rm -rf ../docker-images
-          docker rmi "$ECR/$REPO:$DOCKER_IMAGE_TAG" -f
           docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep 'quay.io/cortexproject/')
   deploy:
     needs: [lint, secure, test, build]
@@ -131,24 +134,17 @@ jobs:
         with:
           name: Docker Images
           path: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
-      - name: Load Docker Image
-        run: |
-          cd $IMAGE_DOWNLOAD_LOCATION
-          tar -xvf images.tar
-          CORTEX_IMAGE=$(cat docker-images/image-name)
-          echo "CORTEX_IMAGE=$CORTEX_IMAGE" >> $GITHUB_ENV
-          docker load -i docker-images/$(echo $CORTEX_IMAGE | tr "/" _)
-          docker tag $CORTEX_IMAGE $ECR/$REPO:latest
-          docker images
+
+      - name: Check out amp-builds
+        uses: actions/checkout@v2
+        with:
+          repository: aws-observability/amp-builds
+          path: amp-builds
+          token: ${{ secrets.MACHINE_PAT }}
+
       - name: Push to ECR
-        run: |
-          cd $IMAGE_DOWNLOAD_LOCATION
-          echo "Pushing $CORTEX_IMAGE and $ECR/$REPO:latest"
-          docker push $CORTEX_IMAGE
-          docker push $ECR/$REPO:latest
-      - name: Cleanup
-        continue-on-error: true
-        run: |
-          rm -rf $IMAGE_DOWNLOAD_LOCATION
-          docker rmi $ECR/$REPO:latest -f
-          docker rmi $CORTEX_IMAGE -f
+        uses: ./amp-builds/actions/push-to-ecr
+        with:
+          imageDownloadLocation: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
+          repoName: ${{ env.REPO }}
+          tagLatest: true
