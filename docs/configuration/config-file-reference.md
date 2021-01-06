@@ -143,6 +143,13 @@ api:
 # The purger_config configures the purger which takes care of delete requests
 [purger: <purger_config>]
 
+tenant_federation:
+  # If enabled on all Cortex services, queries can be federated across multiple
+  # tenants. The tenant IDs involved need to be specified separated by a `|`
+  # character in the `X-Scope-OrgID` header (experimental).
+  # CLI flag: -tenant-federation.enabled
+  [enabled: <boolean> | default = false]
+
 # The ruler_config configures the Cortex ruler.
 [ruler: <ruler_config>]
 
@@ -549,6 +556,8 @@ ring:
 The `ingester_config` configures the Cortex ingester.
 
 ```yaml
+# Configures the Write-Ahead Log (WAL) for the Cortex chunks storage. This
+# config is ignored when running the Cortex blocks storage.
 walconfig:
   # Enable writing of ingested data into WAL.
   # CLI flag: -ingester.wal-enabled
@@ -786,7 +795,7 @@ The `querier_config` configures the Cortex querier.
 # CLI flag: -querier.query-store-for-labels-enabled
 [query_store_for_labels_enabled: <boolean> | default = false]
 
-# The time after which a metric should only be queried from storage and not just
+# The time after which a metric should be queried from storage and not just
 # ingesters. 0 means all queries are sent to store. When running the blocks
 # storage, if this option is enabled, the time range of the query sent to the
 # store will be manipulated to ensure the query end is not more recent than 'now
@@ -873,6 +882,11 @@ The `query_frontend_config` configures the Cortex query-frontend.
 # Max body size for downstream prometheus.
 # CLI flag: -frontend.max-body-size
 [max_body_size: <int> | default = 10485760]
+
+# True to enable query statistics tracking. When enabled, a message with some
+# statistics is logged for every query.
+# CLI flag: -frontend.query-stats-enabled
+[query_stats_enabled: <boolean> | default = false]
 
 # Maximum number of outstanding requests per tenant per frontend; requests
 # beyond this error with HTTP 429.
@@ -961,7 +975,8 @@ grpc_client_config:
 # CLI flag: -frontend.instance-interface-names
 [instance_interface_names: <list of string> | default = [eth0 en0]]
 
-# Compress HTTP responses.
+# This flag is about to be deprecated. Please use
+# -api.response-compression-enabled instead.
 # CLI flag: -querier.compress-http-responses
 [compress_responses: <boolean> | default = false]
 
@@ -1259,6 +1274,11 @@ storage:
       # CLI flag: -ruler.storage.s3.http.insecure-skip-verify
       [insecure_skip_verify: <boolean> | default = false]
 
+    # The signature version to use for authenticating against S3. Supported
+    # values are: v4, v2.
+    # CLI flag: -ruler.storage.s3.signature-version
+    [signature_version: <string> | default = "v4"]
+
   swift:
     # Openstack authentication URL.
     # CLI flag: -ruler.storage.swift.auth-url
@@ -1429,7 +1449,7 @@ ring:
   # CLI flag: -ruler.ring.instance-interface-names
   [instance_interface_names: <list of string> | default = [eth0 en0]]
 
-  # Number of tokens for each ingester.
+  # Number of tokens for each ruler.
   # CLI flag: -ruler.ring.num-tokens
   [num_tokens: <int> | default = 128]
 
@@ -1502,10 +1522,52 @@ storage:
   # The CLI flags prefix for this block config is: alertmanager
   [configdb: <configstore_config>]
 
-  local:
-    # Path at which alertmanager configurations are stored.
-    # CLI flag: -alertmanager.storage.local.path
-    [path: <string> | default = ""]
+  azure:
+    # Azure Cloud environment. Supported values are: AzureGlobal,
+    # AzureChinaCloud, AzureGermanCloud, AzureUSGovernment.
+    # CLI flag: -alertmanager.storage.azure.environment
+    [environment: <string> | default = "AzureGlobal"]
+
+    # Name of the blob container used to store chunks. This container must be
+    # created before running cortex.
+    # CLI flag: -alertmanager.storage.azure.container-name
+    [container_name: <string> | default = "cortex"]
+
+    # The Microsoft Azure account name to be used
+    # CLI flag: -alertmanager.storage.azure.account-name
+    [account_name: <string> | default = ""]
+
+    # The Microsoft Azure account key to use.
+    # CLI flag: -alertmanager.storage.azure.account-key
+    [account_key: <string> | default = ""]
+
+    # Preallocated buffer size for downloads.
+    # CLI flag: -alertmanager.storage.azure.download-buffer-size
+    [download_buffer_size: <int> | default = 512000]
+
+    # Preallocated buffer size for uploads.
+    # CLI flag: -alertmanager.storage.azure.upload-buffer-size
+    [upload_buffer_size: <int> | default = 256000]
+
+    # Number of buffers used to used to upload a chunk.
+    # CLI flag: -alertmanager.storage.azure.download-buffer-count
+    [upload_buffer_count: <int> | default = 1]
+
+    # Timeout for requests made against azure blob storage.
+    # CLI flag: -alertmanager.storage.azure.request-timeout
+    [request_timeout: <duration> | default = 30s]
+
+    # Number of retries for a request which times out.
+    # CLI flag: -alertmanager.storage.azure.max-retries
+    [max_retries: <int> | default = 5]
+
+    # Minimum time to wait before retrying a request.
+    # CLI flag: -alertmanager.storage.azure.min-retry-delay
+    [min_retry_delay: <duration> | default = 10ms]
+
+    # Maximum time to wait before retrying a request.
+    # CLI flag: -alertmanager.storage.azure.max-retry-delay
+    [max_retry_delay: <duration> | default = 500ms]
 
   gcs:
     # Name of GCS bucket. Please refer to
@@ -1576,6 +1638,16 @@ storage:
       # Set to false to skip verifying the certificate chain and hostname.
       # CLI flag: -alertmanager.storage.s3.http.insecure-skip-verify
       [insecure_skip_verify: <boolean> | default = false]
+
+    # The signature version to use for authenticating against S3. Supported
+    # values are: v4, v2.
+    # CLI flag: -alertmanager.storage.s3.signature-version
+    [signature_version: <string> | default = "v4"]
+
+  local:
+    # Path at which alertmanager configurations are stored.
+    # CLI flag: -alertmanager.storage.local.path
+    [path: <string> | default = ""]
 
 # Enable the experimental alertmanager config api.
 # CLI flag: -experimental.alertmanager.enable-api
@@ -2053,6 +2125,11 @@ aws:
     # Set to false to skip verifying the certificate chain and hostname.
     # CLI flag: -s3.http.insecure-skip-verify
     [insecure_skip_verify: <boolean> | default = false]
+
+  # The signature version to use for authenticating against S3. Supported values
+  # are: v4, v2.
+  # CLI flag: -s3.signature-version
+  [signature_version: <string> | default = "v4"]
 
 azure:
   # Azure Cloud environment. Supported values are: AzureGlobal, AzureChinaCloud,
@@ -2957,6 +3034,11 @@ The `memberlist_config` configures the Gossip memberlist.
 # CLI flag: -memberlist.leave-timeout
 [leave_timeout: <duration> | default = 5s]
 
+# How much space to use for keeping received and sent messages in memory for
+# troubleshooting (two buffers). 0 to disable.
+# CLI flag: -memberlist.message-history-buffer-bytes
+[message_history_buffer_bytes: <int> | default = 0]
+
 # IP address to listen on for gossip messages. Multiple addresses may be
 # specified. Defaults to 0.0.0.0
 # CLI flag: -memberlist.bind-addr
@@ -3593,15 +3675,16 @@ filesystem:
   # CLI flag: -blocks-storage.filesystem.dir
   [dir: <string> | default = ""]
 
-# This configures how the store-gateway synchronizes blocks stored in the
-# bucket.
+# This configures how the querier and store-gateway discover and synchronize
+# blocks stored in the bucket.
 bucket_store:
   # Directory to store synchronized TSDB index headers.
   # CLI flag: -blocks-storage.bucket-store.sync-dir
   [sync_dir: <string> | default = "tsdb-sync"]
 
-  # How frequently scan the bucket to look for changes (new blocks shipped by
-  # ingesters and blocks removed by retention or compaction). 0 disables it.
+  # How frequently scan the bucket - or fetch the bucket index (if enabled) - to
+  # look for changes (new blocks shipped by ingesters and blocks removed by
+  # retention or compaction). 0 disables it.
   # CLI flag: -blocks-storage.bucket-store.sync-interval
   [sync_interval: <duration> | default = 5m]
 
@@ -3816,11 +3899,13 @@ bucket_store:
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.chunks-list-ttl
     [chunks_list_ttl: <duration> | default = 24h]
 
-    # How long to cache information that block metafile exists.
+    # How long to cache information that block metafile exists. Also used for
+    # user deletion mark file.
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-exists-ttl
     [metafile_exists_ttl: <duration> | default = 2h]
 
-    # How long to cache information that block metafile doesn't exist.
+    # How long to cache information that block metafile doesn't exist. Also used
+    # for user deletion mark file.
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-doesnt-exist-ttl
     [metafile_doesnt_exist_ttl: <duration> | default = 5m]
 
@@ -3828,13 +3913,33 @@ bucket_store:
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-content-ttl
     [metafile_content_ttl: <duration> | default = 24h]
 
-    # Maximum size of metafile content to cache in bytes.
+    # Maximum size of metafile content to cache in bytes. Caching will be
+    # skipped if the content exceeds this size. This is useful to avoid network
+    # round trip for large content if the configured caching backend has an hard
+    # limit on cached items size (in this case, you should set this limit to the
+    # same limit in the caching backend).
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-max-size-bytes
     [metafile_max_size_bytes: <int> | default = 1048576]
 
     # How long to cache attributes of the block metafile.
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl
     [metafile_attributes_ttl: <duration> | default = 168h]
+
+    # How long to cache attributes of the block index.
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
+    [block_index_attributes_ttl: <duration> | default = 168h]
+
+    # How long to cache content of the bucket index.
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
+    [bucket_index_content_ttl: <duration> | default = 5m]
+
+    # Maximum size of bucket index content to cache in bytes. Caching will be
+    # skipped if the content exceeds this size. This is useful to avoid network
+    # round trip for large content if the configured caching backend has an hard
+    # limit on cached items size (in this case, you should set this limit to the
+    # same limit in the caching backend).
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-max-size-bytes
+    [bucket_index_max_size_bytes: <int> | default = 1048576]
 
   # Duration after which the blocks marked for deletion will be filtered out
   # while fetching blocks. The idea of ignore-deletion-marks-delay is to ignore
@@ -3844,6 +3949,35 @@ bucket_store:
   # -compactor.deletion-delay.
   # CLI flag: -blocks-storage.bucket-store.ignore-deletion-marks-delay
   [ignore_deletion_mark_delay: <duration> | default = 6h]
+
+  bucket_index:
+    # True to enable querier and store-gateway to discover blocks in the storage
+    # via bucket index instead of bucket scanning.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.enabled
+    [enabled: <boolean> | default = false]
+
+    # How frequently a cached bucket index should be refreshed. This option is
+    # used only by querier.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-stale-interval
+    [update_on_stale_interval: <duration> | default = 15m]
+
+    # How frequently a bucket index, which previously failed to load, should be
+    # tried to load again. This option is used only by querier.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-error-interval
+    [update_on_error_interval: <duration> | default = 1m]
+
+    # How long a unused bucket index should be cached. Once this timeout
+    # expires, the unused bucket index is removed from the in-memory cache. This
+    # option is used only by querier.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.idle-timeout
+    [idle_timeout: <duration> | default = 1h]
+
+    # The maximum allowed age of a bucket index (last updated) before queries
+    # start failing because the bucket index is too old. The bucket index is
+    # periodically updated by the compactor, while this check is enforced in the
+    # querier (at query time).
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.max-stale-period
+    [max_stale_period: <duration> | default = 1h]
 
 tsdb:
   # Local directory to store TSDBs in the ingesters.
@@ -3955,8 +4089,7 @@ The `compactor_config` configures the compactor for the blocks storage.
 # CLI flag: -compactor.compaction-interval
 [compaction_interval: <duration> | default = 1h]
 
-# How many times to retry a failed compaction during a single compaction
-# interval
+# How many times to retry a failed compaction within a single compaction run.
 # CLI flag: -compactor.compaction-retries
 [compaction_retries: <int> | default = 3]
 
@@ -3964,19 +4097,35 @@ The `compactor_config` configures the compactor for the blocks storage.
 # CLI flag: -compactor.compaction-concurrency
 [compaction_concurrency: <int> | default = 1]
 
-# Max number of tenants for which blocks should be cleaned up concurrently
-# (deletion of blocks previously marked for deletion).
+# How frequently compactor should run blocks cleanup and maintenance, as well as
+# update the bucket index.
+# CLI flag: -compactor.cleanup-interval
+[cleanup_interval: <duration> | default = 15m]
+
+# Max number of tenants for which blocks cleanup and maintenance should run
+# concurrently.
 # CLI flag: -compactor.cleanup-concurrency
 [cleanup_concurrency: <int> | default = 20]
 
 # Time before a block marked for deletion is deleted from bucket. If not 0,
-# blocks will be marked for deletion and compactor component will delete blocks
-# marked for deletion from the bucket. If delete-delay is 0, blocks will be
+# blocks will be marked for deletion and compactor component will permanently
+# delete blocks marked for deletion from the bucket. If 0, blocks will be
 # deleted straight away. Note that deleting blocks immediately can cause query
-# failures, if store gateway still has the block loaded, or compactor is
-# ignoring the deletion because it's compacting the block at the same time.
+# failures.
 # CLI flag: -compactor.deletion-delay
 [deletion_delay: <duration> | default = 12h]
+
+# For tenants marked for deletion, this is time between deleting of last block,
+# and doing final cleanup (marker files, debug files) of the tenant.
+# CLI flag: -compactor.tenant-cleanup-delay
+[tenant_cleanup_delay: <duration> | default = 6h]
+
+# When enabled, at compactor startup the bucket will be scanned and all found
+# deletion marks inside the block location will be copied to the markers global
+# location too. This option can (and should) be safely disabled as soon as the
+# compactor has successfully run at least once.
+# CLI flag: -compactor.block-deletion-marks-migration-enabled
+[block_deletion_marks_migration_enabled: <boolean> | default = true]
 
 # Comma separated list of tenants that can be compacted. If specified, only
 # these tenants will be compacted by compactor, otherwise all tenants can be

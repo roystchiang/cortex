@@ -12,6 +12,8 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
+	querier_stats "github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -82,8 +84,11 @@ func (fp *frontendProcessor) process(c frontendv1pb.Frontend_ProcessClient) erro
 			// and cancel the query.  We don't actually handle queries in parallel
 			// here, as we're running in lock step with the server - each Recv is
 			// paired with a Send.
-			go fp.runRequest(ctx, request.HttpRequest, func(response *httpgrpc.HTTPResponse) error {
-				return c.Send(&frontendv1pb.ClientToFrontend{HttpResponse: response})
+			go fp.runRequest(ctx, request.HttpRequest, request.StatsEnabled, func(response *httpgrpc.HTTPResponse, stats *stats.Stats) error {
+				return c.Send(&frontendv1pb.ClientToFrontend{
+					HttpResponse: response,
+					Stats:        stats,
+				})
 			})
 
 		case frontendv1pb.GET_ID:
@@ -98,7 +103,12 @@ func (fp *frontendProcessor) process(c frontendv1pb.Frontend_ProcessClient) erro
 	}
 }
 
-func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.HTTPRequest, sendHTTPResponse func(response *httpgrpc.HTTPResponse) error) {
+func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.HTTPRequest, statsEnabled bool, sendHTTPResponse func(response *httpgrpc.HTTPResponse, stats *stats.Stats) error) {
+	var stats *querier_stats.Stats
+	if statsEnabled {
+		stats, ctx = querier_stats.ContextWithEmptyStats(ctx)
+	}
+
 	response, err := fp.handler.Handle(ctx, request)
 	if err != nil {
 		var ok bool
@@ -121,7 +131,7 @@ func (fp *frontendProcessor) runRequest(ctx context.Context, request *httpgrpc.H
 		level.Error(fp.log).Log("msg", "error processing query", "err", errMsg)
 	}
 
-	if err := sendHTTPResponse(response); err != nil {
+	if err := sendHTTPResponse(response, stats); err != nil {
 		level.Error(fp.log).Log("msg", "error processing requests", "err", err)
 	}
 }

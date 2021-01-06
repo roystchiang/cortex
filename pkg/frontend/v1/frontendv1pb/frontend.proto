@@ -8,6 +8,7 @@ option go_package = "frontendv1pb";
 
 import "github.com/gogo/protobuf/gogoproto/gogo.proto";
 import "github.com/weaveworks/common/httpgrpc/httpgrpc.proto";
+import "github.com/cortexproject/cortex/pkg/querier/stats/stats.proto";
 
 option (gogoproto.marshaler_all) = true;
 option (gogoproto.unmarshaler_all) = true;
@@ -26,9 +27,14 @@ enum Type {
 message FrontendToClient {
   httpgrpc.HTTPRequest httpRequest = 1;
   Type type = 2;
+
+  // Whether query statistics tracking should be enabled. The response will include
+  // statistics only when this option is enabled.
+  bool statsEnabled = 3;
 }
 
 message ClientToFrontend {
   httpgrpc.HTTPResponse httpResponse = 1;
   string clientID = 2;
+  stats.Stats stats = 3;
 }

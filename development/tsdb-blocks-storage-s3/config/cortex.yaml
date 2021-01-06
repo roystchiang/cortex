@@ -101,6 +101,8 @@ compactor:
   data_dir:            /tmp/cortex-compactor
   consistency_delay:   1m
   sharding_enabled:    true
+  cleanup_interval:    1m
+  tenant_cleanup_delay: 1m
   sharding_ring:
     kvstore:
       store: consul
@@ -117,6 +119,9 @@ store_gateway:
       store: consul
       consul:
         host: consul:8500
+
+frontend:
+  query_stats_enabled: true
 
 frontend_worker:
   frontend_address: "query-frontend:9007"

@@ -12,6 +12,7 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc"
 
+	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
 	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -260,6 +261,7 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				UserID:          req.userID,
 				HttpRequest:     req.request,
 				FrontendAddress: w.frontendAddr,
+				StatsEnabled:    req.statsEnabled,
 			})
 
 			if err != nil {
@@ -285,16 +287,20 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
-				req.response <- &httpgrpc.HTTPResponse{
-					Code: http.StatusInternalServerError,
-					Body: []byte(err.Error()),
+				req.response <- &frontendv2pb.QueryResultRequest{
+					HttpResponse: &httpgrpc.HTTPResponse{
+						Code: http.StatusInternalServerError,
+						Body: []byte(err.Error()),
+					},
 				}
 
 			case schedulerpb.TOO_MANY_REQUESTS_PER_TENANT:
 				req.enqueue <- enqueueResult{status: waitForResponse}
-				req.response <- &httpgrpc.HTTPResponse{
-					Code: http.StatusTooManyRequests,
-					Body: []byte("too many outstanding requests"),
+				req.response <- &frontendv2pb.QueryResultRequest{
+					HttpResponse: &httpgrpc.HTTPResponse{
+						Code: http.StatusTooManyRequests,
+						Body: []byte("too many outstanding requests"),
+					},
 				}
 			}
 

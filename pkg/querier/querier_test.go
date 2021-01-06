@@ -161,7 +161,7 @@ func TestQuerier(t *testing.T) {
 
 						queryables := []QueryableWithFilter{UseAlwaysQueryable(NewChunkStoreQueryable(cfg, chunkStore)), UseAlwaysQueryable(db)}
 						queryable, _ := New(cfg, overrides, distributor, queryables, purger.NewTombstonesLoader(nil, nil), nil)
-						testQuery(t, queryable, through, query)
+						testRangeQuery(t, queryable, through, query)
 					})
 				}
 			}
@@ -484,7 +484,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 	now := time.Now()
 
 	tests := map[string]struct {
-		maxQueryLookback          time.Duration
+		maxQueryLookback          model.Duration
 		query                     string
 		queryStartTime            time.Time
 		queryEndTime              time.Time
@@ -495,7 +495,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 		expectedMetadataEndTime   time.Time
 	}{
 		"should not manipulate time range for a query on short time range and rate time window close to the limit": {
-			maxQueryLookback:          thirtyDays,
+			maxQueryLookback:          model.Duration(thirtyDays),
 			query:                     "rate(foo[29d])",
 			queryStartTime:            now.Add(-time.Hour),
 			queryEndTime:              now,
@@ -505,7 +505,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 			expectedMetadataEndTime:   now,
 		},
 		"should not manipulate a query on large time range close to the limit and short rate time window": {
-			maxQueryLookback:          thirtyDays,
+			maxQueryLookback:          model.Duration(thirtyDays),
 			query:                     "rate(foo[1m])",
 			queryStartTime:            now.Add(-thirtyDays).Add(time.Hour),
 			queryEndTime:              now,
@@ -515,7 +515,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 			expectedMetadataEndTime:   now,
 		},
 		"should manipulate a query on short time range and rate time window over the limit": {
-			maxQueryLookback:          thirtyDays,
+			maxQueryLookback:          model.Duration(thirtyDays),
 			query:                     "rate(foo[31d])",
 			queryStartTime:            now.Add(-time.Hour),
 			queryEndTime:              now,
@@ -525,7 +525,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 			expectedMetadataEndTime:   now,
 		},
 		"should manipulate a query on large time range over the limit and short rate time window": {
-			maxQueryLookback:          thirtyDays,
+			maxQueryLookback:          model.Duration(thirtyDays),
 			query:                     "rate(foo[1m])",
 			queryStartTime:            now.Add(-thirtyDays).Add(-100 * time.Hour),
 			queryEndTime:              now,
@@ -535,7 +535,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 			expectedMetadataEndTime:   now,
 		},
 		"should skip executing a query outside the allowed time range": {
-			maxQueryLookback: thirtyDays,
+			maxQueryLookback: model.Duration(thirtyDays),
 			query:            "rate(foo[1m])",
 			queryStartTime:   now.Add(-thirtyDays).Add(-100 * time.Hour),
 			queryEndTime:     now.Add(-thirtyDays).Add(-90 * time.Hour),
@@ -702,7 +702,7 @@ func mockDistibutorFor(t *testing.T, cs mockChunkStore, through model.Time) *moc
 	return result
 }
 
-func testQuery(t testing.TB, queryable storage.Queryable, end model.Time, q query) *promql.Result {
+func testRangeQuery(t testing.TB, queryable storage.Queryable, end model.Time, q query) *promql.Result {
 	dir, err := ioutil.TempDir("", "test_query")
 	assert.NoError(t, err)
 	defer os.RemoveAll(dir)

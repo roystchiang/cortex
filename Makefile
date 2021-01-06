@@ -19,10 +19,6 @@ IMAGE_PREFIX ?= quay.io/cortexproject/
 ifneq (,$(findstring refs/tags/, $(GITHUB_REF)))
 	GIT_TAG := $(shell git tag --points-at HEAD)
 endif
-# Keep circle-ci compatability for now.
-ifdef CIRCLE_TAG
-	GIT_TAG := $(CIRCLE_TAG)
-endif
 IMAGE_TAG ?= $(if $(GIT_TAG),$(GIT_TAG),$(shell ./tools/image-tag))
 GIT_REVISION := $(shell git rev-parse --short HEAD)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
@@ -81,6 +77,7 @@ pkg/ring/ring.pb.go: pkg/ring/ring.proto
 pkg/frontend/v1/frontendv1pb/frontend.pb.go: pkg/frontend/v1/frontendv1pb/frontend.proto
 pkg/frontend/v2/frontendv2pb/frontend.pb.go: pkg/frontend/v2/frontendv2pb/frontend.proto
 pkg/querier/queryrange/queryrange.pb.go: pkg/querier/queryrange/queryrange.proto
+pkg/querier/stats/stats.pb.go: pkg/querier/stats/stats.proto
 pkg/chunk/storage/caching_index_client.pb.go: pkg/chunk/storage/caching_index_client.proto
 pkg/distributor/ha_tracker.pb.go: pkg/distributor/ha_tracker.proto
 pkg/ruler/rules/rules.pb.go: pkg/ruler/rules/rules.proto
@@ -102,10 +99,6 @@ build-image/$(UPTODATE): build-image/*
 SUDO := $(shell docker info >/dev/null 2>&1 || echo "sudo -E")
 BUILD_IN_CONTAINER := true
 BUILD_IMAGE ?= $(IMAGE_PREFIX)build-image
-# RM is parameterized to allow CircleCI to run builds, as it
-# currently disallows `docker run --rm`. This value is overridden
-# in circle.yml
-RM := --rm
 # TTY is parameterized to allow Google Cloud Builder to run builds,
 # as it currently disallows TTY devices. This value needs to be overridden
 # in any custom cloudbuild.yaml files
@@ -123,7 +116,7 @@ exes $(EXES) protos $(PROTO_GOS) lint test shell mod-check check-protos web-buil
 	@mkdir -p $(shell pwd)/.cache
 	@echo
 	@echo ">>>> Entering build container: $@"
-	@$(SUDO) time docker run $(RM) $(TTY) -i $(GOVOLUMES) $(BUILD_IMAGE) $@;
+	@$(SUDO) time docker run --rm $(TTY) -i $(GOVOLUMES) $(BUILD_IMAGE) $@;
 
 configs-integration-test: build-image/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
@@ -131,14 +124,14 @@ configs-integration-test: build-image/$(UPTODATE)
 	@DB_CONTAINER="$$(docker run -d -e 'POSTGRES_DB=configs_test' postgres:9.6.16)"; \
 	echo ; \
 	echo ">>>> Entering build container: $@"; \
-	$(SUDO) docker run $(RM) $(TTY) -i $(GOVOLUMES) \
+	$(SUDO) docker run --rm $(TTY) -i $(GOVOLUMES) \
 		-v $(shell pwd)/cmd/cortex/migrations:/migrations:z \
 		--workdir /go/src/github.com/cortexproject/cortex \
 		--link "$$DB_CONTAINER":configs-db.cortex.local \
 		-e DB_ADDR=configs-db.cortex.local \
 		$(BUILD_IMAGE) $@; \
 	status=$$?; \
-	test -n "$(CIRCLECI)" || docker rm -f "$$DB_CONTAINER"; \
+	docker rm -f "$$DB_CONTAINER"; \
 	exit $$status
 
 else
@@ -165,7 +158,8 @@ lint:
 	GOFLAGS="-tags=requires_docker" faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
 		golang.org/x/net/context=context,\
 		sync/atomic=go.uber.org/atomic,\
-		github.com/weaveworks/common/user.{ExtractOrgID}=github.com/cortexproject/cortex/pkg/tenant.{TenantID},\
+		github.com/prometheus/client_golang/prometheus.{MultiError}=github.com/prometheus/prometheus/tsdb/errors.{NewMulti},\
+		github.com/weaveworks/common/user.{ExtractOrgID}=github.com/cortexproject/cortex/pkg/tenant.{TenantID,TenantIDs},\
 		github.com/weaveworks/common/user.{ExtractOrgIDFromHTTPRequest}=github.com/cortexproject/cortex/pkg/tenant.{ExtractTenantIDFromHTTPRequest}" ./pkg/... ./cmd/... ./tools/... ./integration/...
 
 	# Ensure clean pkg structure.
@@ -178,6 +172,14 @@ lint:
 		./pkg/querier/...
 	faillint -paths "github.com/cortexproject/cortex/pkg/querier/..." ./pkg/scheduler/...
 	faillint -paths "github.com/cortexproject/cortex/pkg/storage/tsdb/..." ./pkg/storage/bucket/...
+
+	# Ensure the query path is supporting multiple tenants
+	faillint -paths "\
+		github.com/cortexproject/cortex/pkg/tenant.{TenantID}=github.com/cortexproject/cortex/pkg/tenant.{TenantIDs}" \
+		./pkg/scheduler/... \
+		./pkg/frontend/... \
+		./pkg/querier/tenantfederation/... \
+		./pkg/querier/queryrange/...
 
 	# Validate Kubernetes spec files. Requires:
 	# https://kubeval.instrumenta.dev
@@ -264,7 +266,7 @@ check-white-noise: clean-white-noise
 	@git diff --exit-code --quiet -- '*.md' || (echo "Please remove trailing whitespaces running 'make clean-white-noise'" && false)
 
 web-serve:
-	cd website && hugo --config config.toml -v server
+	cd website && hugo --config config.toml --minify -v server
 
 # Generate binaries for a Cortex release
 dist dist/cortex-linux-amd64 dist/cortex-darwin-amd64 dist/query-tee-linux-amd64 dist/query-tee-darwin-amd64 dist/cortex-linux-amd64-sha-256 dist/cortex-darwin-amd64-sha-256 dist/query-tee-linux-amd64-sha-256 dist/query-tee-darwin-amd64-sha-256:
@@ -297,7 +299,7 @@ packages: dist/cortex-linux-amd64 packaging/fpm/$(UPTODATE)
 	@mkdir -p $(shell pwd)/.pkg
 	@mkdir -p $(shell pwd)/.cache
 	@echo ">>>> Entering build container: $@"
-	@$(SUDO) time docker run $(RM) $(TTY) \
+	@$(SUDO) time docker run --rm $(TTY) \
 		-v  $(shell pwd):/src/github.com/cortexproject/cortex:delegated,z \
 		-i $(PACKAGE_IMAGE) $@;
 
