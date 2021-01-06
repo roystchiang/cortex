@@ -30,6 +30,9 @@ const (
 
 	// How often are open TSDBs checked for being idle and closed.
 	DefaultCloseIdleTSDBInterval = 5 * time.Minute
+
+	// How often to check for tenant deletion mark.
+	DeletionMarkCheckInterval = 1 * time.Hour
 )
 
 // Validation errors
@@ -47,7 +50,7 @@ var (
 //nolint:golint
 type BlocksStorageConfig struct {
 	Bucket      bucket.Config     `yaml:",inline"`
-	BucketStore BucketStoreConfig `yaml:"bucket_store" doc:"description=This configures how the store-gateway synchronizes blocks stored in the bucket."`
+	BucketStore BucketStoreConfig `yaml:"bucket_store" doc:"description=This configures how the querier and store-gateway discover and synchronize blocks stored in the bucket."`
 	TSDB        TSDBConfig        `yaml:"tsdb"`
 }
 
@@ -203,7 +206,7 @@ func (cfg *TSDBConfig) BlocksDir(userID string) string {
 	return filepath.Join(cfg.Dir, userID)
 }
 
-// BucketStoreConfig holds the config information for Bucket Stores used by the querier
+// BucketStoreConfig holds the config information for Bucket Stores used by the querier and store-gateway.
 type BucketStoreConfig struct {
 	SyncDir                  string              `yaml:"sync_dir"`
 	SyncInterval             time.Duration       `yaml:"sync_interval"`
@@ -217,6 +220,7 @@ type BucketStoreConfig struct {
 	ChunksCache              ChunksCacheConfig   `yaml:"chunks_cache"`
 	MetadataCache            MetadataCacheConfig `yaml:"metadata_cache"`
 	IgnoreDeletionMarksDelay time.Duration       `yaml:"ignore_deletion_mark_delay"`
+	BucketIndex              BucketIndexConfig   `yaml:"bucket_index"`
 
 	// Controls whether index-header lazy loading is enabled. This config option is hidden
 	// while it is marked as experimental.
@@ -236,9 +240,10 @@ func (cfg *BucketStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.IndexCache.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.index-cache.")
 	cfg.ChunksCache.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.chunks-cache.")
 	cfg.MetadataCache.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.metadata-cache.")
+	cfg.BucketIndex.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.bucket-index.")
 
 	f.StringVar(&cfg.SyncDir, "blocks-storage.bucket-store.sync-dir", "tsdb-sync", "Directory to store synchronized TSDB index headers.")
-	f.DurationVar(&cfg.SyncInterval, "blocks-storage.bucket-store.sync-interval", 5*time.Minute, "How frequently scan the bucket to look for changes (new blocks shipped by ingesters and blocks removed by retention or compaction). 0 disables it.")
+	f.DurationVar(&cfg.SyncInterval, "blocks-storage.bucket-store.sync-interval", 5*time.Minute, "How frequently scan the bucket - or fetch the bucket index (if enabled) - to look for changes (new blocks shipped by ingesters and blocks removed by retention or compaction). 0 disables it.")
 	f.Uint64Var(&cfg.MaxChunkPoolBytes, "blocks-storage.bucket-store.max-chunk-pool-bytes", uint64(2*units.Gibibyte), "Max size - in bytes - of a per-tenant chunk pool, used to reduce memory allocations.")
 	f.IntVar(&cfg.MaxConcurrent, "blocks-storage.bucket-store.max-concurrent", 100, "Max number of concurrent queries to execute against the long-term storage. The limit is shared across all tenants.")
 	f.IntVar(&cfg.TenantSyncConcurrency, "blocks-storage.bucket-store.tenant-sync-concurrency", 10, "Maximum number of concurrent tenants synching blocks.")
@@ -268,4 +273,20 @@ func (cfg *BucketStoreConfig) Validate() error {
 		return errors.Wrap(err, "metadata-cache configuration")
 	}
 	return nil
+}
+
+type BucketIndexConfig struct {
+	Enabled               bool          `yaml:"enabled"`
+	UpdateOnStaleInterval time.Duration `yaml:"update_on_stale_interval"`
+	UpdateOnErrorInterval time.Duration `yaml:"update_on_error_interval"`
+	IdleTimeout           time.Duration `yaml:"idle_timeout"`
+	MaxStalePeriod        time.Duration `yaml:"max_stale_period"`
+}
+
+func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
+	f.BoolVar(&cfg.Enabled, prefix+"enabled", false, "True to enable querier and store-gateway to discover blocks in the storage via bucket index instead of bucket scanning.")
+	f.DurationVar(&cfg.UpdateOnStaleInterval, prefix+"update-on-stale-interval", 15*time.Minute, "How frequently a cached bucket index should be refreshed. This option is used only by querier.")
+	f.DurationVar(&cfg.UpdateOnErrorInterval, prefix+"update-on-error-interval", time.Minute, "How frequently a bucket index, which previously failed to load, should be tried to load again. This option is used only by querier.")
+	f.DurationVar(&cfg.IdleTimeout, prefix+"idle-timeout", time.Hour, "How long a unused bucket index should be cached. Once this timeout expires, the unused bucket index is removed from the in-memory cache. This option is used only by querier.")
+	f.DurationVar(&cfg.MaxStalePeriod, prefix+"max-stale-period", time.Hour, "The maximum allowed age of a bucket index (last updated) before queries start failing because the bucket index is too old. The bucket index is periodically updated by the compactor, while this check is enforced in the querier (at query time).")
 }

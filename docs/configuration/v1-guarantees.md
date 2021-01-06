@@ -61,3 +61,9 @@ Currently experimental features are:
 - Ingester: do not unregister from ring on shutdown (`-ingester.unregister-on-shutdown=false`)
 - Distributor: do not extend writes on unhealthy ingesters (`-distributor.extend-writes=false`)
 - Ingester: close idle TSDB and remove them from local disk (`-blocks-storage.tsdb.close-idle-tsdb-timeout`)
+- Tenant Deletion in Purger, for blocks storage.
+- Query-frontend: query stats tracking (`-frontend.query-stats-enabled`)
+- Blocks storage bucket index
+  - The bucket index support in the querier and store-gateway (enabled via `-blocks-storage.bucket-store.bucket-index.enabled=true`) is experimental
+  - The block deletion marks migration support in the compactor (`-compactor.block-deletion-marks-migration-enabled`) is temporarily and will be removed in future versions
+- Querier: tenant federation

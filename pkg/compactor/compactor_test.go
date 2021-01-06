@@ -1,14 +1,16 @@
 package compactor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -138,8 +140,8 @@ func TestCompactor_ShouldDoNothingOnNoUserBlocks(t *testing.T) {
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), c))
 
 	assert.Equal(t, []string{
-		`level=info component=cleaner msg="started hard deletion of blocks marked for deletion"`,
-		`level=info component=cleaner msg="successfully completed hard deletion of blocks marked for deletion"`,
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner msg="successfully completed blocks cleanup and maintenance"`,
 		`level=info component=compactor msg="discovering users from bucket"`,
 		`level=info component=compactor msg="discovered users from bucket" users=0`,
 	}, strings.Split(strings.TrimSpace(logs.String()), "\n"))
@@ -284,12 +286,8 @@ func TestCompactor_ShouldRetryCompactionOnFailureWhileDiscoveringUsersFromBucket
 	bucketClient.AssertNumberOfCalls(t, "Iter", 1+3)
 
 	assert.Equal(t, []string{
-		`level=info component=cleaner msg="started hard deletion of blocks marked for deletion"`,
-		`level=error component=cleaner msg="failed to hard delete blocks marked for deletion" err="failed to discover users from bucket: failed to iterate the bucket"`,
-		`level=info component=compactor msg="discovering users from bucket"`,
-		`level=error component=compactor msg="failed to discover users from bucket" err="failed to iterate the bucket"`,
-		`level=info component=compactor msg="discovering users from bucket"`,
-		`level=error component=compactor msg="failed to discover users from bucket" err="failed to iterate the bucket"`,
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=error component=cleaner msg="failed to run blocks cleanup and maintenance" err="failed to discover users from bucket: failed to iterate the bucket"`,
 		`level=info component=compactor msg="discovering users from bucket"`,
 		`level=error component=compactor msg="failed to discover users from bucket" err="failed to iterate the bucket"`,
 	}, strings.Split(strings.TrimSpace(logs.String()), "\n"))
@@ -418,12 +416,20 @@ func TestCompactor_ShouldIterateOverUsersAndRunCompaction(t *testing.T) {
 	// Mock the bucket to contain two users, each one with one block.
 	bucketClient := &bucket.ClientMock{}
 	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+	bucketClient.MockExists(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), false, nil)
+	bucketClient.MockExists(path.Join("user-2", cortex_tsdb.TenantDeletionMarkPath), false, nil)
 	bucketClient.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D"}, nil)
 	bucketClient.MockIter("user-2/", []string{"user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ"}, nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/deletion-mark.json", "", nil)
 	bucketClient.MockGet("user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json", mockBlockMetaJSON("01DTW0ZCPDDNV4BV83Q2SV4QAZ"), nil)
 	bucketClient.MockGet("user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json", "", nil)
+	bucketClient.MockGet("user-1/bucket-index.json.gz", "", nil)
+	bucketClient.MockGet("user-2/bucket-index.json.gz", "", nil)
+	bucketClient.MockIter("user-1/markers/", nil, nil)
+	bucketClient.MockIter("user-2/markers/", nil, nil)
+	bucketClient.MockUpload("user-1/bucket-index.json.gz", nil)
+	bucketClient.MockUpload("user-2/bucket-index.json.gz", nil)
 
 	c, _, tsdbPlanner, logs, registry, cleanup := prepare(t, prepareConfig(), bucketClient)
 	defer cleanup()
@@ -447,12 +453,12 @@ func TestCompactor_ShouldIterateOverUsersAndRunCompaction(t *testing.T) {
 	tsdbPlanner.AssertNumberOfCalls(t, "Plan", 2)
 
 	assert.ElementsMatch(t, []string{
-		`level=info component=cleaner msg="started hard deletion of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-1 msg="started cleaning of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-1 msg="cleaning of blocks marked for deletion done"`,
-		`level=info component=cleaner org_id=user-2 msg="started cleaning of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-2 msg="cleaning of blocks marked for deletion done"`,
-		`level=info component=cleaner msg="successfully completed hard deletion of blocks marked for deletion"`,
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="completed blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-2 msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-2 msg="completed blocks cleanup and maintenance"`,
+		`level=info component=cleaner msg="successfully completed blocks cleanup and maintenance"`,
 		`level=info component=compactor msg="discovering users from bucket"`,
 		`level=info component=compactor msg="discovered users from bucket" users=2`,
 		`level=info component=compactor msg="starting compaction of user blocks" user=user-1`,
@@ -467,7 +473,7 @@ func TestCompactor_ShouldIterateOverUsersAndRunCompaction(t *testing.T) {
 		`level=info component=compactor org_id=user-2 msg="start of compactions"`,
 		`level=info component=compactor org_id=user-2 msg="compaction iterations done"`,
 		`level=info component=compactor msg="successfully compacted user blocks" user=user-2`,
-	}, removeMetaFetcherLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
+	}, removeIgnoredLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
 
 	// Instead of testing for shipper metrics, we only check our metrics here.
 	// Real shipper metrics are too variable to embed into a test.
@@ -525,16 +531,32 @@ func TestCompactor_ShouldNotCompactBlocksMarkedForDeletion(t *testing.T) {
 	bucketClient := &bucket.ClientMock{}
 	bucketClient.MockIter("", []string{"user-1"}, nil)
 	bucketClient.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D", "user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ"}, nil)
+	bucketClient.MockExists(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), false, nil)
 
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/deletion-mark.json", mockDeletionMarkJSON("01DTVP434PA9VFXSW2JKB3392D", time.Now()), nil)
+	bucketClient.MockGet("user-1/markers/01DTVP434PA9VFXSW2JKB3392D-deletion-mark.json", mockDeletionMarkJSON("01DTVP434PA9VFXSW2JKB3392D", time.Now()), nil)
 
 	bucketClient.MockGet("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json", mockBlockMetaJSON("01DTW0ZCPDDNV4BV83Q2SV4QAZ"), nil)
 	bucketClient.MockGet("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json", mockDeletionMarkJSON("01DTW0ZCPDDNV4BV83Q2SV4QAZ", time.Now().Add(-cfg.DeletionDelay)), nil)
-	bucketClient.MockIter("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ", []string{"user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json", "user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json"}, nil)
+	bucketClient.MockGet("user-1/markers/01DTW0ZCPDDNV4BV83Q2SV4QAZ-deletion-mark.json", mockDeletionMarkJSON("01DTW0ZCPDDNV4BV83Q2SV4QAZ", time.Now().Add(-cfg.DeletionDelay)), nil)
+
+	bucketClient.MockIter("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ", []string{
+		"user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json",
+		"user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json",
+	}, nil)
+
+	bucketClient.MockIter("user-1/markers/", []string{
+		"user-1/markers/01DTVP434PA9VFXSW2JKB3392D-deletion-mark.json",
+		"user-1/markers/01DTW0ZCPDDNV4BV83Q2SV4QAZ-deletion-mark.json",
+	}, nil)
+
 	bucketClient.MockDelete("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json", nil)
 	bucketClient.MockDelete("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json", nil)
+	bucketClient.MockDelete("user-1/markers/01DTW0ZCPDDNV4BV83Q2SV4QAZ-deletion-mark.json", nil)
 	bucketClient.MockDelete("user-1/01DTW0ZCPDDNV4BV83Q2SV4QAZ", nil)
+	bucketClient.MockGet("user-1/bucket-index.json.gz", "", nil)
+	bucketClient.MockUpload("user-1/bucket-index.json.gz", nil)
 
 	c, _, tsdbPlanner, logs, registry, cleanup := prepare(t, cfg, bucketClient)
 	defer cleanup()
@@ -558,13 +580,13 @@ func TestCompactor_ShouldNotCompactBlocksMarkedForDeletion(t *testing.T) {
 	tsdbPlanner.AssertNumberOfCalls(t, "Plan", 1)
 
 	assert.ElementsMatch(t, []string{
-		`level=info component=cleaner msg="started hard deletion of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-1 msg="started cleaning of blocks marked for deletion"`,
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="started blocks cleanup and maintenance"`,
 		`level=debug component=cleaner org_id=user-1 msg="deleted file" file=01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json bucket=mock`,
 		`level=debug component=cleaner org_id=user-1 msg="deleted file" file=01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json bucket=mock`,
 		`level=info component=cleaner org_id=user-1 msg="deleted block marked for deletion" block=01DTW0ZCPDDNV4BV83Q2SV4QAZ`,
-		`level=info component=cleaner org_id=user-1 msg="cleaning of blocks marked for deletion done"`,
-		`level=info component=cleaner msg="successfully completed hard deletion of blocks marked for deletion"`,
+		`level=info component=cleaner org_id=user-1 msg="completed blocks cleanup and maintenance"`,
+		`level=info component=cleaner msg="successfully completed blocks cleanup and maintenance"`,
 		`level=info component=compactor msg="discovering users from bucket"`,
 		`level=info component=compactor msg="discovered users from bucket" users=1`,
 		`level=info component=compactor msg="starting compaction of user blocks" user=user-1`,
@@ -573,7 +595,7 @@ func TestCompactor_ShouldNotCompactBlocksMarkedForDeletion(t *testing.T) {
 		`level=info component=compactor org_id=user-1 msg="start of compactions"`,
 		`level=info component=compactor org_id=user-1 msg="compaction iterations done"`,
 		`level=info component=compactor msg="successfully compacted user blocks" user=user-1`,
-	}, removeMetaFetcherLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
+	}, removeIgnoredLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
 
 	// Instead of testing for shipper metrics, we only check our metrics here.
 	// Real shipper metrics are too variable to embed into a test.
@@ -621,18 +643,130 @@ func TestCompactor_ShouldNotCompactBlocksMarkedForDeletion(t *testing.T) {
 	`), testedMetrics...))
 }
 
+func TestCompactor_ShouldNotCompactBlocksForUsersMarkedForDeletion(t *testing.T) {
+	t.Parallel()
+
+	cfg := prepareConfig()
+	cfg.DeletionDelay = 10 * time.Minute      // Delete block after 10 minutes
+	cfg.TenantCleanupDelay = 10 * time.Minute // To make sure it's not 0.
+
+	// Mock the bucket to contain two users, each one with one block.
+	bucketClient := &bucket.ClientMock{}
+	bucketClient.MockIter("", []string{"user-1"}, nil)
+	bucketClient.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D"}, nil)
+	bucketClient.MockGet(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), `{"deletion_time": 1}`, nil)
+	bucketClient.MockUpload(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), nil)
+
+	bucketClient.MockIter("user-1/01DTVP434PA9VFXSW2JKB3392D", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", "user-1/01DTVP434PA9VFXSW2JKB3392D/index"}, nil)
+	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
+	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/index", "some index content", nil)
+
+	bucketClient.MockDelete("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", nil)
+	bucketClient.MockDelete("user-1/01DTVP434PA9VFXSW2JKB3392D/index", nil)
+	bucketClient.MockDelete("user-1/bucket-index.json.gz", nil)
+
+	c, _, tsdbPlanner, logs, registry, cleanup := prepare(t, cfg, bucketClient)
+	defer cleanup()
+
+	// Mock the planner as if there's no compaction to do,
+	// in order to simplify tests (all in all, we just want to
+	// test our logic and not TSDB compactor which we expect to
+	// be already tested).
+	tsdbPlanner.On("Plan", mock.Anything, mock.Anything).Return([]*metadata.Meta{}, nil)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
+
+	// Wait until a run has completed.
+	cortex_testutil.Poll(t, time.Second, 1.0, func() interface{} {
+		return prom_testutil.ToFloat64(c.compactionRunsCompleted)
+	})
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), c))
+
+	// No user is compacted, single user we have is marked for deletion.
+	tsdbPlanner.AssertNumberOfCalls(t, "Plan", 0)
+
+	assert.ElementsMatch(t, []string{
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="deleting blocks for tenant marked for deletion"`,
+		`level=debug component=cleaner org_id=user-1 msg="deleted file" file=01DTVP434PA9VFXSW2JKB3392D/meta.json bucket=mock`,
+		`level=debug component=cleaner org_id=user-1 msg="deleted file" file=01DTVP434PA9VFXSW2JKB3392D/index bucket=mock`,
+		`level=info component=cleaner org_id=user-1 msg="deleted block" block=01DTVP434PA9VFXSW2JKB3392D`,
+		`level=info component=cleaner org_id=user-1 msg="deleted blocks for tenant marked for deletion" deletedBlocks=1`,
+		`level=info component=cleaner org_id=user-1 msg="updating finished time in tenant deletion mark"`,
+		`level=info component=cleaner msg="successfully completed blocks cleanup and maintenance"`,
+		`level=info component=compactor msg="discovering users from bucket"`,
+		`level=info component=compactor msg="discovered users from bucket" users=1`,
+		`level=debug component=compactor msg="skipping user because it is marked for deletion" user=user-1`,
+	}, removeIgnoredLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
+
+	// Instead of testing for shipper metrics, we only check our metrics here.
+	// Real shipper metrics are too variable to embed into a test.
+	testedMetrics := []string{
+		"cortex_compactor_runs_started_total", "cortex_compactor_runs_completed_total", "cortex_compactor_runs_failed_total",
+		"cortex_compactor_blocks_cleaned_total", "cortex_compactor_block_cleanup_failures_total", "cortex_compactor_blocks_marked_for_deletion_total",
+		"cortex_compactor_block_cleanup_started_total", "cortex_compactor_block_cleanup_completed_total", "cortex_compactor_block_cleanup_failed_total",
+		"cortex_bucket_blocks_count", "cortex_bucket_blocks_marked_for_deletion_count", "cortex_bucket_index_last_successful_update_timestamp_seconds",
+	}
+	assert.NoError(t, prom_testutil.GatherAndCompare(registry, strings.NewReader(`
+		# TYPE cortex_compactor_runs_started_total counter
+		# HELP cortex_compactor_runs_started_total Total number of compaction runs started.
+		cortex_compactor_runs_started_total 1
+
+		# TYPE cortex_compactor_runs_completed_total counter
+		# HELP cortex_compactor_runs_completed_total Total number of compaction runs successfully completed.
+		cortex_compactor_runs_completed_total 1
+
+		# TYPE cortex_compactor_runs_failed_total counter
+		# HELP cortex_compactor_runs_failed_total Total number of compaction runs failed.
+		cortex_compactor_runs_failed_total 0
+
+		# TYPE cortex_compactor_block_cleanup_failures_total counter
+		# HELP cortex_compactor_block_cleanup_failures_total Total number of blocks failed to be deleted.
+		cortex_compactor_block_cleanup_failures_total 0
+
+		# HELP cortex_compactor_blocks_cleaned_total Total number of blocks deleted.
+		# TYPE cortex_compactor_blocks_cleaned_total counter
+		cortex_compactor_blocks_cleaned_total 1
+
+		# HELP cortex_compactor_blocks_marked_for_deletion_total Total number of blocks marked for deletion in compactor.
+		# TYPE cortex_compactor_blocks_marked_for_deletion_total counter
+		cortex_compactor_blocks_marked_for_deletion_total 0
+
+		# TYPE cortex_compactor_block_cleanup_started_total counter
+		# HELP cortex_compactor_block_cleanup_started_total Total number of blocks cleanup runs started.
+		cortex_compactor_block_cleanup_started_total 1
+
+		# TYPE cortex_compactor_block_cleanup_completed_total counter
+		# HELP cortex_compactor_block_cleanup_completed_total Total number of blocks cleanup runs successfully completed.
+		cortex_compactor_block_cleanup_completed_total 1
+
+		# TYPE cortex_compactor_block_cleanup_failed_total counter
+		# HELP cortex_compactor_block_cleanup_failed_total Total number of blocks cleanup runs failed.
+		cortex_compactor_block_cleanup_failed_total 0
+	`), testedMetrics...))
+}
+
 func TestCompactor_ShouldCompactAllUsersOnShardingEnabledButOnlyOneInstanceRunning(t *testing.T) {
 	t.Parallel()
 
 	// Mock the bucket to contain two users, each one with one block.
 	bucketClient := &bucket.ClientMock{}
 	bucketClient.MockIter("", []string{"user-1", "user-2"}, nil)
+	bucketClient.MockExists(path.Join("user-1", cortex_tsdb.TenantDeletionMarkPath), false, nil)
+	bucketClient.MockExists(path.Join("user-2", cortex_tsdb.TenantDeletionMarkPath), false, nil)
 	bucketClient.MockIter("user-1/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D"}, nil)
 	bucketClient.MockIter("user-2/", []string{"user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ"}, nil)
+	bucketClient.MockIter("user-1/markers/", nil, nil)
+	bucketClient.MockIter("user-2/markers/", nil, nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/deletion-mark.json", "", nil)
 	bucketClient.MockGet("user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ/meta.json", mockBlockMetaJSON("01DTW0ZCPDDNV4BV83Q2SV4QAZ"), nil)
 	bucketClient.MockGet("user-2/01DTW0ZCPDDNV4BV83Q2SV4QAZ/deletion-mark.json", "", nil)
+	bucketClient.MockGet("user-1/bucket-index.json.gz", "", nil)
+	bucketClient.MockGet("user-2/bucket-index.json.gz", "", nil)
+	bucketClient.MockUpload("user-1/bucket-index.json.gz", nil)
+	bucketClient.MockUpload("user-2/bucket-index.json.gz", nil)
 
 	cfg := prepareConfig()
 	cfg.ShardingEnabled = true
@@ -664,12 +798,12 @@ func TestCompactor_ShouldCompactAllUsersOnShardingEnabledButOnlyOneInstanceRunni
 	assert.ElementsMatch(t, []string{
 		`level=info component=compactor msg="waiting until compactor is ACTIVE in the ring"`,
 		`level=info component=compactor msg="compactor is ACTIVE in the ring"`,
-		`level=info component=cleaner msg="started hard deletion of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-1 msg="started cleaning of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-1 msg="cleaning of blocks marked for deletion done"`,
-		`level=info component=cleaner org_id=user-2 msg="started cleaning of blocks marked for deletion"`,
-		`level=info component=cleaner org_id=user-2 msg="cleaning of blocks marked for deletion done"`,
-		`level=info component=cleaner msg="successfully completed hard deletion of blocks marked for deletion"`,
+		`level=info component=cleaner msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-1 msg="completed blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-2 msg="started blocks cleanup and maintenance"`,
+		`level=info component=cleaner org_id=user-2 msg="completed blocks cleanup and maintenance"`,
+		`level=info component=cleaner msg="successfully completed blocks cleanup and maintenance"`,
 		`level=info component=compactor msg="discovering users from bucket"`,
 		`level=info component=compactor msg="discovered users from bucket" users=2`,
 		`level=info component=compactor msg="starting compaction of user blocks" user=user-1`,
@@ -684,7 +818,7 @@ func TestCompactor_ShouldCompactAllUsersOnShardingEnabledButOnlyOneInstanceRunni
 		`level=info component=compactor org_id=user-2 msg="start of compactions"`,
 		`level=info component=compactor org_id=user-2 msg="compaction iterations done"`,
 		`level=info component=compactor msg="successfully compacted user blocks" user=user-2`,
-	}, removeMetaFetcherLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
+	}, removeIgnoredLogs(strings.Split(strings.TrimSpace(logs.String()), "\n")))
 }
 
 func TestCompactor_ShouldCompactOnlyUsersOwnedByTheInstanceOnShardingEnabledAndMultipleInstancesRunning(t *testing.T) {
@@ -702,9 +836,13 @@ func TestCompactor_ShouldCompactOnlyUsersOwnedByTheInstanceOnShardingEnabledAndM
 	bucketClient := &bucket.ClientMock{}
 	bucketClient.MockIter("", userIDs, nil)
 	for _, userID := range userIDs {
-		bucketClient.MockIter(userID+"/", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D"}, nil)
+		bucketClient.MockIter(userID+"/", []string{userID + "/01DTVP434PA9VFXSW2JKB3392D"}, nil)
+		bucketClient.MockIter(userID+"/markers/", nil, nil)
+		bucketClient.MockExists(path.Join(userID, cortex_tsdb.TenantDeletionMarkPath), false, nil)
 		bucketClient.MockGet(userID+"/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
 		bucketClient.MockGet(userID+"/01DTVP434PA9VFXSW2JKB3392D/deletion-mark.json", "", nil)
+		bucketClient.MockGet(userID+"/bucket-index.json.gz", "", nil)
+		bucketClient.MockUpload(userID+"/bucket-index.json.gz", nil)
 	}
 
 	// Create a shared KV Store
@@ -757,7 +895,7 @@ func TestCompactor_ShouldCompactOnlyUsersOwnedByTheInstanceOnShardingEnabledAndM
 	}
 }
 
-func createTSDBBlock(t *testing.T, dir string, minT, maxT int64, externalLabels map[string]string) ulid.ULID {
+func createTSDBBlock(t *testing.T, bkt objstore.Bucket, userID string, minT, maxT int64, externalLabels map[string]string) ulid.ULID {
 	// Create a temporary dir for TSDB.
 	tempDir, err := ioutil.TempDir(os.TempDir(), "tsdb")
 	require.NoError(t, err)
@@ -810,24 +948,40 @@ func createTSDBBlock(t *testing.T, dir string, minT, maxT int64, externalLabels 
 	_, err = metadata.InjectThanos(log.NewNopLogger(), filepath.Join(snapshotDir, blockID.String()), meta, nil)
 	require.NoError(t, err)
 
-	// Ensure the output directory exists.
-	require.NoError(t, os.MkdirAll(dir, os.ModePerm))
+	// Copy the block files to the bucket.
+	srcRoot := filepath.Join(snapshotDir, blockID.String())
+	require.NoError(t, filepath.Walk(srcRoot, func(file string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
 
-	// Copy the block files to the storage dir.
-	require.NoError(t, exec.Command("cp", "-r", filepath.Join(snapshotDir, blockID.String()), dir).Run())
+		// Read the file content in memory.
+		content, err := ioutil.ReadFile(file)
+		if err != nil {
+			return err
+		}
+
+		// Upload it to the bucket.
+		relPath, err := filepath.Rel(srcRoot, file)
+		if err != nil {
+			return err
+		}
+
+		return bkt.Upload(context.Background(), path.Join(userID, blockID.String(), relPath), bytes.NewReader(content))
+	}))
 
 	return blockID
 }
 
-func createDeletionMark(t *testing.T, dir string, blockID ulid.ULID, deletionTime time.Time) {
+func createDeletionMark(t *testing.T, bkt objstore.Bucket, userID string, blockID ulid.ULID, deletionTime time.Time) {
 	content := mockDeletionMarkJSON(blockID.String(), deletionTime)
-	blockPath := filepath.Join(dir, blockID.String())
-	markPath := filepath.Join(blockPath, metadata.DeletionMarkFilename)
+	blockPath := path.Join(userID, blockID.String())
+	markPath := path.Join(blockPath, metadata.DeletionMarkFilename)
 
-	// Ensure the block directory exists.
-	require.NoError(t, os.MkdirAll(blockPath, os.ModePerm))
-
-	require.NoError(t, ioutil.WriteFile(markPath, []byte(content), os.ModePerm))
+	require.NoError(t, bkt.Upload(context.Background(), markPath, strings.NewReader(content)))
 }
 
 func findCompactorByUserID(compactors []*Compactor, logs []*concurrency.SyncBuffer, userID string) (*Compactor, *concurrency.SyncBuffer, error) {
@@ -858,13 +1012,20 @@ func findCompactorByUserID(compactors []*Compactor, logs []*concurrency.SyncBuff
 	return compactor, log, nil
 }
 
-func removeMetaFetcherLogs(input []string) []string {
+func removeIgnoredLogs(input []string) []string {
 	out := make([]string, 0, len(input))
+	durationRe := regexp.MustCompile(`\s?duration=\S+`)
 
 	for i := 0; i < len(input); i++ {
-		if !strings.Contains(input[i], "block.MetaFetcher") && !strings.Contains(input[i], "block.BaseFetcher") {
-			out = append(out, input[i])
+		log := input[i]
+		if strings.Contains(log, "block.MetaFetcher") || strings.Contains(log, "block.BaseFetcher") {
+			continue
 		}
+
+		// Remove any duration from logs.
+		log = durationRe.ReplaceAllString(log, "")
+
+		out = append(out, log)
 	}
 
 	return out
@@ -876,6 +1037,9 @@ func prepareConfig() Config {
 
 	compactorCfg.retryMinBackoff = 0
 	compactorCfg.retryMaxBackoff = 0
+
+	// The migration is tested in a dedicated test.
+	compactorCfg.BlockDeletionMarksMigrationEnabled = false
 
 	// Do not wait for ring stability by default, in order to speed up tests.
 	compactorCfg.ShardingRing.WaitStabilityMinDuration = 0

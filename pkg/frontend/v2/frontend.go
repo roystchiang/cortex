@@ -19,6 +19,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/grpcclient"
@@ -72,14 +73,15 @@ type Frontend struct {
 }
 
 type frontendRequest struct {
-	queryID uint64
-	request *httpgrpc.HTTPRequest
-	userID  string
+	queryID      uint64
+	request      *httpgrpc.HTTPRequest
+	userID       string
+	statsEnabled bool
 
 	cancel context.CancelFunc
 
 	enqueue  chan enqueueResult
-	response chan *httpgrpc.HTTPResponse
+	response chan *frontendv2pb.QueryResultRequest
 }
 
 type enqueueStatus int
@@ -151,10 +153,11 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 		return nil, fmt.Errorf("frontend not running: %v", s)
 	}
 
-	userID, err := tenant.TenantID(ctx)
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
 		return nil, err
 	}
+	userID := tenant.JoinTenantIDs(tenantIDs)
 
 	// Propagate trace context in gRPC too - this will be ignored if using HTTP.
 	tracer, span := opentracing.GlobalTracer(), opentracing.SpanFromContext(ctx)
@@ -169,16 +172,17 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *httpgrpc.HTTPRequest)
 	defer cancel()
 
 	freq := &frontendRequest{
-		queryID: f.lastQueryID.Inc(),
-		request: req,
-		userID:  userID,
+		queryID:      f.lastQueryID.Inc(),
+		request:      req,
+		userID:       userID,
+		statsEnabled: stats.IsEnabled(ctx),
 
 		cancel: cancel,
 
 		// Buffer of 1 to ensure response or error can be written to the channel
 		// even if this goroutine goes away due to client context cancellation.
 		enqueue:  make(chan enqueueResult, 1),
-		response: make(chan *httpgrpc.HTTPResponse, 1),
+		response: make(chan *frontendv2pb.QueryResultRequest, 1),
 	}
 
 	f.requests.put(freq)
@@ -228,15 +232,21 @@ enqueueAgain:
 		return nil, ctx.Err()
 
 	case resp := <-freq.response:
-		return resp, nil
+		if stats.ShouldTrackHTTPGRPCResponse(resp.HttpResponse) {
+			stats := stats.FromContext(ctx)
+			stats.Merge(resp.Stats) // Safe if stats is nil.
+		}
+
+		return resp.HttpResponse, nil
 	}
 }
 
 func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryResultRequest) (*frontendv2pb.QueryResultResponse, error) {
-	userID, err := tenant.TenantID(ctx)
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
 		return nil, err
 	}
+	userID := tenant.JoinTenantIDs(tenantIDs)
 
 	req := f.requests.get(qrReq.QueryID)
 	// It is possible that some old response belonging to different user was received, if frontend has restarted.
@@ -244,7 +254,7 @@ func (f *Frontend) QueryResult(ctx context.Context, qrReq *frontendv2pb.QueryRes
 	// To avoid mixing results from different queries, we randomize queryID counter on start.
 	if req != nil && req.userID == userID {
 		select {
-		case req.response <- qrReq.HttpResponse:
+		case req.response <- qrReq:
 			// Should always be possible, unless QueryResult is called multiple times with the same queryID.
 		default:
 			level.Warn(f.log).Log("msg", "failed to write query result to the response channel", "queryID", qrReq.QueryID, "user", userID)
