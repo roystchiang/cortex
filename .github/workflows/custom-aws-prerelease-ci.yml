@@ -1,0 +1,151 @@
+name: cortex-prod-ci
+on:
+  pull_request:
+    branches:
+      - '*'
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+**
+env:
+  PRERELEASE_REPO: cortex-prerelease
+  IMAGE_DOWNLOAD_LOCATION: ../downloaded_images
+
+jobs:
+  lint:
+    runs-on: [self-hosted, prod]
+    container:
+      image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Lint
+        run: make BUILD_IN_CONTAINER=false lint
+      - name: Check Vendor Directory
+        run: make BUILD_IN_CONTAINER=false mod-check
+      - name: Check Protos
+        run: make BUILD_IN_CONTAINER=false check-protos
+      - name: Check Generated Documentation
+        run: make BUILD_IN_CONTAINER=false check-doc
+      - name: Check White Noise.
+        run: make BUILD_IN_CONTAINER=false check-white-noise
+  secure:
+    runs-on: [self-hosted, prod]
+    container:
+      image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Run Gosec Security Scanner
+        continue-on-error: true
+        uses: securego/gosec@master
+        with:
+          args: ./...
+  test:
+    runs-on: [self-hosted, prod]
+    container:
+      image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
+    services:
+      cassandra:
+        image: cassandra:3.11
+        env:
+          JVM_OPTS: "-Xms1024M -Xmx1024M"
+        ports:
+          - 9042:9042
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v2
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Run Tests
+        run: CASSANDRA_TEST_ADDRESSES=cassandra:9042 make BUILD_IN_CONTAINER=false test
+  build:
+    runs-on: [self-hosted, prod]
+    container:
+      image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
+      env:
+        ECR: ${{ env.ECR }}
+    steps:
+      - run: echo "ECR=$ECR" >> $GITHUB_ENV
+      - name: Checkout Repo
+        uses: actions/checkout@v2
+
+      - name: Check out amp-builds
+        uses: actions/checkout@v2
+        with:
+          repository: aws-observability/amp-builds
+          path: amp-builds
+          token: ${{ secrets.MACHINE_PAT }}
+      
+      - name: Generate Tag
+        uses: ./amp-builds/actions/generate-tag
+        with:
+          branch: master
+          ref: ${{ github.ref }}
+      - name: Install Docker Client
+        run: ./.github/workflows/scripts/install-docker.sh
+      - name: Sym Link Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/cortexproject/cortex
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Build Image
+        run: |
+          touch build-image/.uptodate
+          make BUILD_IN_CONTAINER=false
+      - name: Save Image
+        uses: ./amp-builds/actions/save-image
+        with:
+          builtImage: quay.io/cortexproject/cortex:${{ env.DOCKER_IMAGE_TAG }}
+          awsImage: ${{ env.ECR }}/${{ env.PRERELEASE_REPO }}:${{ env.DOCKER_IMAGE_TAG }}
+          path: ".."
+          fileName: images.tar
+      - name: Upload Docker Images Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: Docker Images
+          path: ${{ runner.workspace }}/images.tar
+      - name: Cleanup
+        continue-on-error: true
+        run: |
+          rm -rf amp-builds
+          rm ../images.tar
+          docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep 'quay.io/cortexproject/')
+  deploy:
+    needs: [lint, secure, test, build]
+    runs-on: [self-hosted, prod]
+    steps:
+      - name: Make Directory
+        run: mkdir -p $IMAGE_DOWNLOAD_LOCATION
+      - name: Download Docker Images Artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: Docker Images
+          path: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
+
+      - name: Check out amp-builds
+        uses: actions/checkout@v2
+        with:
+          repository: aws-observability/amp-builds
+          path: amp-builds
+          token: ${{ secrets.MACHINE_PAT }}
+
+      - name: Push to ECR
+        uses: ./amp-builds/actions/push-to-ecr
+        with:
+          imageDownloadLocation: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
+          repoName: ${{ env.PRERELEASE_REPO }}
+          tagLatest: false
