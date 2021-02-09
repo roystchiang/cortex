@@ -105,7 +105,7 @@ jobs:
       - name: Build Image
         run: |
           touch build-image/.uptodate
-          make BUILD_IN_CONTAINER=false
+          make BUILD_IN_CONTAINER=false IMAGE_TAG=$DOCKER_IMAGE_TAG
       - name: Save Image
         uses: ./amp-builds/actions/save-image
         with:
