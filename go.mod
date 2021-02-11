@@ -59,6 +59,10 @@ require (
 	github.com/weaveworks/common v0.0.0-20201119133501-0619918236ec
 	go.etcd.io/bbolt v1.3.5-0.20200615073812-232d8fc87f50
 	go.etcd.io/etcd v0.5.0-alpha.5.0.20200520232829-54ba9589114f
+	go.opentelemetry.io/otel v0.11.0
+	go.opentelemetry.io/otel/bridge/opentracing v0.11.0
+	go.opentelemetry.io/otel/exporters/otlp v0.11.0
+	go.opentelemetry.io/otel/sdk v0.11.0
 	go.uber.org/atomic v1.7.0
 	golang.org/x/net v0.0.0-20201110031124-69a78807bb2b
 	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9

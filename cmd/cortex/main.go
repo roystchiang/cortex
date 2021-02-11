@@ -4,7 +4,11 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
+	"github.com/opentracing/opentracing-go"
+	"go.opentelemetry.io/otel/api/global"
+	"google.golang.org/grpc"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"os"
 	"runtime"
@@ -16,12 +20,15 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/version"
-	"github.com/weaveworks/common/tracing"
 	"gopkg.in/yaml.v2"
 
 	"github.com/cortexproject/cortex/pkg/cortex"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+
+	bridge "go.opentelemetry.io/otel/bridge/opentracing"
+	"go.opentelemetry.io/otel/exporters/otlp"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // Version is set via build flag -ldflags -X main.Version
@@ -151,12 +158,31 @@ func main() {
 			name += "-" + cfg.Target[0]
 		}
 
-		// Setting the environment variable JAEGER_AGENT_HOST enables tracing.
-		if trace, err := tracing.NewFromEnv(name); err != nil {
-			level.Error(util.Logger).Log("msg", "Failed to setup tracing", "err", err.Error())
-		} else {
-			defer trace.Close()
+		// get exporter
+		fmt.Println("Configuring exporter")
+		exporter, err := otlp.NewExporter(
+			otlp.WithInsecure(),
+			otlp.WithAddress("otel.monitoring:55680"),
+			otlp.WithGRPCDialOption(grpc.WithBlock()), // useful for testing
+		)
+		fmt.Println("Configured exporter")
+		if err != nil {
+			log.Fatalf("Failed to setup exporter: %v", err)
 		}
+		// configure SDK
+		tracerProvider, err := sdktrace.NewProvider(
+			sdktrace.WithConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
+			sdktrace.WithBatcher(exporter),
+		)
+		if err != nil {
+			log.Fatalf("Failed to setup tracer provider: %v", err)
+		}
+		global.SetTraceProvider(tracerProvider)
+		tracer := global.Tracer(name)
+
+		// configure open tracing
+		bridgeTracer, _ := bridge.NewTracerPair(tracer)
+		opentracing.SetGlobalTracer(bridgeTracer)
 	}
 
 	// Initialise seed for randomness usage.
