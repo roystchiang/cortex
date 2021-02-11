@@ -9,12 +9,22 @@ env:
   IMAGE_DOWNLOAD_LOCATION: ../downloaded_images
 
 jobs:
+  configure:
+    runs-on: [self-hosted, prod]
+    outputs:
+      containerUser: ${{ steps.get-user.outputs.containerUser }}
+    
+    steps:
+      - id: get-user
+        run: echo "::set-output name=containerUser::`id -u`:`id -g`"
   lint:
+    needs: configure
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
       env:
         ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -32,12 +42,15 @@ jobs:
         run: make BUILD_IN_CONTAINER=false check-doc
       - name: Check White Noise.
         run: make BUILD_IN_CONTAINER=false check-white-noise
+      - run: chown -R $ORIGINAL_USER $GITHUB_WORKSPACE
   secure:
+    needs: configure
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
       env:
         ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -50,12 +63,15 @@ jobs:
         uses: securego/gosec@master
         with:
           args: ./...
+      - run: chown -R $ORIGINAL_USER $GITHUB_WORKSPACE
   test:
+    needs: configure
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
       env:
         ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     services:
       cassandra:
         image: cassandra:3.11
@@ -72,13 +88,15 @@ jobs:
           ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
       - name: Run Tests
         run: CASSANDRA_TEST_ADDRESSES=cassandra:9042 make BUILD_IN_CONTAINER=false test
+      - run: chown -R $ORIGINAL_USER $GITHUB_WORKSPACE
   build:
-    needs: [test, secure, lint]
+    needs: configure
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:upgrade-build-image-debian-491e60715-WIP
       env:
         ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     steps:
       - run: echo "ECR=$ECR" >> $GITHUB_ENV
       - name: Checkout Repo
@@ -133,6 +151,7 @@ jobs:
           rm -rf amp-builds
           rm ../images.tar
           docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep 'quay.io/cortexproject/')
+      - run: chown -R $ORIGINAL_USER $GITHUB_WORKSPACE
   integration-configs-db:
     needs: build
     runs-on: [self-hosted, prod]
