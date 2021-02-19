@@ -25,6 +25,7 @@ import (
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
@@ -37,15 +38,16 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
-	errFail = fmt.Errorf("Fail")
-	success = &client.WriteResponse{}
-	ctx     = user.InjectOrgID(context.Background(), "user")
+	errFail       = fmt.Errorf("Fail")
+	emptyResponse = &client.WriteResponse{}
+	ctx           = user.InjectOrgID(context.Background(), "user")
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -123,14 +125,14 @@ func TestDistributor_Push(t *testing.T) {
 		"A push of no samples shouldn't block or return error, even if ingesters are sad": {
 			numIngesters:     3,
 			happyIngesters:   0,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 		},
 		"A push to 3 happy ingesters should succeed": {
 			numIngesters:     3,
 			happyIngesters:   3,
 			samples:          samplesIn{num: 5, startTimestampMs: 123456789000},
 			metadata:         5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			metricNames:      []string{lastSeenTimestamp},
 			expectedMetrics: `
 				# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
@@ -143,7 +145,7 @@ func TestDistributor_Push(t *testing.T) {
 			happyIngesters:   2,
 			samples:          samplesIn{num: 5, startTimestampMs: 123456789000},
 			metadata:         5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			metricNames:      []string{lastSeenTimestamp},
 			expectedMetrics: `
 				# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
@@ -194,7 +196,7 @@ func TestDistributor_Push(t *testing.T) {
 			samples:          samplesIn{num: 1, startTimestampMs: 123456789000},
 			metadata:         0,
 			metricNames:      []string{distributorAppend, distributorAppendFailure},
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			expectedMetrics: `
 				# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
 				# TYPE cortex_distributor_ingester_append_failures_total counter
@@ -212,7 +214,7 @@ func TestDistributor_Push(t *testing.T) {
 			samples:          samplesIn{num: 0, startTimestampMs: 123456789000},
 			metadata:         1,
 			metricNames:      []string{distributorAppend, distributorAppendFailure},
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			expectedMetrics: `
 				# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
 				# TYPE cortex_distributor_ingester_append_failures_total counter
@@ -348,7 +350,7 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 				response, err := distributors[0].Push(ctx, request)
 
 				if push.expectedError == nil {
-					assert.Equal(t, success, response)
+					assert.Equal(t, emptyResponse, response)
 					assert.Nil(t, err)
 				} else {
 					assert.Nil(t, response)
@@ -377,7 +379,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 			testReplica:      "instance0",
 			cluster:          "cluster0",
 			samples:          5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 		},
 		// The 202 indicates that we didn't accept this sample.
 		{
@@ -395,7 +397,17 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 			testReplica:      "instance0",
 			cluster:          "cluster0",
 			samples:          5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
+		},
+		// Using very long replica label value results in validation error.
+		{
+			enableTracker:    true,
+			acceptedReplica:  "instance0",
+			testReplica:      "instance1234567890123456789012345678901234567890",
+			cluster:          "cluster0",
+			samples:          5,
+			expectedResponse: emptyResponse,
+			expectedCode:     400,
 		},
 	} {
 		for _, shardByAllLabels := range []bool{true, false} {
@@ -403,6 +415,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 				var limits validation.Limits
 				flagext.DefaultValues(&limits)
 				limits.AcceptHASamples = true
+				limits.MaxLabelValueLength = 15
 
 				ds, _, r := prepare(t, prepConfig{
 					numIngesters:     3,
@@ -422,7 +435,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 						KVStore:         kv.Config{Mock: mock},
 						UpdateTimeout:   100 * time.Millisecond,
 						FailoverTimeout: time.Second,
-					}, nil)
+					}, trackerLimits{maxClusters: 100}, nil)
 					require.NoError(t, err)
 					require.NoError(t, services.StartAndAwaitRunning(context.Background(), r))
 					d.HATracker = r
@@ -440,6 +453,8 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 				httpResp, ok := httpgrpc.HTTPResponseFromError(err)
 				if ok {
 					assert.Equal(t, tc.expectedCode, httpResp.Code)
+				} else if tc.expectedCode != 0 {
+					assert.Fail(t, "expected HTTP status code", tc.expectedCode)
 				}
 			})
 		}
@@ -487,7 +502,7 @@ func TestDistributor_PushQuery(t *testing.T) {
 					// shard by all labels are enabled.
 					var expectedIngesters int
 					if shuffleShardEnabled {
-						expectedIngesters = util.Min(shuffleShardSize, numIngesters)
+						expectedIngesters = util_math.Min(shuffleShardSize, numIngesters)
 					} else if shardByAllLabels {
 						expectedIngesters = numIngesters
 					} else {
@@ -818,6 +833,57 @@ func TestDistributor_Push_ShouldGuaranteeShardingTokenConsistencyOverTheTime(t *
 	}
 }
 
+func TestDistributor_Push_LabelNameValidation(t *testing.T) {
+	inputLabels := labels.Labels{
+		{Name: model.MetricNameLabel, Value: "foo"},
+		{Name: "999.illegal", Value: "baz"},
+	}
+	tests := map[string]struct {
+		inputLabels                labels.Labels
+		skipLabelNameValidationCfg bool
+		skipLabelNameValidationReq bool
+		errExpected                bool
+		errMessage                 string
+	}{
+		"label name validation is on by default": {
+			inputLabels: inputLabels,
+			errExpected: true,
+			errMessage:  `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
+		},
+		"label name validation can be skipped via config": {
+			inputLabels:                inputLabels,
+			skipLabelNameValidationCfg: true,
+			errExpected:                false,
+		},
+		"label name validation can be skipped via WriteRequest parameter": {
+			inputLabels:                inputLabels,
+			skipLabelNameValidationReq: true,
+			errExpected:                false,
+		},
+	}
+
+	for testName, tc := range tests {
+		t.Run(testName, func(t *testing.T) {
+			ds, _, _ := prepare(t, prepConfig{
+				numIngesters:            2,
+				happyIngesters:          2,
+				numDistributors:         1,
+				shuffleShardSize:        1,
+				skipLabelNameValidation: tc.skipLabelNameValidationCfg,
+			})
+			req := mockWriteRequest(tc.inputLabels, 42, 100000)
+			req.SkipLabelNameValidation = tc.skipLabelNameValidationReq
+			_, err := ds[0].Push(ctx, req)
+			if tc.errExpected {
+				fromError, _ := status.FromError(err)
+				assert.Equal(t, tc.errMessage, fromError.Message())
+			} else {
+				assert.Nil(t, err)
+			}
+		})
+	}
+}
+
 func TestSlowQueries(t *testing.T) {
 	nameMatcher := mustEqualMatcher(model.MetricNameLabel, "foo")
 	nIngesters := 3
@@ -1058,6 +1124,7 @@ type prepConfig struct {
 	shuffleShardSize             int
 	limits                       *validation.Limits
 	numDistributors              int
+	skipLabelNameValidation      bool
 }
 
 func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *ring.Ring) {
@@ -1075,11 +1142,11 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 	}
 
 	// Use a real ring with a mock KV store to test ring RF logic.
-	ingesterDescs := map[string]ring.IngesterDesc{}
+	ingesterDescs := map[string]ring.InstanceDesc{}
 	ingestersByAddr := map[string]*mockIngester{}
 	for i := range ingesters {
 		addr := fmt.Sprintf("%d", i)
-		ingesterDescs[addr] = ring.IngesterDesc{
+		ingesterDescs[addr] = ring.InstanceDesc{
 			Addr:                addr,
 			Zone:                "",
 			State:               ring.ACTIVE,
@@ -1106,13 +1173,12 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		},
 		HeartbeatTimeout:  60 * time.Minute,
 		ReplicationFactor: 3,
-		ExtendWrites:      true,
 	}, ring.IngesterRingKey, ring.IngesterRingKey, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingestersRing))
 
 	test.Poll(t, time.Second, cfg.numIngesters, func() interface{} {
-		return ingestersRing.IngesterCount()
+		return ingestersRing.InstancesCount()
 	})
 
 	factory := func(addr string) (ring_client.PoolClient, error) {
@@ -1137,6 +1203,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		distributorCfg.DistributorRing.InstanceID = strconv.Itoa(i)
 		distributorCfg.DistributorRing.KVStore.Mock = kvStore
 		distributorCfg.DistributorRing.InstanceAddr = "127.0.0.1"
+		distributorCfg.SkipLabelNameValidation = cfg.skipLabelNameValidation
 
 		if cfg.shuffleShardEnabled {
 			distributorCfg.ShardingStrategy = util.ShardingStrategyShuffle
@@ -1589,7 +1656,7 @@ func TestDistributorValidation(t *testing.T) {
 				TimestampMs: int64(now),
 				Value:       2,
 			}},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `sample for 'testmetric{foo2="bar2", foo="bar"}' has 3 label names; limit 2`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
 		},
 		// Test multiple validation fails return the first one.
 		{
@@ -1601,7 +1668,7 @@ func TestDistributorValidation(t *testing.T) {
 				{TimestampMs: int64(now), Value: 2},
 				{TimestampMs: int64(past), Value: 2},
 			},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `sample for 'testmetric{foo2="bar2", foo="bar"}' has 3 label names; limit 2`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
 		},
 		// Test metadata validation fails
 		{

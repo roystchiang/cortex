@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	httpPort = 80
-	grpcPort = 9095
+	httpPort   = 80
+	grpcPort   = 9095
+	GossipPort = 9094
 )
 
 // GetDefaultImage returns the Docker image to use to run Cortex.
@@ -345,6 +346,27 @@ func NewAlertmanager(name string, flags map[string]string, image string) *Cortex
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
 		grpcPort,
+		GossipPort,
+	)
+}
+
+func NewAlertmanagerWithTLS(name string, flags map[string]string, image string) *CortexService {
+	if image == "" {
+		image = GetDefaultImage()
+	}
+
+	return NewCortexService(
+		name,
+		image,
+		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
+			"-target":                               "alertmanager",
+			"-log.level":                            "warn",
+			"-experimental.alertmanager.enable-api": "true",
+		}, flags))...),
+		e2e.NewTCPReadinessProbe(httpPort),
+		httpPort,
+		grpcPort,
+		GossipPort,
 	)
 }
 

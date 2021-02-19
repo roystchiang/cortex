@@ -28,7 +28,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/storage/bucket"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -324,7 +324,7 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 		return bs, nil
 	}
 
-	userLogger := util.WithUserID(userID, u.logger)
+	userLogger := util_log.WithUserID(userID, u.logger)
 
 	level.Info(userLogger).Log("msg", "creating user bucket store")
 
@@ -396,7 +396,8 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 		u.queryGate,
 		u.cfg.BucketStore.MaxChunkPoolBytes,
 		newChunksLimiterFactory(u.limits, userID),
-		u.logLevel.String() == "debug", // Turn on debug logging, if the log level is set to debug
+		store.NewSeriesLimiterFactory(0), // No series limiter.
+		u.logLevel.String() == "debug",   // Turn on debug logging, if the log level is set to debug
 		u.cfg.BucketStore.BlockSyncConcurrency,
 		nil,   // Do not limit timerange.
 		false, // No need to enable backward compatibility with Thanos pre 0.8.0 queriers

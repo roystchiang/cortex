@@ -206,6 +206,11 @@ func (cfg *TSDBConfig) BlocksDir(userID string) string {
 	return filepath.Join(cfg.Dir, userID)
 }
 
+// IsShippingEnabled returns whether blocks shipping is enabled.
+func (cfg *TSDBConfig) IsBlocksShippingEnabled() bool {
+	return cfg.ShipInterval > 0
+}
+
 // BucketStoreConfig holds the config information for Bucket Stores used by the querier and store-gateway.
 type BucketStoreConfig struct {
 	SyncDir                  string              `yaml:"sync_dir"`
@@ -222,10 +227,9 @@ type BucketStoreConfig struct {
 	IgnoreDeletionMarksDelay time.Duration       `yaml:"ignore_deletion_mark_delay"`
 	BucketIndex              BucketIndexConfig   `yaml:"bucket_index"`
 
-	// Controls whether index-header lazy loading is enabled. This config option is hidden
-	// while it is marked as experimental.
-	IndexHeaderLazyLoadingEnabled     bool          `yaml:"index_header_lazy_loading_enabled" doc:"hidden"`
-	IndexHeaderLazyLoadingIdleTimeout time.Duration `yaml:"index_header_lazy_loading_idle_timeout" doc:"hidden"`
+	// Controls whether index-header lazy loading is enabled.
+	IndexHeaderLazyLoadingEnabled     bool          `yaml:"index_header_lazy_loading_enabled"`
+	IndexHeaderLazyLoadingIdleTimeout time.Duration `yaml:"index_header_lazy_loading_idle_timeout"`
 
 	// Controls what is the ratio of postings offsets store will hold in memory.
 	// Larger value will keep less offsets, which will increase CPU cycles needed for query touching those postings.
@@ -243,7 +247,7 @@ func (cfg *BucketStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.BucketIndex.RegisterFlagsWithPrefix(f, "blocks-storage.bucket-store.bucket-index.")
 
 	f.StringVar(&cfg.SyncDir, "blocks-storage.bucket-store.sync-dir", "tsdb-sync", "Directory to store synchronized TSDB index headers.")
-	f.DurationVar(&cfg.SyncInterval, "blocks-storage.bucket-store.sync-interval", 5*time.Minute, "How frequently scan the bucket - or fetch the bucket index (if enabled) - to look for changes (new blocks shipped by ingesters and blocks removed by retention or compaction). 0 disables it.")
+	f.DurationVar(&cfg.SyncInterval, "blocks-storage.bucket-store.sync-interval", 15*time.Minute, "How frequently to scan the bucket, or to refresh the bucket index (if enabled), in order to look for changes (new blocks shipped by ingesters and blocks deleted by retention or compaction).")
 	f.Uint64Var(&cfg.MaxChunkPoolBytes, "blocks-storage.bucket-store.max-chunk-pool-bytes", uint64(2*units.Gibibyte), "Max size - in bytes - of a per-tenant chunk pool, used to reduce memory allocations.")
 	f.IntVar(&cfg.MaxConcurrent, "blocks-storage.bucket-store.max-concurrent", 100, "Max number of concurrent queries to execute against the long-term storage. The limit is shared across all tenants.")
 	f.IntVar(&cfg.TenantSyncConcurrency, "blocks-storage.bucket-store.tenant-sync-concurrency", 10, "Maximum number of concurrent tenants synching blocks.")
@@ -277,7 +281,6 @@ func (cfg *BucketStoreConfig) Validate() error {
 
 type BucketIndexConfig struct {
 	Enabled               bool          `yaml:"enabled"`
-	UpdateOnStaleInterval time.Duration `yaml:"update_on_stale_interval"`
 	UpdateOnErrorInterval time.Duration `yaml:"update_on_error_interval"`
 	IdleTimeout           time.Duration `yaml:"idle_timeout"`
 	MaxStalePeriod        time.Duration `yaml:"max_stale_period"`
@@ -285,7 +288,6 @@ type BucketIndexConfig struct {
 
 func (cfg *BucketIndexConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.Enabled, prefix+"enabled", false, "True to enable querier and store-gateway to discover blocks in the storage via bucket index instead of bucket scanning.")
-	f.DurationVar(&cfg.UpdateOnStaleInterval, prefix+"update-on-stale-interval", 15*time.Minute, "How frequently a cached bucket index should be refreshed. This option is used only by querier.")
 	f.DurationVar(&cfg.UpdateOnErrorInterval, prefix+"update-on-error-interval", time.Minute, "How frequently a bucket index, which previously failed to load, should be tried to load again. This option is used only by querier.")
 	f.DurationVar(&cfg.IdleTimeout, prefix+"idle-timeout", time.Hour, "How long a unused bucket index should be cached. Once this timeout expires, the unused bucket index is removed from the in-memory cache. This option is used only by querier.")
 	f.DurationVar(&cfg.MaxStalePeriod, prefix+"max-stale-period", time.Hour, "The maximum allowed age of a bucket index (last updated) before queries start failing because the bucket index is too old. The bucket index is periodically updated by the compactor, while this check is enforced in the querier (at query time).")

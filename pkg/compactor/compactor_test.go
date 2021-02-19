@@ -660,6 +660,7 @@ func TestCompactor_ShouldNotCompactBlocksForUsersMarkedForDeletion(t *testing.T)
 	bucketClient.MockIter("user-1/01DTVP434PA9VFXSW2JKB3392D", []string{"user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", "user-1/01DTVP434PA9VFXSW2JKB3392D/index"}, nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", mockBlockMetaJSON("01DTVP434PA9VFXSW2JKB3392D"), nil)
 	bucketClient.MockGet("user-1/01DTVP434PA9VFXSW2JKB3392D/index", "some index content", nil)
+	bucketClient.MockExists("user-1/01DTVP434PA9VFXSW2JKB3392D/deletion-mark.json", false, nil)
 
 	bucketClient.MockDelete("user-1/01DTVP434PA9VFXSW2JKB3392D/meta.json", nil)
 	bucketClient.MockDelete("user-1/01DTVP434PA9VFXSW2JKB3392D/index", nil)
@@ -1067,9 +1068,15 @@ func prepare(t *testing.T, compactorCfg Config, bucketClient objstore.Bucket) (*
 	logger := log.NewLogfmtLogger(logs)
 	registry := prometheus.NewRegistry()
 
-	c, err := newCompactor(compactorCfg, storageCfg, logger, registry, func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error) {
-		return bucketClient, tsdbCompactor, tsdbPlanner, nil
-	})
+	bucketClientFactory := func(ctx context.Context) (objstore.Bucket, error) {
+		return bucketClient, nil
+	}
+
+	blocksCompactorFactory := func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, compact.Planner, error) {
+		return tsdbCompactor, tsdbPlanner, nil
+	}
+
+	c, err := newCompactor(compactorCfg, storageCfg, logger, registry, bucketClientFactory, DefaultBlocksGrouperFactory, blocksCompactorFactory)
 	require.NoError(t, err)
 
 	return c, tsdbCompactor, tsdbPlanner, logs, registry, cleanup

@@ -38,6 +38,7 @@ type Limits struct {
 	AcceptHASamples           bool                `yaml:"accept_ha_samples"`
 	HAClusterLabel            string              `yaml:"ha_cluster_label"`
 	HAReplicaLabel            string              `yaml:"ha_replica_label"`
+	HAMaxClusters             int                 `yaml:"ha_max_clusters"`
 	DropLabels                flagext.StringSlice `yaml:"drop_labels"`
 	MaxLabelNameLength        int                 `yaml:"max_label_name_length"`
 	MaxLabelValueLength       int                 `yaml:"max_label_value_length"`
@@ -98,6 +99,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&l.AcceptHASamples, "distributor.ha-tracker.enable-for-all-users", false, "Flag to enable, for all users, handling of samples with external labels identifying replicas in an HA Prometheus setup.")
 	f.StringVar(&l.HAClusterLabel, "distributor.ha-tracker.cluster", "cluster", "Prometheus label to look for in samples to identify a Prometheus HA cluster.")
 	f.StringVar(&l.HAReplicaLabel, "distributor.ha-tracker.replica", "__replica__", "Prometheus label to look for in samples to identify a Prometheus HA replica.")
+	f.IntVar(&l.HAMaxClusters, "distributor.ha-tracker.max-clusters", 0, "Maximum number of clusters that HA tracker will keep track of for single user. 0 to disable the limit.")
 	f.Var(&l.DropLabels, "distributor.drop-label", "This flag can be used to specify label names that to drop during sample ingestion within the distributor and can be repeated in order to drop multiple labels.")
 	f.IntVar(&l.MaxLabelNameLength, "validation.max-length-label-name", 1024, "Maximum length accepted for label names")
 	f.IntVar(&l.MaxLabelValueLength, "validation.max-length-label-value", 2048, "Maximum length accepted for label value. This setting also applies to the metric name")
@@ -413,6 +415,11 @@ func (o *Overrides) StoreGatewayTenantShardSize(userID string) int {
 	return o.getOverridesForUser(userID).StoreGatewayTenantShardSize
 }
 
+// MaxHAClusters returns maximum number of clusters that HA tracker will track for a user.
+func (o *Overrides) MaxHAClusters(user string) int {
+	return o.getOverridesForUser(user).HAMaxClusters
+}
+
 func (o *Overrides) getOverridesForUser(userID string) *Limits {
 	if o.tenantLimits != nil {
 		l := o.tenantLimits(userID)
@@ -473,4 +480,17 @@ func SmallestPositiveNonZeroDurationPerTenant(tenantIDs []string, f func(string)
 		return 0
 	}
 	return *result
+}
+
+// MaxDurationPerTenant is returning the maximum duration per tenant. Without
+// tenants given it will return a time.Duration(0).
+func MaxDurationPerTenant(tenantIDs []string, f func(string) time.Duration) time.Duration {
+	result := time.Duration(0)
+	for _, tenantID := range tenantIDs {
+		v := f(tenantID)
+		if v > result {
+			result = v
+		}
+	}
+	return result
 }

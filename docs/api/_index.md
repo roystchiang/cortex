@@ -19,6 +19,7 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | --- | ------- | -------- |
 | [Index page](#index-page) | _All services_ | `GET /` |
 | [Configuration](#configuration) | _All services_ | `GET /config` |
+| [Runtime Configuration](#runtime-configuration) | _All services_ | `GET /runtime_config` |
 | [Services status](#services-status) | _All services_ | `GET /services` |
 | [Readiness probe](#readiness-probe) | _All services_ | `GET /ready` |
 | [Metrics](#metrics) | _All services_ | `GET /metrics` |
@@ -49,6 +50,7 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Delete rule group](#delete-rule-group) | Ruler | `DELETE /api/v1/rules/{namespace}/{groupName}` |
 | [Delete namespace](#delete-namespace) | Ruler | `DELETE /api/v1/rules/{namespace}` |
 | [Alertmanager status](#alertmanager-status) | Alertmanager | `GET /multitenant_alertmanager/status` |
+| [Alertmanager ring status](#alertmanager-ring-status) | Alertmanager | `GET /multitenant_alertmanager/ring` |
 | [Alertmanager UI](#alertmanager-ui) | Alertmanager | `GET /<alertmanager-http-prefix>` |
 | [Get Alertmanager configuration](#get-alertmanager-configuration) | Alertmanager | `GET /api/v1/alerts` |
 | [Set Alertmanager configuration](#set-alertmanager-configuration) | Alertmanager | `POST /api/v1/alerts` |
@@ -108,6 +110,36 @@ GET /config
 ```
 
 Displays the configuration currently applied to Cortex (in YAML format), including default values and settings via CLI flags. Sensitive data is masked. Please be aware that the exported configuration **doesn't include the per-tenant overrides**.
+
+#### Different modes
+
+```
+GET /config?mode=diff
+```
+
+Displays the configuration currently applied to Cortex (in YAML format) as before, but containing only the values that differ from the default values.
+
+```
+GET /config?mode=defaults
+```
+
+Displays the configuration using only the default values.
+
+### Runtime Configuration
+
+```
+GET /runtime_config
+```
+
+Displays the runtime configuration currently applied to Cortex (in YAML format), including default values. Please be aware that the endpoint will be only available if Cortex is configured with the `-runtime-config.file` option.
+
+#### Different modes
+
+```
+GET /runtime_config?mode=diff
+```
+
+Displays the runtime configuration currently applied to Cortex (in YAML format) as before, but containing only the values that differ from the default values.
 
 ### Services status
 
@@ -616,6 +648,14 @@ GET /status
 ```
 
 Displays a web page with the current status of the Alertmanager, including the Alertmanager cluster members.
+
+### Alertmanager ring status
+
+```
+GET /multitenant_alertmanager/ring
+```
+
+Displays a web page with the Alertmanager hash ring status, including the state, healthy and last heartbeat time of each Alertmanager instance.
 
 ### Alertmanager UI
 

@@ -10,8 +10,8 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 const (
@@ -20,6 +20,12 @@ const (
 	// receive duplicate/out-of-order sample errors.
 	ringAutoForgetUnhealthyPeriods = 2
 )
+
+// RingOp is the operation used for distributing rule groups between rulers.
+var RingOp = ring.NewOp([]ring.IngesterState{ring.ACTIVE}, func(s ring.IngesterState) bool {
+	// Only ACTIVE rulers get any rule groups. If instance is not ACTIVE, we need to find another ruler.
+	return s != ring.ACTIVE
+})
 
 // RingConfig masks the ring lifecycler config which contains
 // many options not really required by the rulers ring. This config
@@ -48,7 +54,7 @@ type RingConfig struct {
 func (cfg *RingConfig) RegisterFlags(f *flag.FlagSet) {
 	hostname, err := os.Hostname()
 	if err != nil {
-		level.Error(util.Logger).Log("msg", "failed to get hostname", "err", err)
+		level.Error(util_log.Logger).Log("msg", "failed to get hostname", "err", err)
 		os.Exit(1)
 	}
 
@@ -91,6 +97,7 @@ func (cfg *RingConfig) ToRingConfig() ring.Config {
 
 	rc.KVStore = cfg.KVStore
 	rc.HeartbeatTimeout = cfg.HeartbeatTimeout
+	rc.SubringCacheDisabled = true
 
 	// Each rule group is loaded to *exactly* one ruler.
 	rc.ReplicationFactor = 1

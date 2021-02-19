@@ -4,8 +4,12 @@ package integration
 
 import (
 	"context"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,9 +18,12 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
+	"github.com/prometheus/prometheus/pkg/value"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/cortexproject/cortex/integration/ca"
 	"github.com/cortexproject/cortex/integration/e2e"
 	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/cortexproject/cortex/integration/e2ecortex"
@@ -179,45 +186,110 @@ func TestRulerEvaluationDelay(t *testing.T) {
 	namespace := "ns"
 	user := "fake"
 
+	evaluationDelay := time.Minute * 5
+
 	configOverrides := map[string]string{
 		"-ruler.storage.local.directory":   filepath.Join(e2e.ContainerSharedDir, "ruler_configs"),
 		"-ruler.poll-interval":             "2s",
 		"-ruler.rule-path":                 filepath.Join(e2e.ContainerSharedDir, "rule_tmp/"),
-		"-ruler.evaluation-delay-duration": "5m", // 5 minutes is clarifying when seeing when a rule is evaluated
+		"-ruler.evaluation-delay-duration": evaluationDelay.String(),
 	}
 
 	// Start Cortex components.
 	require.NoError(t, copyFileToSharedDir(s, "docs/configuration/single-process-config.yaml", cortexConfigFile))
-	require.NoError(t, writeFileToSharedDir(s, filepath.Join("ruler_configs", user, namespace), []byte(cortexRulerEvalTimeConfigYaml)))
+	require.NoError(t, writeFileToSharedDir(s, filepath.Join("ruler_configs", user, namespace), []byte(cortexRulerEvalStaleNanConfigYaml)))
 	cortex := e2ecortex.NewSingleBinaryWithConfigFile("cortex", cortexConfigFile, configOverrides, "", 9009, 9095)
 	require.NoError(t, s.StartAndWaitReady(cortex))
 
 	// Create a client with the ruler address configured
-	c, err := e2ecortex.NewClient("", cortex.HTTPEndpoint(), "", cortex.HTTPEndpoint(), "")
+	c, err := e2ecortex.NewClient(cortex.HTTPEndpoint(), cortex.HTTPEndpoint(), "", cortex.HTTPEndpoint(), "")
 	require.NoError(t, err)
-
-	// Wait until the rule is evaluated
-	require.NoError(t, cortex.WaitSumMetrics(e2e.Greater(0), "cortex_prometheus_rule_evaluations_total"))
 
 	now := time.Now()
 
-	result, err := c.QueryRange("time_eval", now.Add(-10*time.Minute), now, time.Minute)
+	// Generate series that includes stale nans
+	var samplesToSend int = 10
+	series := prompb.TimeSeries{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: "a_sometimes_stale_nan_series"},
+			{Name: "instance", Value: "sometimes-stale"},
+		},
+	}
+	series.Samples = make([]prompb.Sample, samplesToSend)
+	posStale := 2
+
+	// Create samples, that are delayed by the evaluation delay with increasing values.
+	for pos := range series.Samples {
+		series.Samples[pos].Timestamp = e2e.TimeToMilliseconds(now.Add(-evaluationDelay).Add(time.Duration(pos) * time.Second))
+		series.Samples[pos].Value = float64(pos + 1)
+
+		// insert staleness marker at the positions marked by posStale
+		if pos == posStale {
+			series.Samples[pos].Value = math.Float64frombits(value.StaleNaN)
+		}
+	}
+
+	// Insert metrics
+	res, err := c.Push([]prompb.TimeSeries{series})
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	// Get number of rule evaluations just after push
+	ruleEvaluationsAfterPush, err := cortex.SumMetrics([]string{"cortex_prometheus_rule_evaluations_total"})
+	require.NoError(t, err)
+
+	// Wait until the rule is evaluated for the first time
+	require.NoError(t, cortex.WaitSumMetrics(e2e.Greater(ruleEvaluationsAfterPush[0]), "cortex_prometheus_rule_evaluations_total"))
+
+	// Query the timestamp of the latest result to ensure the evaluation is delayed
+	result, err := c.Query("timestamp(stale_nan_eval)", now)
+	require.NoError(t, err)
+	require.Equal(t, model.ValVector, result.Type())
+
+	vector := result.(model.Vector)
+	require.Equal(t, 1, vector.Len(), "expect one sample returned")
+
+	// 290 seconds gives 10 seconds of slack between the rule evaluation and the query
+	// to account for CI latency, but ensures the latest evaluation was in the past.
+	var maxDiff int64 = 290_000
+	require.GreaterOrEqual(t, e2e.TimeToMilliseconds(time.Now())-int64(vector[0].Value)*1000, maxDiff)
+
+	// Wait until all the pushed samples have been evaluated by the rule. This
+	// ensures that rule results are successfully written even after a
+	// staleness period.
+	require.NoError(t, cortex.WaitSumMetrics(e2e.GreaterOrEqual(ruleEvaluationsAfterPush[0]+float64(samplesToSend)), "cortex_prometheus_rule_evaluations_total"))
+
+	// query all results to verify rules have been evaluated correctly
+	result, err = c.QueryRange("stale_nan_eval", now.Add(-evaluationDelay), now, time.Second)
 	require.NoError(t, err)
 	require.Equal(t, model.ValMatrix, result.Type())
 
-	// Iterate through the values recorded and ensure they exist in the past.
 	matrix := result.(model.Matrix)
+	require.GreaterOrEqual(t, 1, matrix.Len(), "expect at least a series returned")
 
-	// 290 seconds gives 10 seconds of slack between the rule evaluation and the query
-	// to account for CI latency, but ensures the latest evalation was in the past.
-	var maxDiff int64 = 290
-
+	// Iterate through the values recorded and ensure they exist as expected.
+	inputPos := 0
 	for _, m := range matrix {
 		for _, v := range m.Values {
-			diff := now.Unix() - int64(v.Value)
-			require.GreaterOrEqual(t, diff, maxDiff)
+			// Skip values for stale positions
+			if inputPos == posStale {
+				inputPos++
+			}
+
+			expectedValue := model.SampleValue(2 * (inputPos + 1))
+			require.Equal(t, expectedValue, v.Value)
+
+			// Look for next value
+			inputPos++
+
+			// We have found all input values
+			if inputPos >= len(series.Samples) {
+				break
+			}
 		}
 	}
+	require.Equal(t, len(series.Samples), inputPos, "expect to have returned all evaluations")
+
 }
 
 func TestRulerAlertmanager(t *testing.T) {
@@ -267,6 +339,85 @@ func TestRulerAlertmanager(t *testing.T) {
 
 	//  Wait until we've discovered the alertmanagers.
 	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(2), []string{"cortex_prometheus_notifications_alertmanagers_discovered"}, e2e.WaitMissingMetrics))
+}
+
+func TestRulerAlertmanagerTLS(t *testing.T) {
+	var namespaceOne = "test_/encoded_+namespace/?"
+	ruleGroup := createTestRuleGroup(t)
+
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Start dependencies.
+	dynamo := e2edb.NewDynamoDB()
+	minio := e2edb.NewMinio(9000, RulerFlags()["-ruler.storage.s3.buckets"])
+	require.NoError(t, s.StartAndWaitReady(minio, dynamo))
+
+	// set the ca
+	cert := ca.New("Ruler/Alertmanager Test")
+
+	// Ensure the entire path of directories exist.
+	require.NoError(t, os.MkdirAll(filepath.Join(s.SharedDir(), "certs"), os.ModePerm))
+
+	require.NoError(t, cert.WriteCACertificate(filepath.Join(s.SharedDir(), caCertFile)))
+
+	// server certificate
+	require.NoError(t, cert.WriteCertificate(
+		&x509.Certificate{
+			Subject:     pkix.Name{CommonName: "client"},
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		},
+		filepath.Join(s.SharedDir(), clientCertFile),
+		filepath.Join(s.SharedDir(), clientKeyFile),
+	))
+	require.NoError(t, cert.WriteCertificate(
+		&x509.Certificate{
+			Subject:     pkix.Name{CommonName: "server"},
+			DNSNames:    []string{"ruler.alertmanager-client"},
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		},
+		filepath.Join(s.SharedDir(), serverCertFile),
+		filepath.Join(s.SharedDir(), serverKeyFile),
+	))
+
+	// Have at least one alertmanager configuration.
+	require.NoError(t, writeFileToSharedDir(s, "alertmanager_configs/user-1.yaml", []byte(cortexAlertmanagerUserConfigYaml)))
+
+	// Start Alertmanagers.
+	amFlags := mergeFlags(
+		AlertmanagerFlags(),
+		AlertmanagerLocalFlags(),
+		getServerHTTPTLSFlags(),
+	)
+	am1 := e2ecortex.NewAlertmanagerWithTLS("alertmanager1", amFlags, "")
+	require.NoError(t, s.StartAndWaitReady(am1))
+
+	// Connect the ruler to the Alertmanager
+	configOverrides := mergeFlags(
+		map[string]string{
+			"-ruler.alertmanager-url": "https://" + am1.HTTPEndpoint(),
+		},
+		getTLSFlagsWithPrefix("ruler.alertmanager-client", "alertmanager", true),
+	)
+
+	// Start Ruler.
+	require.NoError(t, writeFileToSharedDir(s, cortexSchemaConfigFile, []byte(cortexSchemaConfigYaml)))
+	ruler := e2ecortex.NewRuler("ruler", mergeFlags(ChunksStorageFlags(), RulerFlags(), configOverrides), "")
+	require.NoError(t, s.StartAndWaitReady(ruler))
+
+	// Create a client with the ruler address configured
+	c, err := e2ecortex.NewClient("", "", "", ruler.HTTPEndpoint(), "user-1")
+	require.NoError(t, err)
+
+	// Set the rule group into the ruler
+	require.NoError(t, c.SetRuleGroup(ruleGroup, namespaceOne))
+
+	// Wait until the user manager is created
+	require.NoError(t, ruler.WaitSumMetrics(e2e.Equals(1), "cortex_ruler_managers_total"))
+
+	//  Wait until we've discovered the alertmanagers.
+	require.NoError(t, ruler.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_prometheus_notifications_alertmanagers_discovered"}, e2e.WaitMissingMetrics))
 }
 
 func createTestRuleGroup(t *testing.T) rulefmt.RuleGroup {

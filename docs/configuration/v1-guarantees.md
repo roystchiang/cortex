@@ -37,6 +37,7 @@ Cortex is an actively developed project and we want to encourage the introductio
 
 Currently experimental features are:
 
+- S3 Server Side Encryption (SSE) using KMS.
 - Azure blob storage.
 - Zone awareness based replication.
 - Shuffle sharding (both read and write path).
@@ -45,7 +46,6 @@ Currently experimental features are:
 - Memcached client DNS-based service discovery.
 - Delete series APIs.
 - In-memory (FIFO) and Redis cache.
-- Openstack Swift storage.
 - gRPC Store.
 - Querier support for querying chunks and blocks store at the same time.
 - Tracking of active series and exporting them as metrics (`-ingester.active-series-metrics-enabled` and related flags)
@@ -53,7 +53,7 @@ Currently experimental features are:
 - TLS configuration in gRPC and HTTP clients.
 - TLS configuration in Etcd client.
 - Blocksconvert tools
-- OpenStack Swift storage support.
+- OpenStack Swift storage support (both in blocks and chunks storage).
 - Metric relabeling in the distributor.
 - Scalable query-frontend (when using query-scheduler)
 - Querying store for series, labels APIs (`-querier.query-store-for-labels-enabled`)
@@ -67,3 +67,4 @@ Currently experimental features are:
   - The bucket index support in the querier and store-gateway (enabled via `-blocks-storage.bucket-store.bucket-index.enabled=true`) is experimental
   - The block deletion marks migration support in the compactor (`-compactor.block-deletion-marks-migration-enabled`) is temporarily and will be removed in future versions
 - Querier: tenant federation
+- Alertmanager: Sharding of tenants across multiple instances

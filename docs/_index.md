@@ -44,6 +44,7 @@ To learn more about Cortex, consult the following talks and articles.
 
 ### Recent talks and articles
 
+- Dec 2020 blog post "[How AWS and Grafana Labs are scaling Cortex for the cloud](https://aws.amazon.com/blogs/opensource/how-aws-and-grafana-labs-are-scaling-cortex-for-the-cloud/)
 - Oct 2020 blog post "[How to switch Cortex from chunks to blocks storage (and why you won’t look back)](https://grafana.com/blog/2020/10/19/how-to-switch-cortex-from-chunks-to-blocks-storage-and-why-you-wont-look-back/)"
 - Oct 2020 blog post "[Now GA: Cortex blocks storage for running Prometheus at scale with reduced operational complexity](https://grafana.com/blog/2020/10/06/now-ga-cortex-blocks-storage-for-running-prometheus-at-scale-with-reduced-operational-complexity/)"
 - Sep 2020 blog post "[A Tale of Tail Latencies](https://www.weave.works/blog/a-tale-of-tail-latencies)"
@@ -152,6 +153,11 @@ in the [Weave Cloud documentation](https://www.weave.works/docs/cloud/latest/ove
 
 ### Grafana Cloud
 
-To use Cortex as part of Grafana Cloud, sign up for [Grafana Cloud](https://grafana.com/cloud)
-by clicking "Log In" in the top right and then "Sign Up Now".  Cortex is included
-as part of the Starter and Basic Hosted Grafana plans.
+The Cortex project was started by Tom Wilkie (Grafana Labs' VP Product) and Julius Volz (Prometheus' co-founder) in June 2016. Employing 6 out of 8 maintainers for Cortex enables [Grafana Labs](https://grafana.com/) to offer Cortex-as-a-service with exceptional performance and reliability. As the creators of [Grafana](https://grafana.com/oss/grafana/), [Loki](https://grafana.com/oss/loki/), and [Tempo](https://grafana.com/oss/tempo/), Grafana Labs can offer you the most wholistic Observability-as-a-Service stack out there.
+
+For further information see Grafana Cloud [documentation](https://grafana.com/docs/grafana-cloud/), [tutorials](https://grafana.com/tutorials/), [webinars](https://grafana.com/videos/), and [KubeCon talks](https://grafana.com/categories/cortex/). Get started today and [sign up here](https://grafana.com/products/cloud/).
+
+### Amazon Managed Service for Prometheus (AMP)
+[Amazon Managed Service for Prometheus (AMP)](https://aws.amazon.com/prometheus/) is a Prometheus-compatible monitoring service that makes it easy to monitor containerized applications at scale. It is a highly available, secure, and managed monitoring for your containers. Get started [here](https://console.aws.amazon.com/prometheus/home). To learn more about the AMP, reference our [documentation](https://docs.aws.amazon.com/prometheus/latest/userguide/what-is-Amazon-Managed-Service-Prometheus.html) and [Getting Started with AMP blog](https://aws.amazon.com/blogs/mt/getting-started-amazon-managed-service-for-prometheus/).
+
+

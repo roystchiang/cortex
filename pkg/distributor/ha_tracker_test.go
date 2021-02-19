@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,8 +19,10 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
+	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 var (
@@ -135,7 +140,7 @@ func TestWatchPrefixAssignment(t *testing.T) {
 		UpdateTimeout:          time.Millisecond,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Millisecond * 2,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -165,7 +170,7 @@ func TestCheckReplicaOverwriteTimeout(t *testing.T) {
 		UpdateTimeout:          100 * time.Millisecond,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -194,13 +199,14 @@ func TestCheckReplicaMultiCluster(t *testing.T) {
 	replica1 := "replica1"
 	replica2 := "replica2"
 
+	reg := prometheus.NewPedanticRegistry()
 	c, err := newClusterTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Store: "inmemory"},
 		UpdateTimeout:          100 * time.Millisecond,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -222,6 +228,19 @@ func TestCheckReplicaMultiCluster(t *testing.T) {
 	assert.NoError(t, err)
 	err = c.checkReplica(context.Background(), "user", "c2", replica1)
 	assert.NoError(t, err)
+
+	// We expect no CAS operation failures.
+	metrics, err := reg.Gather()
+	require.NoError(t, err)
+
+	assert.Equal(t, uint64(0), util.GetSumOfHistogramSampleCount(metrics, "cortex_kv_request_duration_seconds", labels.Selector{
+		labels.MustNewMatcher(labels.MatchEqual, "operation", "CAS"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status_code", "5.*"),
+	}))
+	assert.Greater(t, util.GetSumOfHistogramSampleCount(metrics, "cortex_kv_request_duration_seconds", labels.Selector{
+		labels.MustNewMatcher(labels.MatchEqual, "operation", "CAS"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status_code", "2.*"),
+	}), uint64(0))
 }
 
 func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
@@ -229,13 +248,14 @@ func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
 	replica1 := "replica1"
 	replica2 := "replica2"
 
+	reg := prometheus.NewPedanticRegistry()
 	c, err := newClusterTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Store: "inmemory"},
 		UpdateTimeout:          100 * time.Millisecond,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, reg)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -257,7 +277,13 @@ func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
 	err = c.checkReplica(context.Background(), "user", "c2", replica1)
 	assert.NoError(t, err)
 
-	// Wait more than the timeout.
+	// Reject samples from replica 2 in each cluster.
+	err = c.checkReplica(context.Background(), "user", "c1", replica2)
+	assert.Error(t, err)
+	err = c.checkReplica(context.Background(), "user", "c2", replica2)
+	assert.Error(t, err)
+
+	// Wait more than the failover timeout.
 	mtime.NowForce(start.Add(1100 * time.Millisecond))
 
 	// Accept a sample from c1/replica2.
@@ -269,6 +295,19 @@ func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
 	assert.Error(t, err)
 	err = c.checkReplica(context.Background(), "user", "c2", replica1)
 	assert.NoError(t, err)
+
+	// We expect no CAS operation failures.
+	metrics, err := reg.Gather()
+	require.NoError(t, err)
+
+	assert.Equal(t, uint64(0), util.GetSumOfHistogramSampleCount(metrics, "cortex_kv_request_duration_seconds", labels.Selector{
+		labels.MustNewMatcher(labels.MatchEqual, "operation", "CAS"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status_code", "5.*"),
+	}))
+	assert.Greater(t, util.GetSumOfHistogramSampleCount(metrics, "cortex_kv_request_duration_seconds", labels.Selector{
+		labels.MustNewMatcher(labels.MatchEqual, "operation", "CAS"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status_code", "2.*"),
+	}), uint64(0))
 }
 
 // Test that writes only happen every update timeout.
@@ -286,7 +325,7 @@ func TestCheckReplicaUpdateTimeout(t *testing.T) {
 		UpdateTimeout:          time.Second,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -347,7 +386,7 @@ func TestCheckReplicaMultiUser(t *testing.T) {
 		UpdateTimeout:          100 * time.Millisecond,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, nil)
+	}, trackerLimits{maxClusters: 100}, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -430,7 +469,7 @@ func TestCheckReplicaUpdateTimeoutJitter(t *testing.T) {
 				UpdateTimeout:          testData.updateTimeout,
 				UpdateTimeoutJitterMax: 0,
 				FailoverTimeout:        time.Second,
-			}, nil)
+			}, trackerLimits{maxClusters: 100}, nil)
 			require.NoError(t, err)
 			require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 			defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -517,4 +556,86 @@ func TestHATrackerConfig_ShouldCustomizePrefixDefaultValue(t *testing.T) {
 
 	assert.Equal(t, "ha-tracker/", haConfig.KVStore.Prefix)
 	assert.NotEqual(t, haConfig.KVStore.Prefix, ringConfig.KVStore.Prefix)
+}
+
+func TestHAClustersLimit(t *testing.T) {
+	defer mtime.NowReset()
+
+	const userID = "user"
+
+	codec := GetReplicaDescCodec()
+	mock := kv.PrefixClient(consul.NewInMemoryClient(codec), "prefix")
+	limits := trackerLimits{maxClusters: 2}
+
+	t1, err := newClusterTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mock},
+		UpdateTimeout:          time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        time.Second,
+	}, limits, nil)
+
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), t1))
+	defer services.StopAndAwaitTerminated(context.Background(), t1) //nolint:errcheck
+
+	assert.NoError(t, t1.checkReplica(context.Background(), userID, "a", "a1"))
+	waitForClustersUpdate(t, 1, t1, userID)
+
+	assert.NoError(t, t1.checkReplica(context.Background(), userID, "b", "b1"))
+	waitForClustersUpdate(t, 2, t1, userID)
+
+	assert.EqualError(t, t1.checkReplica(context.Background(), userID, "c", "c1"), "too many HA clusters (limit: 2)")
+
+	// Move time forward, and make sure that checkReplica for existing cluster works fine.
+	mtime.NowForce(time.Now().Add(5 * time.Second)) // higher than "update timeout"
+
+	assert.NoError(t, t1.checkReplica(context.Background(), userID, "b", "b2"))
+	waitForClustersUpdate(t, 2, t1, userID)
+}
+
+func waitForClustersUpdate(t *testing.T, expected int, tr *haTracker, userID string) {
+	t.Helper()
+	test.Poll(t, 2*time.Second, expected, func() interface{} {
+		tr.electedLock.RLock()
+		defer tr.electedLock.RUnlock()
+
+		return tr.clusters[userID]
+	})
+}
+
+func TestTooManyClustersError(t *testing.T) {
+	var err error = tooManyClustersError{limit: 10}
+	assert.True(t, errors.Is(err, tooManyClustersError{}))
+	assert.True(t, errors.Is(err, &tooManyClustersError{}))
+
+	err = &tooManyClustersError{limit: 20}
+	assert.True(t, errors.Is(err, tooManyClustersError{}))
+	assert.True(t, errors.Is(err, &tooManyClustersError{}))
+
+	err = replicasNotMatchError{replica: "a", elected: "b"}
+	assert.False(t, errors.Is(err, tooManyClustersError{}))
+	assert.False(t, errors.Is(err, &tooManyClustersError{}))
+}
+
+func TestReplicasNotMatchError(t *testing.T) {
+	var err error = replicasNotMatchError{replica: "a", elected: "b"}
+	assert.True(t, errors.Is(err, replicasNotMatchError{}))
+	assert.True(t, errors.Is(err, &replicasNotMatchError{}))
+
+	err = &replicasNotMatchError{replica: "a", elected: "b"}
+	assert.True(t, errors.Is(err, replicasNotMatchError{}))
+	assert.True(t, errors.Is(err, &replicasNotMatchError{}))
+
+	err = tooManyClustersError{limit: 10}
+	assert.False(t, errors.Is(err, replicasNotMatchError{}))
+	assert.False(t, errors.Is(err, &replicasNotMatchError{}))
+}
+
+type trackerLimits struct {
+	maxClusters int
+}
+
+func (l trackerLimits) MaxHAClusters(_ string) int {
+	return l.maxClusters
 }

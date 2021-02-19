@@ -132,6 +132,10 @@ querier:
   # CLI flag: -querier.query-store-for-labels-enabled
   [query_store_for_labels_enabled: <boolean> | default = false]
 
+  # Enable the @ modifier in PromQL.
+  # CLI flag: -querier.at-modifier-enabled
+  [at_modifier_enabled: <boolean> | default = false]
+
   # The time after which a metric should be queried from storage and not just
   # ingesters. 0 means all queries are sent to store. When running the blocks
   # storage, if this option is enabled, the time range of the query sent to the
@@ -168,6 +172,10 @@ querier:
   [store_gateway_addresses: <string> | default = ""]
 
   store_gateway_client:
+    # Enable TLS for gRPC client connecting to store-gateway.
+    # CLI flag: -querier.store-gateway-client.tls-enabled
+    [tls_enabled: <boolean> | default = false]
+
     # Path to the client certificate file, which will be used for authenticating
     # with the server. Also requires the key path to be configured.
     # CLI flag: -querier.store-gateway-client.tls-cert-path
@@ -182,6 +190,10 @@ querier:
     # If not set, the host's root CA certificates are used.
     # CLI flag: -querier.store-gateway-client.tls-ca-path
     [tls_ca_path: <string> | default = ""]
+
+    # Override the expected name on the server certificate.
+    # CLI flag: -querier.store-gateway-client.tls-server-name
+    [tls_server_name: <string> | default = ""]
 
     # Skip validating server certificate.
     # CLI flag: -querier.store-gateway-client.tls-insecure-skip-verify
@@ -261,6 +273,30 @@ blocks_storage:
       # CLI flag: -blocks-storage.s3.http.insecure-skip-verify
       [insecure_skip_verify: <boolean> | default = false]
 
+      # Maximum time to wait for a TLS handshake. 0 means no limit.
+      # CLI flag: -blocks-storage.s3.tls-handshake-timeout
+      [tls_handshake_timeout: <duration> | default = 10s]
+
+      # The time to wait for a server's first response headers after fully
+      # writing the request headers if the request has an Expect header. 0 to
+      # send the request body immediately.
+      # CLI flag: -blocks-storage.s3.expect-continue-timeout
+      [expect_continue_timeout: <duration> | default = 1s]
+
+      # Maximum number of idle (keep-alive) connections across all hosts. 0
+      # means no limit.
+      # CLI flag: -blocks-storage.s3.max-idle-connections
+      [max_idle_connections: <int> | default = 100]
+
+      # Maximum number of idle (keep-alive) connections to keep per-host. If 0,
+      # a built-in default value is used.
+      # CLI flag: -blocks-storage.s3.max-idle-connections-per-host
+      [max_idle_connections_per_host: <int> | default = 100]
+
+      # Maximum number of connections per host. 0 means no limit.
+      # CLI flag: -blocks-storage.s3.max-connections-per-host
+      [max_connections_per_host: <int> | default = 0]
+
   gcs:
     # GCS bucket name
     # CLI flag: -blocks-storage.gcs.bucket-name
@@ -295,6 +331,10 @@ blocks_storage:
     [max_retries: <int> | default = 20]
 
   swift:
+    # OpenStack Swift authentication API version. 0 to autodetect.
+    # CLI flag: -blocks-storage.swift.auth-version
+    [auth_version: <int> | default = 0]
+
     # OpenStack Swift authentication URL
     # CLI flag: -blocks-storage.swift.auth-url
     [auth_url: <string> | default = ""]
@@ -353,6 +393,20 @@ blocks_storage:
     # CLI flag: -blocks-storage.swift.container-name
     [container_name: <string> | default = ""]
 
+    # Max retries on requests error.
+    # CLI flag: -blocks-storage.swift.max-retries
+    [max_retries: <int> | default = 3]
+
+    # Time after which a connection attempt is aborted.
+    # CLI flag: -blocks-storage.swift.connect-timeout
+    [connect_timeout: <duration> | default = 10s]
+
+    # Time after which an idle request is aborted. The timeout watchdog is reset
+    # each time some data is received, so the timeout triggers after X time no
+    # data is received on a request.
+    # CLI flag: -blocks-storage.swift.request-timeout
+    [request_timeout: <duration> | default = 5s]
+
   filesystem:
     # Local filesystem storage directory.
     # CLI flag: -blocks-storage.filesystem.dir
@@ -365,11 +419,11 @@ blocks_storage:
     # CLI flag: -blocks-storage.bucket-store.sync-dir
     [sync_dir: <string> | default = "tsdb-sync"]
 
-    # How frequently scan the bucket - or fetch the bucket index (if enabled) -
-    # to look for changes (new blocks shipped by ingesters and blocks removed by
-    # retention or compaction). 0 disables it.
+    # How frequently to scan the bucket, or to refresh the bucket index (if
+    # enabled), in order to look for changes (new blocks shipped by ingesters
+    # and blocks deleted by retention or compaction).
     # CLI flag: -blocks-storage.bucket-store.sync-interval
-    [sync_interval: <duration> | default = 5m]
+    [sync_interval: <duration> | default = 15m]
 
     # Max size - in bytes - of a per-tenant chunk pool, used to reduce memory
     # allocations.
@@ -640,11 +694,6 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.bucket-index.enabled
       [enabled: <boolean> | default = false]
 
-      # How frequently a cached bucket index should be refreshed. This option is
-      # used only by querier.
-      # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-stale-interval
-      [update_on_stale_interval: <duration> | default = 15m]
-
       # How frequently a bucket index, which previously failed to load, should
       # be tried to load again. This option is used only by querier.
       # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-error-interval
@@ -662,6 +711,17 @@ blocks_storage:
       # the querier (at query time).
       # CLI flag: -blocks-storage.bucket-store.bucket-index.max-stale-period
       [max_stale_period: <duration> | default = 1h]
+
+    # If enabled, store-gateway will lazy load an index-header only once
+    # required by a query.
+    # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-enabled
+    [index_header_lazy_loading_enabled: <boolean> | default = false]
+
+    # If index-header lazy loading is enabled and this setting is > 0, the
+    # store-gateway will offload unused index-headers after 'idle timeout'
+    # inactivity.
+    # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-idle-timeout
+    [index_header_lazy_loading_idle_timeout: <duration> | default = 20m]
 
   tsdb:
     # Local directory to store TSDBs in the ingesters.

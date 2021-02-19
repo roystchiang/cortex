@@ -37,6 +37,8 @@ import (
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
@@ -172,7 +174,7 @@ func NewBlocksStoreQueryableFromConfig(querierCfg Config, gatewayCfg storegatewa
 		finder = NewBucketIndexBlocksFinder(BucketIndexBlocksFinderConfig{
 			IndexLoader: bucketindex.LoaderConfig{
 				CheckInterval:         time.Minute,
-				UpdateOnStaleInterval: storageCfg.BucketStore.BucketIndex.UpdateOnStaleInterval,
+				UpdateOnStaleInterval: storageCfg.BucketStore.SyncInterval,
 				UpdateOnErrorInterval: storageCfg.BucketStore.BucketIndex.UpdateOnErrorInterval,
 				IdleTimeout:           storageCfg.BucketStore.BucketIndex.IdleTimeout,
 			},
@@ -200,7 +202,7 @@ func NewBlocksStoreQueryableFromConfig(querierCfg Config, gatewayCfg storegatewa
 			return nil, errors.Wrap(err, "failed to create store-gateway ring backend")
 		}
 
-		storesRing, err := ring.NewWithStoreClientAndStrategy(storesRingCfg, storegateway.RingNameForClient, storegateway.RingKey, storesRingBackend, &storegateway.BlocksReplicationStrategy{})
+		storesRing, err := ring.NewWithStoreClientAndStrategy(storesRingCfg, storegateway.RingNameForClient, storegateway.RingKey, storesRingBackend, ring.NewIgnoreUnhealthyInstancesReplicationStrategy())
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create store-gateway ring client")
 		}
@@ -447,7 +449,7 @@ func (q *blocksStoreQuerier) queryWithConsistencyCheck(ctx context.Context, logg
 	if q.queryStoreAfter > 0 {
 		now := time.Now()
 		origMaxT := maxT
-		maxT = util.Min64(maxT, util.TimeToMillis(now.Add(-q.queryStoreAfter)))
+		maxT = math.Min64(maxT, util.TimeToMillis(now.Add(-q.queryStoreAfter)))
 
 		if origMaxT != maxT {
 			level.Debug(logger).Log("msg", "the max time of the query to blocks storage has been manipulated", "original", origMaxT, "updated", maxT)
@@ -534,7 +536,7 @@ func (q *blocksStoreQuerier) queryWithConsistencyCheck(ctx context.Context, logg
 	}
 
 	// We've not been able to query all expected blocks after all retries.
-	level.Warn(util.WithContext(ctx, logger)).Log("msg", "failed consistency check", "err", err)
+	level.Warn(util_log.WithContext(ctx, logger)).Log("msg", "failed consistency check", "err", err)
 	return fmt.Errorf("consistency check failed because some blocks were not queried: %s", strings.Join(convertULIDsToString(remainingBlocks), " "))
 }
 

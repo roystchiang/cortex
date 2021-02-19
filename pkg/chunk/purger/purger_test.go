@@ -17,8 +17,8 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/testutils"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 )
@@ -202,7 +202,7 @@ func TestPurger_BuildPlan(t *testing.T) {
 				require.NoError(t, err)
 
 				deleteRequest := deleteRequests[0]
-				requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util.Logger)
+				requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util_log.Logger)
 
 				err = purger.buildDeletePlan(requestWithLogger)
 				require.NoError(t, err)
@@ -295,7 +295,7 @@ func TestPurger_ExecutePlan(t *testing.T) {
 				require.NoError(t, err)
 
 				deleteRequest := deleteRequests[0]
-				requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util.Logger)
+				requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util_log.Logger)
 				err = purger.buildDeletePlan(requestWithLogger)
 				require.NoError(t, err)
 
@@ -346,7 +346,7 @@ func TestPurger_Restarts(t *testing.T) {
 	require.NoError(t, err)
 
 	deleteRequest := deleteRequests[0]
-	requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util.Logger)
+	requestWithLogger := makeDeleteRequestWithLogger(deleteRequest, util_log.Logger)
 	err = purger.buildDeletePlan(requestWithLogger)
 	require.NoError(t, err)
 
@@ -435,9 +435,15 @@ func TestPurger_Metrics(t *testing.T) {
 		return testutil.ToFloat64(purger.metrics.deleteRequestsProcessedTotal)
 	})
 
-	// there must be 0 pending delete requests so the age for oldest pending must be 0
-	require.InDelta(t, float64(0), testutil.ToFloat64(purger.metrics.oldestPendingDeleteRequestAgeSeconds), 1)
-	require.Equal(t, float64(0), testutil.ToFloat64(purger.metrics.pendingDeleteRequestsCount))
+	// wait until oldest pending request age becomes 0
+	test.Poll(t, 2*time.Second, float64(0), func() interface{} {
+		return testutil.ToFloat64(purger.metrics.oldestPendingDeleteRequestAgeSeconds)
+	})
+
+	// wait until pending delete requests count becomes 0
+	test.Poll(t, 2*time.Second, float64(0), func() interface{} {
+		return testutil.ToFloat64(purger.metrics.pendingDeleteRequestsCount)
+	})
 }
 
 func TestPurger_retryFailedRequests(t *testing.T) {
