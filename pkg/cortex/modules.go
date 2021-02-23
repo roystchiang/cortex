@@ -1,6 +1,7 @@
 package cortex
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -37,6 +38,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
+	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/cortexproject/cortex/pkg/scheduler"
 	"github.com/cortexproject/cortex/pkg/storegateway"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
@@ -52,6 +54,7 @@ const (
 	Ring                     string = "ring"
 	RuntimeConfig            string = "runtime-config"
 	Overrides                string = "overrides"
+	OverridesExporter        string = "overrides-exporter"
 	Server                   string = "server"
 	Distributor              string = "distributor"
 	DistributorService       string = "distributor-service"
@@ -74,7 +77,7 @@ const (
 	StoreGateway             string = "store-gateway"
 	MemberlistKV             string = "memberlist-kv"
 	ChunksPurger             string = "chunks-purger"
-	BlocksPurger             string = "blocks-purger"
+	TenantDeletion           string = "tenant-deletion"
 	Purger                   string = "purger"
 	QueryScheduler           string = "query-scheduler"
 	TenantFederation         string = "tenant-federation"
@@ -158,16 +161,39 @@ func (t *Cortex) initRuntimeConfig() (services.Service, error) {
 	validation.SetDefaultLimitsForYAMLUnmarshalling(t.Cfg.LimitsConfig)
 
 	serv, err := runtimeconfig.NewRuntimeConfigManager(t.Cfg.RuntimeConfig, prometheus.DefaultRegisterer)
+	if err == nil {
+		// TenantLimits just delegates to RuntimeConfig and doesn't have any state or need to do
+		// anything in the start/stopping phase. Thus we can create it as part of runtime config
+		// setup without any service instance of its own.
+		t.TenantLimits = newTenantLimits(serv)
+	}
+
 	t.RuntimeConfig = serv
 	t.API.RegisterRuntimeConfig(runtimeConfigHandler(t.RuntimeConfig, t.Cfg.LimitsConfig))
 	return serv, err
 }
 
 func (t *Cortex) initOverrides() (serv services.Service, err error) {
-	t.Overrides, err = validation.NewOverrides(t.Cfg.LimitsConfig, tenantLimitsFromRuntimeConfig(t.RuntimeConfig))
+	t.Overrides, err = validation.NewOverrides(t.Cfg.LimitsConfig, t.TenantLimits)
 	// overrides don't have operational state, nor do they need to do anything more in starting/stopping phase,
 	// so there is no need to return any service.
 	return nil, err
+}
+
+func (t *Cortex) initOverridesExporter() (services.Service, error) {
+	if t.Cfg.isModuleEnabled(OverridesExporter) && t.TenantLimits == nil {
+		// This target isn't enabled by default ("all") and requires per-tenant limits to
+		// work. Fail if it can't be setup correctly since the user explicitly wanted this
+		// target to run.
+		return nil, errors.New("overrides-exporter has been enabled, but no runtime configuration file was configured")
+	}
+
+	exporter := validation.NewOverridesExporter(t.TenantLimits)
+	prometheus.MustRegister(exporter)
+
+	// the overrides exporter has no state and reads overrides for runtime configuration each time it
+	// is collected so there is no need to return any service
+	return nil, nil
 }
 
 func (t *Cortex) initDistributorService() (serv services.Service, err error) {
@@ -179,7 +205,7 @@ func (t *Cortex) initDistributorService() (serv services.Service, err error) {
 	// ruler's dependency)
 	canJoinDistributorsRing := t.Cfg.isModuleEnabled(Distributor) || t.Cfg.isModuleEnabled(All)
 
-	t.Distributor, err = distributor.New(t.Cfg.Distributor, t.Cfg.IngesterClient, t.Overrides, t.Ring, canJoinDistributorsRing, prometheus.DefaultRegisterer)
+	t.Distributor, err = distributor.New(t.Cfg.Distributor, t.Cfg.IngesterClient, t.Overrides, t.Ring, canJoinDistributorsRing, prometheus.DefaultRegisterer, util_log.Logger)
 	if err != nil {
 		return
 	}
@@ -199,7 +225,7 @@ func (t *Cortex) initQueryable() (serv services.Service, err error) {
 	querierRegisterer := prometheus.WrapRegistererWith(prometheus.Labels{"engine": "querier"}, prometheus.DefaultRegisterer)
 
 	// Create a querier queryable and PromQL engine
-	t.QuerierQueryable, t.QuerierEngine = querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.StoreQueryables, t.TombstonesLoader, querierRegisterer)
+	t.QuerierQueryable, t.QuerierEngine = querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.StoreQueryables, t.TombstonesLoader, querierRegisterer, util_log.Logger)
 
 	// Register the default endpoints that are always enabled for the querier module
 	t.API.RegisterQueryable(t.QuerierQueryable, t.Distributor)
@@ -537,10 +563,7 @@ func (t *Cortex) initQueryFrontend() (serv services.Service, err error) {
 		t.API.RegisterQueryFrontend1(frontendV1)
 		t.Frontend = frontendV1
 
-		return services.NewIdleService(nil, func(_ error) error {
-			frontendV1.Close()
-			return nil
-		}), nil
+		return frontendV1, nil
 	} else if frontendV2 != nil {
 		t.API.RegisterQueryFrontend2(frontendV2)
 
@@ -611,11 +634,22 @@ func (t *Cortex) initRulerStorage() (serv services.Service, err error) {
 	// to determine if it's unconfigured.  the following check, however, correctly tests this.
 	// Single binary integration tests will break if this ever drifts
 	if t.Cfg.isModuleEnabled(All) && t.Cfg.Ruler.StoreConfig.IsDefaults() {
-		level.Info(util_log.Logger).Log("msg", "RulerStorage is not configured in single binary mode and will not be started.")
+		level.Info(util_log.Logger).Log("msg", "Ruler storage is not configured in single binary mode and will not be started.")
 		return
 	}
 
-	t.RulerStorage, err = ruler.NewRuleStorage(t.Cfg.Ruler.StoreConfig, rules.FileLoader{})
+	// Purger didn't use ruler storage before, but now it does. However empty configuration just causes error,
+	// so to preserve previous purger behaviour, we simply disable it.
+	if t.Cfg.isModuleEnabled(Purger) && t.Cfg.Ruler.StoreConfig.IsDefaults() {
+		level.Info(util_log.Logger).Log("msg", "Ruler storage is not configured. If you want to use tenant deletion API and delete rule groups, please configure ruler storage.")
+		return
+	}
+
+	if !t.Cfg.Ruler.StoreConfig.IsDefaults() {
+		t.RulerStorage, err = ruler.NewRuleStorage(t.Cfg.Ruler.StoreConfig, rules.FileLoader{}, util_log.Logger)
+	} else {
+		t.RulerStorage, err = rulestore.NewRuleStore(context.Background(), t.Cfg.RulerStorage, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
+	}
 	return
 }
 
@@ -627,7 +661,8 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 
 	t.Cfg.Ruler.Ring.ListenPort = t.Cfg.Server.GRPCListenPort
 	rulerRegisterer := prometheus.WrapRegistererWith(prometheus.Labels{"engine": "ruler"}, prometheus.DefaultRegisterer)
-	queryable, engine := querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.StoreQueryables, t.TombstonesLoader, rulerRegisterer)
+	// TODO: Consider wrapping logger to differentiate from querier module logger
+	queryable, engine := querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.StoreQueryables, t.TombstonesLoader, rulerRegisterer, util_log.Logger)
 
 	managerFactory := ruler.DefaultTenantManagerFactory(t.Cfg.Ruler, t.Distributor, queryable, engine, t.Overrides)
 	manager, err := ruler.NewDefaultMultiTenantManager(t.Cfg.Ruler, managerFactory, prometheus.DefaultRegisterer, util_log.Logger)
@@ -652,7 +687,7 @@ func (t *Cortex) initRuler() (serv services.Service, err error) {
 
 	// If the API is enabled, register the Ruler API
 	if t.Cfg.Ruler.EnableAPI {
-		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage))
+		t.API.RegisterRulerAPI(ruler.NewAPI(t.Ruler, t.RulerStorage, util_log.Logger))
 	}
 
 	return t.Ruler, nil
@@ -673,21 +708,21 @@ func (t *Cortex) initConfig() (serv services.Service, err error) {
 }
 
 func (t *Cortex) initAlertManager() (serv services.Service, err error) {
-	t.Cfg.Alertmanager.ShardingRing.ListenPort = t.Cfg.Server.HTTPListenPort
+	t.Cfg.Alertmanager.ShardingRing.ListenPort = t.Cfg.Server.GRPCListenPort
 
 	t.Alertmanager, err = alertmanager.NewMultitenantAlertmanager(&t.Cfg.Alertmanager, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return
 	}
 
-	t.API.RegisterAlertmanager(t.Alertmanager, t.Cfg.isModuleEnabled(AlertManager), t.Cfg.Alertmanager.EnableAPI)
+	t.API.RegisterAlertmanager(t.Alertmanager, t.Cfg.Alertmanager, t.Cfg.isModuleEnabled(AlertManager), t.Cfg.Alertmanager.EnableAPI)
 	return t.Alertmanager, nil
 }
 
 func (t *Cortex) initCompactor() (serv services.Service, err error) {
 	t.Cfg.Compactor.ShardingRing.ListenPort = t.Cfg.Server.GRPCListenPort
 
-	t.Compactor, err = compactor.NewCompactor(t.Cfg.Compactor, t.Cfg.BlocksStorage, util_log.Logger, prometheus.DefaultRegisterer)
+	t.Compactor, err = compactor.NewCompactor(t.Cfg.Compactor, t.Cfg.BlocksStorage, t.Overrides, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return
 	}
@@ -757,17 +792,18 @@ func (t *Cortex) initChunksPurger() (services.Service, error) {
 	return t.Purger, nil
 }
 
-func (t *Cortex) initBlocksPurger() (services.Service, error) {
+func (t *Cortex) initTenantDeletionAPI() (services.Service, error) {
 	if t.Cfg.Storage.Engine != storage.StorageEngineBlocks {
 		return nil, nil
 	}
 
-	purgerAPI, err := purger.NewBlocksPurgerAPI(t.Cfg.BlocksStorage, util_log.Logger, prometheus.DefaultRegisterer)
+	// t.RulerStorage can be nil when running in single-binary mode, and rule storage is not configured.
+	tenantDeletionAPI, err := purger.NewTenantDeletionAPI(t.Cfg.BlocksStorage, t.Overrides, t.RulerStorage, util_log.Logger, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, err
 	}
 
-	t.API.RegisterBlocksPurger(purgerAPI)
+	t.API.RegisterTenantDeletion(tenantDeletionAPI)
 	return nil, nil
 }
 
@@ -792,6 +828,7 @@ func (t *Cortex) setupModuleManager() error {
 	mm.RegisterModule(MemberlistKV, t.initMemberlistKV, modules.UserInvisibleModule)
 	mm.RegisterModule(Ring, t.initRing, modules.UserInvisibleModule)
 	mm.RegisterModule(Overrides, t.initOverrides, modules.UserInvisibleModule)
+	mm.RegisterModule(OverridesExporter, t.initOverridesExporter)
 	mm.RegisterModule(Distributor, t.initDistributor)
 	mm.RegisterModule(DistributorService, t.initDistributorService, modules.UserInvisibleModule)
 	mm.RegisterModule(Store, t.initChunkStore, modules.UserInvisibleModule)
@@ -812,7 +849,7 @@ func (t *Cortex) setupModuleManager() error {
 	mm.RegisterModule(Compactor, t.initCompactor)
 	mm.RegisterModule(StoreGateway, t.initStoreGateway)
 	mm.RegisterModule(ChunksPurger, t.initChunksPurger, modules.UserInvisibleModule)
-	mm.RegisterModule(BlocksPurger, t.initBlocksPurger, modules.UserInvisibleModule)
+	mm.RegisterModule(TenantDeletion, t.initTenantDeletionAPI, modules.UserInvisibleModule)
 	mm.RegisterModule(Purger, nil)
 	mm.RegisterModule(QueryScheduler, t.initQueryScheduler)
 	mm.RegisterModule(TenantFederation, t.initTenantFederation, modules.UserInvisibleModule)
@@ -825,6 +862,7 @@ func (t *Cortex) setupModuleManager() error {
 		RuntimeConfig:            {API},
 		Ring:                     {API, RuntimeConfig, MemberlistKV},
 		Overrides:                {RuntimeConfig},
+		OverridesExporter:        {RuntimeConfig},
 		Distributor:              {DistributorService, API},
 		DistributorService:       {Ring, Overrides},
 		Store:                    {Overrides, DeleteRequestsStore},
@@ -838,14 +876,15 @@ func (t *Cortex) setupModuleManager() error {
 		QueryFrontend:            {QueryFrontendTripperware},
 		QueryScheduler:           {API, Overrides},
 		TableManager:             {API},
-		Ruler:                    {Overrides, DistributorService, Store, StoreQueryable, RulerStorage},
+		Ruler:                    {DistributorService, Store, StoreQueryable, RulerStorage},
+		RulerStorage:             {Overrides},
 		Configs:                  {API},
 		AlertManager:             {API, MemberlistKV},
-		Compactor:                {API, MemberlistKV},
+		Compactor:                {API, MemberlistKV, Overrides},
 		StoreGateway:             {API, Overrides, MemberlistKV},
 		ChunksPurger:             {Store, DeleteRequestsStore, API},
-		BlocksPurger:             {Store, API},
-		Purger:                   {ChunksPurger, BlocksPurger},
+		TenantDeletion:           {Store, API, Overrides, RulerStorage},
+		Purger:                   {ChunksPurger, TenantDeletion},
 		TenantFederation:         {Queryable},
 		All:                      {QueryFrontend, Querier, Ingester, Distributor, TableManager, Purger, StoreGateway, Ruler},
 	}

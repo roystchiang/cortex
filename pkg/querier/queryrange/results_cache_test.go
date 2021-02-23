@@ -17,7 +17,6 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 const (
@@ -106,7 +105,7 @@ func mkExtent(start, end int64) Extent {
 
 func TestShouldCache(t *testing.T) {
 	maxCacheTime := int64(150 * 1000)
-	c := &resultsCache{logger: util_log.Logger, cacheGenNumberLoader: newMockCacheGenNumberLoader()}
+	c := &resultsCache{logger: log.NewNopLogger(), cacheGenNumberLoader: newMockCacheGenNumberLoader()}
 	for _, tc := range []struct {
 		name                   string
 		request                Request
@@ -264,6 +263,7 @@ func TestShouldCache(t *testing.T) {
 			cacheGenNumberToInject: "1",
 			expected:               false,
 		},
+		// @ modifier on vector selectors.
 		{
 			name:     "@ modifier on vector selector, before end, before maxCacheTime",
 			request:  &PrometheusRequest{Query: "metric @ 123", End: 125000},
@@ -289,6 +289,19 @@ func TestShouldCache(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "@ modifier on vector selector with start() before maxCacheTime",
+			request:  &PrometheusRequest{Query: "metric @ start()", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "@ modifier on vector selector with end() after maxCacheTime",
+			request:  &PrometheusRequest{Query: "metric @ end()", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		// @ modifier on matrix selectors.
+		{
 			name:     "@ modifier on matrix selector, before end, before maxCacheTime",
 			request:  &PrometheusRequest{Query: "rate(metric[5m] @ 123)", End: 125000},
 			input:    Response(&PrometheusResponse{}),
@@ -313,6 +326,19 @@ func TestShouldCache(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "@ modifier on matrix selector with start() before maxCacheTime",
+			request:  &PrometheusRequest{Query: "rate(metric[5m] @ start())", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "@ modifier on matrix selector with end() after maxCacheTime",
+			request:  &PrometheusRequest{Query: "rate(metric[5m] @ end())", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		// @ modifier on subqueries.
+		{
 			name:     "@ modifier on subqueries, before end, before maxCacheTime",
 			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ 123)", End: 125000},
 			input:    Response(&PrometheusResponse{}),
@@ -333,6 +359,18 @@ func TestShouldCache(t *testing.T) {
 		{
 			name:     "@ modifier on subqueries, after end, after maxCacheTime",
 			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ 151)", End: 125000},
+			input:    Response(&PrometheusResponse{}),
+			expected: false,
+		},
+		{
+			name:     "@ modifier on subqueries with start() before maxCacheTime",
+			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ start())", Start: 100000, End: 200000},
+			input:    Response(&PrometheusResponse{}),
+			expected: true,
+		},
+		{
+			name:     "@ modifier on subqueries with end() after maxCacheTime",
+			request:  &PrometheusRequest{Query: "sum_over_time(rate(metric[1m])[10m:1m] @ end())", Start: 100000, End: 200000},
 			input:    Response(&PrometheusResponse{}),
 			expected: false,
 		},
@@ -445,6 +483,36 @@ func TestPartition(t *testing.T) {
 			},
 			expectedCachedResponse: []Response{
 				mkAPIResponse(100, 120, 10),
+			},
+		},
+		// Extent is outside the range and the request has a single step (same start and end).
+		{
+			input: &PrometheusRequest{
+				Start: 100,
+				End:   100,
+			},
+			prevCachedResponse: []Extent{
+				mkExtent(50, 90),
+			},
+			expectedRequests: []Request{
+				&PrometheusRequest{
+					Start: 100,
+					End:   100,
+				},
+			},
+		},
+		// Test when hit has a large step and only a single sample extent.
+		{
+			// If there is a only a single sample in the split interval, start and end will be the same.
+			input: &PrometheusRequest{
+				Start: 100,
+				End:   100,
+			},
+			prevCachedResponse: []Extent{
+				mkExtent(100, 100),
+			},
+			expectedCachedResponse: []Response{
+				mkAPIResponse(100, 105, 10),
 			},
 		},
 	} {
