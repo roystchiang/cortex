@@ -81,6 +81,11 @@
 * [BUGFIX] Prevent panic at start if the http_prefix setting doesn't have a valid value. #3796
 * [BUGFIX] Memberlist: fixed panic caused by race condition in `armon/go-metrics` used by memberlist client. #3724
 
+## Blocksconvert
+
+* [ENHANCEMENT] Scanner: Implement for DynamoDB (v9 schema only). #3828
+
+
 ## 1.7.0
 
 Note the blocks storage compactor runs a migration task at startup in this version, which can take many minutes and use a lot of RAM.
