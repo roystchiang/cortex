@@ -44,6 +44,10 @@ import (
 
 const (
 	errTSDBCreateIncompatibleState = "cannot create a new TSDB while the ingester is not in active state (current state: %s)"
+	errTSDBIngest                  = "err: %v. timestamp=%s, series=%s" // Using error.Wrap puts the message before the error and if the series is too long, its truncated.
+
+	// Jitter applied to the idle timeout to prevent compaction in all ingesters concurrently.
+	compactionIdleTimeoutJitter = 0.25
 )
 
 // Shipper interface is used to have an easy way to mock it in tests.
@@ -354,6 +358,9 @@ type TSDBState struct {
 	forceCompactTrigger chan chan<- struct{}
 	shipTrigger         chan chan<- struct{}
 
+	// Timeout chosen for idle compactions.
+	compactionIdleTimeout time.Duration
+
 	// Head compactions metrics.
 	compactionsTriggered   prometheus.Counter
 	compactionsFailed      prometheus.Counter
@@ -475,13 +482,17 @@ func NewV2(cfg Config, clientConfig client.Config, limits *validation.Overrides,
 
 	i.TSDBState.shipperIngesterID = i.lifecycler.ID
 
+	// Apply positive jitter only to ensure that the minimum timeout is adhered to.
+	i.TSDBState.compactionIdleTimeout = util.DurationWithPositiveJitter(i.cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout, compactionIdleTimeoutJitter)
+	level.Info(i.logger).Log("msg", "TSDB idle compaction timeout set", "timeout", i.TSDBState.compactionIdleTimeout)
+
 	i.BasicService = services.NewBasicService(i.startingV2, i.updateLoop, i.stoppingV2)
 	return i, nil
 }
 
-// Special version of ingester used by Flusher. This ingester is not ingesting anything, its only purpose is to react
+// NewV2ForFlusher is a special version of ingester used by Flusher. This ingester is not ingesting anything, its only purpose is to react
 // on Flush method and flush all openened TSDBs when called.
-func NewV2ForFlusher(cfg Config, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
+func NewV2ForFlusher(cfg Config, limits *validation.Overrides, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
 	bucketClient, err := bucket.NewClient(context.Background(), cfg.BlocksStorageConfig.Bucket, "ingester", logger, registerer)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create the bucket client")
@@ -489,6 +500,7 @@ func NewV2ForFlusher(cfg Config, registerer prometheus.Registerer, logger log.Lo
 
 	i := &Ingester{
 		cfg:       cfg,
+		limits:    limits,
 		metrics:   newIngesterMetrics(registerer, false, false),
 		wal:       &noopWAL{},
 		TSDBState: newTSDBState(bucketClient, registerer),
@@ -754,7 +766,7 @@ func (i *Ingester) v2Push(ctx context.Context, req *client.WriteRequest) (*clien
 			cause := errors.Cause(err)
 			if cause == storage.ErrOutOfBounds || cause == storage.ErrOutOfOrderSample || cause == storage.ErrDuplicateSampleForTimestamp {
 				if firstPartialErr == nil {
-					firstPartialErr = errors.Wrapf(err, "series=%s, timestamp=%v", client.FromLabelAdaptersToLabels(ts.Labels).String(), model.Time(s.TimestampMs).Time().UTC().Format(time.RFC3339Nano))
+					firstPartialErr = wrappedTSDBIngestErr(err, model.Time(s.TimestampMs), ts.Labels)
 				}
 
 				switch cause {
@@ -920,6 +932,11 @@ func (i *Ingester) v2Query(ctx context.Context, req *client.QueryRequest) (*clie
 }
 
 func (i *Ingester) v2LabelValues(ctx context.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, error) {
+	labelName, startTimestampMs, endTimestampMs, matchers, err := client.FromLabelValuesRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -930,7 +947,7 @@ func (i *Ingester) v2LabelValues(ctx context.Context, req *client.LabelValuesReq
 		return &client.LabelValuesResponse{}, nil
 	}
 
-	mint, maxt, err := metadataQueryRange(req.StartTimestampMs, req.EndTimestampMs, db)
+	mint, maxt, err := metadataQueryRange(startTimestampMs, endTimestampMs, db)
 	if err != nil {
 		return nil, err
 	}
@@ -941,7 +958,7 @@ func (i *Ingester) v2LabelValues(ctx context.Context, req *client.LabelValuesReq
 	}
 	defer q.Close()
 
-	vals, _, err := q.LabelValues(req.LabelName)
+	vals, _, err := q.LabelValues(labelName, matchers...)
 	if err != nil {
 		return nil, err
 	}
@@ -1320,7 +1337,7 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 			userLogger,
 			tsdbPromReg,
 			udir,
-			bucket.NewUserBucketClient(userID, i.TSDBState.bucket),
+			bucket.NewUserBucketClient(userID, i.TSDBState.bucket, i.limits),
 			func() labels.Labels { return l },
 			metadata.ReceiveSource,
 			false, // No need to upload compacted blocks. Cortex compactor takes care of that.
@@ -1659,7 +1676,7 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool) {
 			reason = "forced"
 			err = userDB.compactHead(i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
 
-		case i.cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout > 0 && userDB.isIdle(time.Now(), i.cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout):
+		case i.TSDBState.compactionIdleTimeout > 0 && userDB.isIdle(time.Now(), i.TSDBState.compactionIdleTimeout):
 			reason = "idle"
 			level.Info(i.logger).Log("msg", "TSDB is idle, forcing compaction", "user", userID)
 			err = userDB.compactHead(i.cfg.BlocksStorageConfig.TSDB.BlockRanges[0].Milliseconds())
@@ -1869,4 +1886,12 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB) (mint, maxt in
 	}
 
 	return
+}
+
+func wrappedTSDBIngestErr(ingestErr error, timestamp model.Time, labels []client.LabelAdapter) error {
+	if ingestErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf(errTSDBIngest, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano), client.FromLabelAdaptersToLabels(labels).String())
 }

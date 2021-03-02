@@ -26,6 +26,33 @@ type runtimeConfigValues struct {
 	Multi kv.MultiRuntimeConfig `yaml:"multi_kv_config"`
 }
 
+// runtimeConfigTenantLimits provides per-tenant limit overrides based on a runtimeconfig.Manager
+// that reads limits from a configuration file on disk and periodically reloads them.
+type runtimeConfigTenantLimits struct {
+	manager *runtimeconfig.Manager
+}
+
+// newTenantLimits creates a new validation.TenantLimits that loads per-tenant limit overrides from
+// a runtimeconfig.Manager
+func newTenantLimits(manager *runtimeconfig.Manager) validation.TenantLimits {
+	return &runtimeConfigTenantLimits{
+		manager: manager,
+	}
+}
+
+func (l *runtimeConfigTenantLimits) ByUserID(userID string) *validation.Limits {
+	return l.AllByUserID()[userID]
+}
+
+func (l *runtimeConfigTenantLimits) AllByUserID() map[string]*validation.Limits {
+	cfg, ok := l.manager.GetConfig().(*runtimeConfigValues)
+	if cfg != nil && ok {
+		return cfg.TenantLimits
+	}
+
+	return nil
+}
+
 func loadRuntimeConfig(r io.Reader) (interface{}, error) {
 	var overrides = &runtimeConfigValues{}
 
@@ -43,20 +70,6 @@ func loadRuntimeConfig(r io.Reader) (interface{}, error) {
 	}
 
 	return overrides, nil
-}
-
-func tenantLimitsFromRuntimeConfig(c *runtimeconfig.Manager) validation.TenantLimits {
-	if c == nil {
-		return nil
-	}
-	return func(userID string) *validation.Limits {
-		cfg, ok := c.GetConfig().(*runtimeConfigValues)
-		if !ok || cfg == nil {
-			return nil
-		}
-
-		return cfg.TenantLimits[userID]
-	}
 }
 
 func multiClientRuntimeConfigChannel(manager *runtimeconfig.Manager) func() <-chan kv.MultiRuntimeConfig {
