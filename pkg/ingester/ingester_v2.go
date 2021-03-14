@@ -101,7 +101,6 @@ const (
 type userTSDB struct {
 	db             *tsdb.DB
 	userID         string
-	refCache       *cortex_tsdb.RefCache
 	activeSeries   *ActiveSeries
 	seriesInMetric *metricCounter
 	limiter        *Limiter
@@ -383,7 +382,6 @@ type TSDBState struct {
 	walReplayTime          prometheus.Histogram
 	appenderAddDuration    prometheus.Histogram
 	appenderCommitDuration prometheus.Histogram
-	refCachePurgeDuration  prometheus.Histogram
 	idleTsdbChecks         *prometheus.CounterVec
 }
 
@@ -434,11 +432,6 @@ func newTSDBState(bucketClient objstore.Bucket, registerer prometheus.Registerer
 			Name:    "cortex_ingester_tsdb_appender_commit_duration_seconds",
 			Help:    "The total time it takes for a push request to commit samples appended to TSDB.",
 			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
-		}),
-		refCachePurgeDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_ingester_tsdb_refcache_purge_duration_seconds",
-			Help:    "The total time it takes to purge the TSDB series reference cache for a single tenant.",
-			Buckets: prometheus.DefBuckets,
 		}),
 
 		idleTsdbChecks: idleTsdbChecks,
@@ -646,17 +639,6 @@ func (i *Ingester) updateLoop(ctx context.Context) error {
 				db.ingestedRuleSamples.tick()
 			}
 			i.userStatesMtx.RUnlock()
-		case <-refCachePurgeTicker.C:
-			for _, userID := range i.getTSDBUsers() {
-				userDB := i.getTSDB(userID)
-				if userDB == nil {
-					continue
-				}
-
-				startTime := time.Now()
-				userDB.refCache.Purge(startTime.Add(-cortex_tsdb.DefaultRefCacheTTL))
-				i.TSDBState.refCachePurgeDuration.Observe(time.Since(startTime).Seconds())
-			}
 
 		case <-activeSeriesTickerChan:
 			i.v2UpdateActiveSeries()
@@ -681,6 +663,12 @@ func (i *Ingester) v2UpdateActiveSeries() {
 		userDB.activeSeries.Purge(purgeTime)
 		i.metrics.activeSeriesPerUser.WithLabelValues(userID).Set(float64(userDB.activeSeries.Active()))
 	}
+}
+
+// GetRef() is an extra method added to TSDB to let Cortex check before calling Add()
+type extendedAppender interface {
+	storage.Appender
+	GetRef(lset labels.Labels) (uint64, bool)
 }
 
 // v2Push adds metrics to a block
@@ -725,17 +713,16 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 	startAppend := time.Now()
 
 	// Walk the samples, appending them to the users database
-	app := db.Appender(ctx)
+	app := db.Appender(ctx).(extendedAppender)
 	for _, ts := range req.Timeseries {
 		// Keeps a reference to labels copy, if it was needed. This is to avoid making a copy twice,
-		// once for TSDB/refcache, and second time for activeSeries map.
+		// once for TSDB, and second time for activeSeries map.
 		var copiedLabels []labels.Label
 
-		// Check if we already have a cached reference for this series. Be aware
-		// that even if we have a reference it's not guaranteed to be still valid.
+		// Look up a reference for this series.
 		// The labels must be sorted (in our case, it's guaranteed a write request
 		// has sorted labels once hit the ingester).
-		cachedRef, cachedRefExists := db.refCache.Ref(startAppend, cortexpb.FromLabelAdaptersToLabels(ts.Labels))
+		cachedRef, cachedRefExists := app.GetRef(cortexpb.FromLabelAdaptersToLabels(ts.Labels))
 
 		// To find out if any sample was added to this series, we keep old value.
 		oldSucceededSamplesCount := succeededSamplesCount
@@ -764,7 +751,6 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 				copiedLabels = cortexpb.FromLabelAdaptersToLabelsWithCopy(ts.Labels)
 
 				if ref, err = app.Add(copiedLabels, s.TimestampMs, s.Value); err == nil {
-					db.refCache.SetRef(startAppend, copiedLabels, ref)
 					cachedRef = ref
 					cachedRefExists = true
 
@@ -1409,7 +1395,6 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 
 	userDB := &userTSDB{
 		userID:              userID,
-		refCache:            cortex_tsdb.NewRefCache(),
 		activeSeries:        NewActiveSeries(),
 		seriesInMetric:      newMetricCounter(i.limiter),
 		ingestedAPISamples:  newEWMARate(0.2, i.cfg.RateUpdatePeriod),

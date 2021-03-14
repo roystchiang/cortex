@@ -101,3 +101,6 @@ replace github.com/go-openapi/strfmt => github.com/go-openapi/strfmt v0.19.5
 replace github.com/go-openapi/swag => github.com/go-openapi/swag v0.19.9
 
 replace github.com/go-openapi/validate => github.com/go-openapi/validate v0.19.8
+
+// Fork of Prometheus that adds GetRef() method to TSDB Appender
+replace github.com/prometheus/prometheus => github.com/bboreham/prometheus v1.7.2-0.20210314111355-ef93aa99d145
