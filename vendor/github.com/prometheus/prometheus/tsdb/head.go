@@ -1064,6 +1064,15 @@ func (a *initAppender) AddFast(ref uint64, t int64, v float64) error {
 	return a.app.AddFast(ref, t, v)
 }
 
+func (a *initAppender) GetRef(lset labels.Labels) (uint64, bool) {
+	if g, ok := a.app.(interface {
+		GetRef(lset labels.Labels) (uint64, bool)
+	}); ok {
+		return g.GetRef(lset)
+	}
+	return 0, false
+}
+
 func (a *initAppender) Commit() error {
 	if a.app == nil {
 		return nil
@@ -1202,6 +1211,14 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 		})
 	}
 	return s.ref, a.AddFast(s.ref, t, v)
+}
+
+func (a *headAppender) GetRef(lset labels.Labels) (uint64, bool) {
+	s := a.head.series.getByHash(lset.Hash(), lset)
+	if s == nil {
+		return 0, false
+	}
+	return s.ref, true
 }
 
 func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {

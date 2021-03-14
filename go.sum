@@ -197,6 +197,8 @@ github.com/aws/aws-sdk-go v1.37.8/go.mod h1:hcU610XS61/+aQV88ixoOzUoG7v3b31pl2zK
 github.com/aws/aws-sdk-go-v2 v0.18.0/go.mod h1:JWVYvqSMppoMJC0x5wdwiImzgXTI9FuZwxzkQq9wy+g=
 github.com/baiyubin/aliyun-sts-go-sdk v0.0.0-20180326062324-cfa1a18b161f h1:ZNv7On9kyUzm7fvRZumSyy/IUiSC7AzL0I1jKKtwooA=
 github.com/baiyubin/aliyun-sts-go-sdk v0.0.0-20180326062324-cfa1a18b161f/go.mod h1:AuiFmCCPBSrqvVMvuqFuk0qogytodnVFVSN5CeJB8Gc=
+github.com/bboreham/prometheus v1.7.2-0.20210314111355-ef93aa99d145 h1:7aJKOEQ23AIdCq/Y8jj89vE7hd1GSC1ZkJxlZbkjZXc=
+github.com/bboreham/prometheus v1.7.2-0.20210314111355-ef93aa99d145/go.mod h1:NAYujktP0dmSSpeV155mtnwX2pndLpVVK/Ps68R01TA=
 github.com/beevik/ntp v0.2.0/go.mod h1:hIHWr+l3+/clUnF44zdK+CWW7fO8dR5cIylAQ76NRpg=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=

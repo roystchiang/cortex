@@ -104,3 +104,10 @@ replace github.com/go-openapi/validate => github.com/go-openapi/validate v0.19.8
 
 // Fork of Prometheus that adds GetRef() method to TSDB Appender
 replace github.com/prometheus/prometheus => github.com/bboreham/prometheus v1.7.2-0.20210314111355-ef93aa99d145
+
+// Pin these too, because 'go mod vendor' is downgrading them otherwise
+replace github.com/hashicorp/go-hclog => github.com/hashicorp/go-hclog v0.12.2
+replace github.com/hashicorp/go-immutable-radix => github.com/hashicorp/go-immutable-radix v1.2.0
+replace github.com/mitchellh/mapstructure => github.com/mitchellh/mapstructure v1.2.2
+replace github.com/satori/go.uuid => github.com/satori/go.uuid v1.2.0
+replace go.mongodb.org/mongo-driver => go.mongodb.org/mongo-driver v1.3.2
