@@ -49,9 +49,11 @@ For the sake of clarity, in this document we have grouped API endpoints by servi
 | [Set rule group](#set-rule-group) | Ruler | `POST /api/v1/rules/{namespace}` |
 | [Delete rule group](#delete-rule-group) | Ruler | `DELETE /api/v1/rules/{namespace}/{groupName}` |
 | [Delete namespace](#delete-namespace) | Ruler | `DELETE /api/v1/rules/{namespace}` |
+| [Delete tenant configuration](#delete-tenant-configuration) | Ruler | `POST /ruler/delete_tenant_config` |
 | [Alertmanager status](#alertmanager-status) | Alertmanager | `GET /multitenant_alertmanager/status` |
 | [Alertmanager ring status](#alertmanager-ring-status) | Alertmanager | `GET /multitenant_alertmanager/ring` |
 | [Alertmanager UI](#alertmanager-ui) | Alertmanager | `GET /<alertmanager-http-prefix>` |
+| [Alertmanager Delete Tenant Configuration](#alertmanager-delete-tenant-configuration) | Alertmanager | `POST /multitenant_alertmanager/delete_tenant_config` |
 | [Get Alertmanager configuration](#get-alertmanager-configuration) | Alertmanager | `GET /api/v1/alerts` |
 | [Set Alertmanager configuration](#set-alertmanager-configuration) | Alertmanager | `POST /api/v1/alerts` |
 | [Delete Alertmanager configuration](#delete-alertmanager-configuration) | Alertmanager | `DELETE /api/v1/alerts` |
@@ -636,6 +638,18 @@ _This experimental endpoint is disabled by default and can be enabled via the `-
 
 _Requires [authentication](#authentication)._
 
+### Delete tenant configuration
+
+```
+POST /ruler/delete_tenant_config
+```
+
+This deletes all rule groups for tenant, and returns `200` on success. Calling endpoint when no rule groups exist for user returns `200`. Authentication is only to identify the tenant.
+
+This is intended as internal API, and not to be exposed to users. This endpoint is enabled regardless of whether `-experimental.ruler.enable-api` is enabled or not.
+
+_Requires [authentication](#authentication)._
+
 ## Alertmanager
 
 ### Alertmanager status
@@ -667,6 +681,18 @@ GET /<legacy-http-prefix>
 ```
 
 Displays the Alertmanager UI.
+
+_Requires [authentication](#authentication)._
+
+### Alertmanager Delete Tenant Configuration
+
+```
+POST /multitenant_alertmanager/delete_tenant_config
+```
+
+This endpoint deletes configuration for a tenant identified by `X-Scope-OrgID` header.
+It is internal, available even if Alertmanager API is not enabled by using `-experimental.alertmanager.enable-api`.
+The endpoint returns a status code of `200` if the user's configuration has been deleted, or it didn't exist in the first place.
 
 _Requires [authentication](#authentication)._
 

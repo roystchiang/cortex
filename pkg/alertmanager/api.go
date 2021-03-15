@@ -112,6 +112,8 @@ func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.
 	w.WriteHeader(http.StatusCreated)
 }
 
+// DeleteUserConfig is exposed via user-visible API (if enabled, uses DELETE method), but also as an internal endpoint using POST method.
+// Note that if no config exists for a user, StatusOK is returned.
 func (am *MultitenantAlertmanager) DeleteUserConfig(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), am.logger)
 	userID, err := tenant.TenantID(r.Context())
@@ -151,14 +153,14 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc) error {
 	// not to configured data dir, and on the flipside, it'll fail if we can't write
 	// to tmpDir. Ignoring both cases for now as they're ultra rare but will revisit if
 	// we see this in the wild.
-	tmpDir, err := ioutil.TempDir("", "validate-config")
+	userTempDir, err := ioutil.TempDir("", "validate-config-"+cfg.User)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpDir)
+	defer os.RemoveAll(userTempDir)
 
 	for _, tmpl := range cfg.Templates {
-		_, err := createTemplateFile(tmpDir, cfg.User, tmpl.Filename, tmpl.Body)
+		_, err := storeTemplateFile(userTempDir, tmpl.Filename, tmpl.Body)
 		if err != nil {
 			level.Error(logger).Log("msg", "unable to create template file", "err", err, "user", cfg.User)
 			return fmt.Errorf("unable to create template file '%s'", tmpl.Filename)
@@ -167,7 +169,7 @@ func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc) error {
 
 	templateFiles := make([]string, len(amCfg.Templates))
 	for i, t := range amCfg.Templates {
-		templateFiles[i] = filepath.Join(tmpDir, "templates", cfg.User, t)
+		templateFiles[i] = filepath.Join(userTempDir, t)
 	}
 
 	_, err = template.FromGlobs(templateFiles...)

@@ -22,6 +22,7 @@ var (
 // Methods starting with "List" prefix may return partially loaded groups: with only group Name, Namespace and User fields set.
 // To make sure that rules within each group are loaded, client must use LoadRuleGroups method.
 type RuleStore interface {
+	// ListAllUsers returns all users with rule groups configured.
 	ListAllUsers(ctx context.Context) ([]string, error)
 
 	// ListAllRuleGroups returns all rule groups for all users.
@@ -45,9 +46,6 @@ type RuleStore interface {
 	// DeleteNamespace lists rule groups for given user and namespace, and deletes all rule groups.
 	// If namespace is empty, deletes all rule groups for user.
 	DeleteNamespace(ctx context.Context, userID, namespace string) error
-
-	// SupportsModifications returns true if this RuleStore supports operations that modify rule groups in the store.
-	SupportsModifications() bool
 }
 
 // RuleGroupList contains a set of rule groups

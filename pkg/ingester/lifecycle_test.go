@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
@@ -140,7 +141,7 @@ func TestIngesterChunksTransfer(t *testing.T) {
 	})
 
 	// Now write a sample to this ingester
-	req, expectedResponse, _ := mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "foo"}}, 456, 123000)
+	req, expectedResponse, _, _ := mockWriteRequest(t, labels.Labels{{Name: labels.MetricName, Value: "foo"}}, 456, 123000)
 	ctx := user.InjectOrgID(context.Background(), userID)
 	_, err = ing1.Push(ctx, req)
 	require.NoError(t, err)
@@ -181,7 +182,7 @@ func TestIngesterChunksTransfer(t *testing.T) {
 	assert.Equal(t, expectedResponse, response)
 
 	// Check we can send the same sample again to the new ingester and get the same result
-	req, _, _ = mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "foo"}}, 456, 123000)
+	req, _, _, _ = mockWriteRequest(t, labels.Labels{{Name: labels.MetricName, Value: "foo"}}, 456, 123000)
 	_, err = ing2.Push(ctx, req)
 	require.NoError(t, err)
 	response, err = ing2.Query(ctx, request)
@@ -314,7 +315,7 @@ func TestIngesterFlush(t *testing.T) {
 	// Now write a sample to this ingester
 	var (
 		lbls       = []labels.Labels{{{Name: labels.MetricName, Value: "foo"}}}
-		sampleData = []client.Sample{
+		sampleData = []cortexpb.Sample{
 			{
 				TimestampMs: 123000,
 				Value:       456,
@@ -322,7 +323,7 @@ func TestIngesterFlush(t *testing.T) {
 		}
 	)
 	ctx := user.InjectOrgID(context.Background(), userID)
-	_, err := ing.Push(ctx, client.ToWriteRequest(lbls, sampleData, nil, client.API))
+	_, err := ing.Push(ctx, cortexpb.ToWriteRequest(lbls, sampleData, nil, cortexpb.API))
 	require.NoError(t, err)
 
 	// We add a 100ms sleep into the flush loop, such that we can reliably detect
