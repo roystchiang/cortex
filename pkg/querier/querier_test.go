@@ -179,6 +179,7 @@ func mockTSDB(t *testing.T, mint model.Time, samples int, step, chunkOffset time
 	})
 
 	opts := tsdb.DefaultHeadOptions()
+	opts.ChunkDirRoot = dir
 	// We use TSDB head only. By using full TSDB DB, and appending samples to it, closing it would cause unnecessary HEAD compaction, which slows down the test.
 	head, err := tsdb.NewHead(nil, nil, nil, opts)
 	require.NoError(t, err)
@@ -196,7 +197,7 @@ func mockTSDB(t *testing.T, mint model.Time, samples int, step, chunkOffset time
 	chunkStartTs := mint
 	ts := chunkStartTs
 	for i := 0; i < samples; i++ {
-		_, err := app.Add(l, int64(ts), float64(ts))
+		_, err := app.Append(0, l, int64(ts), float64(ts))
 		require.NoError(t, err)
 		cnt++
 
@@ -438,7 +439,7 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLength(t *testing.T) {
 			flagext.DefaultValues(&cfg)
 
 			limits := defaultLimitsConfig()
-			limits.MaxQueryLength = maxQueryLength
+			limits.MaxQueryLength = model.Duration(maxQueryLength)
 			overrides, err := validation.NewOverrides(limits, nil)
 			require.NoError(t, err)
 

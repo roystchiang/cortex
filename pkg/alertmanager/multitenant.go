@@ -35,6 +35,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -105,11 +106,6 @@ type MultitenantAlertmanagerConfig struct {
 	PollInterval   time.Duration    `yaml:"poll_interval"`
 	MaxRecvMsgSize int64            `yaml:"max_recv_msg_size"`
 
-	DeprecatedClusterBindAddr      string              `yaml:"cluster_bind_address"`
-	DeprecatedClusterAdvertiseAddr string              `yaml:"cluster_advertise_address"`
-	DeprecatedPeers                flagext.StringSlice `yaml:"peers"`
-	DeprecatedPeerTimeout          time.Duration       `yaml:"peer_timeout"`
-
 	// Enable sharding for the Alertmanager
 	ShardingEnabled bool       `yaml:"sharding_enabled"`
 	ShardingRing    RingConfig `yaml:"sharding_ring"`
@@ -117,13 +113,16 @@ type MultitenantAlertmanagerConfig struct {
 	FallbackConfigFile string `yaml:"fallback_config_file"`
 	AutoWebhookRoot    string `yaml:"auto_webhook_root"`
 
-	Store   alertstore.LegacyConfig `yaml:"storage"`
+	Store   alertstore.LegacyConfig `yaml:"storage" doc:"description=Deprecated. Use -alertmanager-storage.* CLI flags and their respective YAML config options instead."`
 	Cluster ClusterConfig           `yaml:"cluster"`
 
 	EnableAPI bool `yaml:"enable_api"`
 
 	// For distributor.
 	AlertmanagerClient ClientConfig `yaml:"alertmanager_client"`
+
+	// For the state persister.
+	Persister PersisterConfig `yaml:",inline"`
 }
 
 type ClusterConfig struct {
@@ -152,18 +151,13 @@ func (cfg *MultitenantAlertmanagerConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.AutoWebhookRoot, "alertmanager.configs.auto-webhook-root", "", "Root of URL to generate if config is "+autoWebhookURL)
 	f.DurationVar(&cfg.PollInterval, "alertmanager.configs.poll-interval", 15*time.Second, "How frequently to poll Cortex configs")
 
-	// Flags prefixed with `cluster` are deprecated in favor of their `alertmanager` prefix equivalent.
-	// TODO: New flags introduced in Cortex 1.7, remove old ones in Cortex 1.9
-	f.StringVar(&cfg.DeprecatedClusterBindAddr, "cluster.listen-address", defaultClusterAddr, "Deprecated. Use -alertmanager.cluster.listen-address instead.")
-	f.StringVar(&cfg.DeprecatedClusterAdvertiseAddr, "cluster.advertise-address", "", "Deprecated. Use -alertmanager.cluster.advertise-address instead.")
-	f.Var(&cfg.DeprecatedPeers, "cluster.peer", "Deprecated. Use -alertmanager.cluster.peers instead.")
-	f.DurationVar(&cfg.DeprecatedPeerTimeout, "cluster.peer-timeout", time.Second*15, "Deprecated. Use -alertmanager.cluster.peer-timeout instead.")
-
 	f.BoolVar(&cfg.EnableAPI, "experimental.alertmanager.enable-api", false, "Enable the experimental alertmanager config api.")
 
 	f.BoolVar(&cfg.ShardingEnabled, "alertmanager.sharding-enabled", false, "Shard tenants across multiple alertmanager instances.")
 
 	cfg.AlertmanagerClient.RegisterFlagsWithPrefix("alertmanager.alertmanager-client", f)
+
+	cfg.Persister.RegisterFlagsWithPrefix("alertmanager", f)
 
 	cfg.ShardingRing.RegisterFlags(f)
 	cfg.Store.RegisterFlags(f)
@@ -180,38 +174,16 @@ func (cfg *ClusterConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.PushPullInterval, prefix+"push-pull-interval", cluster.DefaultPushPullInterval, "The interval between gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.")
 }
 
-// SupportDeprecatedFlagset ensures we support the previous set of cluster flags that are now deprecated.
-func (cfg *ClusterConfig) SupportDeprecatedFlagset(amCfg *MultitenantAlertmanagerConfig, logger log.Logger) {
-	if amCfg.DeprecatedClusterBindAddr != defaultClusterAddr {
-		flagext.DeprecatedFlagsUsed.Inc()
-		level.Warn(logger).Log("msg", "running with DEPRECATED flag -cluster.listen-address, use -alertmanager.cluster.listen-address instead.")
-		cfg.ListenAddr = amCfg.DeprecatedClusterBindAddr
-	}
-
-	if amCfg.DeprecatedClusterAdvertiseAddr != "" {
-		flagext.DeprecatedFlagsUsed.Inc()
-		level.Warn(logger).Log("msg", "running with DEPRECATED flag -cluster.advertise-address, use -alertmanager.cluster.advertise-address instead.")
-		cfg.AdvertiseAddr = amCfg.DeprecatedClusterAdvertiseAddr
-	}
-
-	if len(amCfg.DeprecatedPeers) > 0 {
-		flagext.DeprecatedFlagsUsed.Inc()
-		level.Warn(logger).Log("msg", "running with DEPRECATED flag -cluster.peer, use -alertmanager.cluster.peers instead.")
-		cfg.Peers = []string(amCfg.DeprecatedPeers)
-	}
-
-	if amCfg.DeprecatedPeerTimeout != defaultPeerTimeout {
-		flagext.DeprecatedFlagsUsed.Inc()
-		level.Warn(logger).Log("msg", "running with DEPRECATED flag -cluster.peer-timeout, use -alertmanager.cluster.peer-timeout instead.")
-		cfg.PeerTimeout = amCfg.DeprecatedPeerTimeout
-	}
-}
-
 // Validate config and returns error on failure
 func (cfg *MultitenantAlertmanagerConfig) Validate() error {
 	if err := cfg.Store.Validate(); err != nil {
 		return errors.Wrap(err, "invalid storage config")
 	}
+
+	if err := cfg.Persister.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -310,8 +282,6 @@ func NewMultitenantAlertmanager(cfg *MultitenantAlertmanagerConfig, store alerts
 			return nil, fmt.Errorf("unable to load fallback config %q: %s", cfg.FallbackConfigFile, err)
 		}
 	}
-
-	cfg.Cluster.SupportDeprecatedFlagset(cfg, logger)
 
 	var peer *cluster.Peer
 	// We need to take this case into account to support our legacy upstream clustering.
@@ -508,7 +478,7 @@ func (am *MultitenantAlertmanager) starting(ctx context.Context) (err error) {
 }
 
 // migrateStateFilesToPerTenantDirectories migrates any existing configuration from old place to new hierarchy.
-// TODO: Remove in Cortex 1.10.
+// TODO: Remove in Cortex 1.11.
 func (am *MultitenantAlertmanager) migrateStateFilesToPerTenantDirectories() error {
 	migrate := func(from, to string) error {
 		level.Info(am.logger).Log("msg", "migrating alertmanager state", "from", from, "to", to)
@@ -895,6 +865,8 @@ func (am *MultitenantAlertmanager) newAlertmanager(userID string, amConfig *amco
 		ShardingEnabled:   am.cfg.ShardingEnabled,
 		Replicator:        am,
 		ReplicationFactor: am.cfg.ShardingRing.ReplicationFactor,
+		Store:             am.store,
+		PersisterConfig:   am.cfg.Persister,
 	}, reg)
 	if err != nil {
 		return nil, fmt.Errorf("unable to start Alertmanager for user %v: %v", userID, err)
@@ -924,7 +896,7 @@ func (am *MultitenantAlertmanager) GetPositionForUser(userID string) int {
 	}
 
 	var position int
-	for i, instance := range set.Ingesters {
+	for i, instance := range set.Instances {
 		if instance.Addr == am.ringLifecycler.GetInstanceAddr() {
 			position = i
 			break
@@ -1036,32 +1008,91 @@ func (am *MultitenantAlertmanager) ReplicateStateForUser(ctx context.Context, us
 		}
 
 		switch resp.Status {
-		case alertmanagerpb.OK:
-			return nil
 		case alertmanagerpb.MERGE_ERROR:
 			level.Error(am.logger).Log("msg", "state replication failed", "user", userID, "key", part.Key, "err", resp.Error)
-			return nil
 		case alertmanagerpb.USER_NOT_FOUND:
 			level.Debug(am.logger).Log("msg", "user not found while trying to replicate state", "user", userID, "key", part.Key)
-			return nil
-		default:
-			return nil
 		}
+		return nil
 	}, func() {})
 
 	return err
+}
+
+// ReadFullStateForUser attempts to read the full state from each replica for user. Note that it will try to obtain and return
+// state from all replicas, but will consider it a success if state is obtained from at least one replica.
+func (am *MultitenantAlertmanager) ReadFullStateForUser(ctx context.Context, userID string) ([]*clusterpb.FullState, error) {
+
+	// Only get the set of replicas which contain the specified user.
+	key := shardByUser(userID)
+	replicationSet, err := am.ring.Get(key, RingOp, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// We should only query state from other replicas, and not our own state.
+	addrs := replicationSet.GetAddressesWithout(am.ringLifecycler.GetInstanceAddr())
+
+	var (
+		resultsMtx sync.Mutex
+		results    []*clusterpb.FullState
+	)
+
+	// Note that the jobs swallow the errors - this is because we want to give each replica a chance to respond.
+	jobs := concurrency.CreateJobsFromStrings(addrs)
+	err = concurrency.ForEach(ctx, jobs, len(jobs), func(ctx context.Context, job interface{}) error {
+		addr := job.(string)
+		level.Debug(am.logger).Log("msg", "contacting replica for full state", "user", userID, "addr", addr)
+
+		c, err := am.alertmanagerClientsPool.GetClientFor(addr)
+		if err != nil {
+			level.Error(am.logger).Log("msg", "failed to get rpc client", "err", err)
+			return nil
+		}
+
+		resp, err := c.ReadState(user.InjectOrgID(ctx, userID), &alertmanagerpb.ReadStateRequest{})
+		if err != nil {
+			level.Error(am.logger).Log("msg", "rpc reading state from replica failed", "addr", addr, "user", userID, "err", err)
+			return nil
+		}
+
+		switch resp.Status {
+		case alertmanagerpb.READ_OK:
+			resultsMtx.Lock()
+			results = append(results, resp.State)
+			resultsMtx.Unlock()
+		case alertmanagerpb.READ_ERROR:
+			level.Error(am.logger).Log("msg", "error trying to read state", "addr", addr, "user", userID, "err", resp.Error)
+		case alertmanagerpb.READ_USER_NOT_FOUND:
+			level.Debug(am.logger).Log("msg", "user not found while trying to read state", "addr", addr, "user", userID)
+		default:
+			level.Error(am.logger).Log("msg", "unknown response trying to read state", "addr", addr, "user", userID)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// We only require the state from a single replica, though we return as many as we were able to obtain.
+	if len(results) == 0 {
+		return nil, fmt.Errorf("failed to read state from any replica")
+	}
+
+	return results, nil
 }
 
 // UpdateState implements the Alertmanager service.
 func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *clusterpb.Part) (*alertmanagerpb.UpdateStateResponse, error) {
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("no user id found in context")
+		return nil, err
 	}
 
 	am.alertmanagersMtx.Lock()
-	defer am.alertmanagersMtx.Unlock()
 	userAM, ok := am.alertmanagers[userID]
+	am.alertmanagersMtx.Unlock()
+
 	if !ok {
 		// We can end up trying to replicate state to an alertmanager that is no longer available due to e.g. a ring topology change.
 		level.Debug(am.logger).Log("msg", "user does not have an alertmanager in this instance", "user", userID)
@@ -1072,7 +1103,6 @@ func (am *MultitenantAlertmanager) UpdateState(ctx context.Context, part *cluste
 	}
 
 	if err = userAM.mergePartialExternalState(part); err != nil {
-		level.Error(am.logger).Log("msg", "failed to merge state", "err", err, "key", part.Key)
 		return &alertmanagerpb.UpdateStateResponse{
 			Status: alertmanagerpb.MERGE_ERROR,
 			Error:  err.Error(),
@@ -1128,6 +1158,39 @@ func (am *MultitenantAlertmanager) getPerUserDirectories() map[string]string {
 		result[f.Name()] = fullPath
 	}
 	return result
+}
+
+// UpdateState implements the Alertmanager service.
+func (am *MultitenantAlertmanager) ReadState(ctx context.Context, req *alertmanagerpb.ReadStateRequest) (*alertmanagerpb.ReadStateResponse, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	am.alertmanagersMtx.Lock()
+	userAM, ok := am.alertmanagers[userID]
+	am.alertmanagersMtx.Unlock()
+
+	if !ok {
+		level.Debug(am.logger).Log("msg", "user does not have an alertmanager in this instance", "user", userID)
+		return &alertmanagerpb.ReadStateResponse{
+			Status: alertmanagerpb.READ_USER_NOT_FOUND,
+			Error:  "alertmanager for this user does not exists",
+		}, nil
+	}
+
+	state, err := userAM.getFullState()
+	if err != nil {
+		return &alertmanagerpb.ReadStateResponse{
+			Status: alertmanagerpb.READ_ERROR,
+			Error:  err.Error(),
+		}, nil
+	}
+
+	return &alertmanagerpb.ReadStateResponse{
+		Status: alertmanagerpb.READ_OK,
+		State:  state,
+	}, nil
 }
 
 // StatusHandler shows the status of the alertmanager.

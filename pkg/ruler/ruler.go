@@ -72,7 +72,7 @@ type Config struct {
 	// How frequently to poll for updated rules.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// Rule Storage and Polling configuration.
-	StoreConfig RuleStoreConfig `yaml:"storage"`
+	StoreConfig RuleStoreConfig `yaml:"storage" doc:"description=Deprecated. Use -ruler-storage.* CLI flags and their respective YAML config options instead."`
 	// Path to store rule files for prom manager.
 	RulePath string `yaml:"rule_path"`
 
@@ -331,19 +331,19 @@ func (r *Ruler) stopping(_ error) error {
 	return nil
 }
 
+type sender interface {
+	Send(alerts ...*notifier.Alert)
+}
+
 // SendAlerts implements a rules.NotifyFunc for a Notifier.
 // It filters any non-firing alerts from the input.
 //
 // Copied from Prometheus's main.go.
-func SendAlerts(n *notifier.Manager, externalURL string) promRules.NotifyFunc {
+func SendAlerts(n sender, externalURL string) promRules.NotifyFunc {
 	return func(ctx context.Context, expr string, alerts ...*promRules.Alert) {
 		var res []*notifier.Alert
 
 		for _, alert := range alerts {
-			// Only send actually firing alerts.
-			if alert.State == promRules.StatePending {
-				continue
-			}
 			a := &notifier.Alert{
 				StartsAt:     alert.FiredAt,
 				Labels:       alert.Labels,
@@ -352,6 +352,8 @@ func SendAlerts(n *notifier.Manager, externalURL string) promRules.NotifyFunc {
 			}
 			if !alert.ResolvedAt.IsZero() {
 				a.EndsAt = alert.ResolvedAt
+			} else {
+				a.EndsAt = alert.ValidUntil
 			}
 			res = append(res, a)
 		}
@@ -385,7 +387,7 @@ func instanceOwnsRuleGroup(r ring.ReadRing, g *rulespb.RuleGroupDesc, instanceAd
 		return false, errors.Wrap(err, "error reading ring to verify rule group ownership")
 	}
 
-	return rlrs.Ingesters[0].Addr == instanceAddr, nil
+	return rlrs.Instances[0].Addr == instanceAddr, nil
 }
 
 func (r *Ruler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -768,7 +770,7 @@ func (r *Ruler) AssertMaxRuleGroups(userID string, rg int) error {
 		return nil
 	}
 
-	if rg < limit {
+	if rg <= limit {
 		return nil
 	}
 
@@ -784,7 +786,7 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 
-	if rules < limit {
+	if rules <= limit {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
