@@ -1,5 +1,5 @@
 FROM       alpine:3.13
-RUN        apk add --no-cache ca-certificates
+RUN        apk add --no-cache ca-certificates && apk --no-cache upgrade musl
 COPY       migrations /migrations/
 COPY       cortex /bin/cortex
 EXPOSE     80
