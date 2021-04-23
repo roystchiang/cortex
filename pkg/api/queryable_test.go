@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/config"
@@ -101,6 +101,12 @@ func TestApiStatusCodes(t *testing.T) {
 			expectedString: "context canceled",
 			expectedCode:   422,
 		},
+		// Status code 400 is remapped to 422 (only choice we have)
+		{
+			err:            errors.Wrap(httpgrpc.Errorf(http.StatusBadRequest, "test string"), "wrapped error"),
+			expectedString: "test string",
+			expectedCode:   422,
+		},
 	} {
 		for k, q := range map[string]storage.SampleAndChunkQueryable{
 			"error from queryable": testQueryable{err: tc.err},
@@ -136,6 +142,7 @@ func createPrometheusAPI(q storage.SampleAndChunkQueryable) *route.Router {
 		engine,
 		q,
 		nil,
+		nil,
 		func(context.Context) v1.TargetRetriever { return &querier.DummyTargetRetriever{} },
 		func(context.Context) v1.AlertmanagerRetriever { return &querier.DummyAlertmanagerRetriever{} },
 		func() config.Config { return config.Config{} },
@@ -152,6 +159,7 @@ func createPrometheusAPI(q storage.SampleAndChunkQueryable) *route.Router {
 		func() (v1.RuntimeInfo, error) { return v1.RuntimeInfo{}, errors.New("not implemented") },
 		&v1.PrometheusVersion{},
 		prometheus.DefaultGatherer,
+		nil,
 	)
 
 	promRouter := route.New().WithPrefix("/api/v1")
