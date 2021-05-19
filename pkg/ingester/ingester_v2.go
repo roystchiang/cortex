@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -49,9 +50,16 @@ import (
 const (
 	errTSDBCreateIncompatibleState = "cannot create a new TSDB while the ingester is not in active state (current state: %s)"
 	errTSDBIngest                  = "err: %v. timestamp=%s, series=%s" // Using error.Wrap puts the message before the error and if the series is too long, its truncated.
+	errTSDBIngestExemplar          = "err: %v. timestamp=%s, series=%s, exemplar=%s"
 
 	// Jitter applied to the idle timeout to prevent compaction in all ingesters concurrently.
 	compactionIdleTimeoutJitter = 0.25
+
+	instanceIngestionRateTickInterval = time.Second
+)
+
+var (
+	errExemplarRef = errors.New("exemplars not ingested because series not already present")
 )
 
 // Shipper interface is used to have an easy way to mock it in tests.
@@ -387,8 +395,8 @@ type TSDBState struct {
 
 	tsdbMetrics *tsdbMetrics
 
-	forceCompactTrigger chan chan<- struct{}
-	shipTrigger         chan chan<- struct{}
+	forceCompactTrigger chan requestWithUsersAndCallback
+	shipTrigger         chan requestWithUsersAndCallback
 
 	// Timeout chosen for idle compactions.
 	compactionIdleTimeout time.Duration
@@ -403,6 +411,11 @@ type TSDBState struct {
 	appenderAddDuration    prometheus.Histogram
 	appenderCommitDuration prometheus.Histogram
 	idleTsdbChecks         *prometheus.CounterVec
+}
+
+type requestWithUsersAndCallback struct {
+	users    *util.AllowedTenants // if nil, all tenants are allowed.
+	callback chan<- struct{}      // when compaction/shipping is finished, this channel is closed
 }
 
 func newTSDBState(bucketClient objstore.Bucket, registerer prometheus.Registerer) TSDBState {
@@ -426,8 +439,8 @@ func newTSDBState(bucketClient objstore.Bucket, registerer prometheus.Registerer
 		dbs:                 make(map[string]*userTSDB),
 		bucket:              bucketClient,
 		tsdbMetrics:         newTSDBMetrics(registerer),
-		forceCompactTrigger: make(chan chan<- struct{}),
-		shipTrigger:         make(chan chan<- struct{}),
+		forceCompactTrigger: make(chan requestWithUsersAndCallback),
+		shipTrigger:         make(chan requestWithUsersAndCallback),
 
 		compactionsTriggered: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ingester_tsdb_compactions_triggered_total",
@@ -474,7 +487,7 @@ func NewV2(cfg Config, clientConfig client.Config, limits *validation.Overrides,
 		wal:           &noopWAL{},
 		TSDBState:     newTSDBState(bucketClient, registerer),
 		logger:        logger,
-		ingestionRate: util_math.NewEWMARate(0.2, cfg.RateUpdatePeriod),
+		ingestionRate: util_math.NewEWMARate(0.2, instanceIngestionRateTickInterval),
 	}
 	i.metrics = newIngesterMetrics(registerer, false, cfg.ActiveSeriesMetricsEnabled, i.getInstanceLimits, i.ingestionRate, &i.inflightPushRequests)
 
@@ -630,10 +643,15 @@ func (i *Ingester) stoppingV2(_ error) error {
 }
 
 func (i *Ingester) updateLoop(ctx context.Context) error {
+	if limits := i.getInstanceLimits(); limits != nil && *limits != (InstanceLimits{}) {
+		// This check will not cover enabling instance limits in runtime, but it will do for now.
+		logutil.WarnExperimentalUse("ingester instance limits")
+	}
+
 	rateUpdateTicker := time.NewTicker(i.cfg.RateUpdatePeriod)
 	defer rateUpdateTicker.Stop()
 
-	ingestionRateTicker := time.NewTicker(1 * time.Second)
+	ingestionRateTicker := time.NewTicker(instanceIngestionRateTickInterval)
 	defer ingestionRateTicker.Stop()
 
 	var activeSeriesTickerChan <-chan time.Time
@@ -732,13 +750,15 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 
 	// Given metadata is a best-effort approach, and we don't halt on errors
 	// process it before samples. Otherwise, we risk returning an error before ingestion.
-	i.pushMetadata(ctx, userID, req.GetMetadata())
+	ingestedMetadata := i.pushMetadata(ctx, userID, req.GetMetadata())
 
 	// Keep track of some stats which are tracked only if the samples will be
 	// successfully committed
 	var (
 		succeededSamplesCount     = 0
 		failedSamplesCount        = 0
+		succeededExemplarsCount   = 0
+		failedExemplarsCount      = 0
 		startAppend               = time.Now()
 		sampleOutOfBoundsCount    = 0
 		sampleOutOfOrderCount     = 0
@@ -835,6 +855,38 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 				return copiedLabels
 			})
 		}
+
+		if i.cfg.BlocksStorageConfig.TSDB.MaxExemplars > 0 {
+			// app.AppendExemplar currently doesn't create the series, it must
+			// already exist.  If it does not then drop.
+			if ref == 0 && len(ts.Exemplars) > 0 {
+				updateFirstPartial(func() error {
+					return wrappedTSDBIngestExemplarErr(errExemplarRef,
+						model.Time(ts.Exemplars[0].TimestampMs), ts.Labels, ts.Exemplars[0].Labels)
+				})
+				failedExemplarsCount += len(ts.Exemplars)
+			} else { // Note that else is explicit, rather than a continue in the above if, in case of additional logic post exemplar processing.
+				for _, ex := range ts.Exemplars {
+					e := exemplar.Exemplar{
+						Value:  ex.Value,
+						Ts:     ex.TimestampMs,
+						HasTs:  true,
+						Labels: cortexpb.FromLabelAdaptersToLabelsWithCopy(ex.Labels),
+					}
+
+					if _, err = app.AppendExemplar(ref, nil, e); err == nil {
+						succeededExemplarsCount++
+						continue
+					}
+
+					// Error adding exemplar
+					updateFirstPartial(func() error {
+						return wrappedTSDBIngestExemplarErr(err, model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
+					})
+					failedExemplarsCount++
+				}
+			}
+		}
 	}
 
 	// At this point all samples have been added to the appender, so we can track the time it took.
@@ -856,6 +908,8 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 	// which will be converted into an HTTP 5xx and the client should/will retry.
 	i.metrics.ingestedSamples.Add(float64(succeededSamplesCount))
 	i.metrics.ingestedSamplesFail.Add(float64(failedSamplesCount))
+	i.metrics.ingestedExemplars.Add(float64(succeededExemplarsCount))
+	i.metrics.ingestedExemplarsFail.Add(float64(failedExemplarsCount))
 
 	if sampleOutOfBoundsCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(sampleOutOfBounds, userID).Add(float64(sampleOutOfBoundsCount))
@@ -873,7 +927,8 @@ func (i *Ingester) v2Push(ctx context.Context, req *cortexpb.WriteRequest) (*cor
 		validation.DiscardedSamples.WithLabelValues(perMetricSeriesLimit, userID).Add(float64(perMetricSeriesLimitCount))
 	}
 
-	i.ingestionRate.Add(int64(succeededSamplesCount))
+	// Distributor counts both samples and metadata, so for consistency ingester does the same.
+	i.ingestionRate.Add(int64(succeededSamplesCount + ingestedMetadata))
 
 	switch req.Source {
 	case cortexpb.RULE:
@@ -1082,7 +1137,13 @@ func (i *Ingester) v2MetricsForLabelMatchers(ctx context.Context, req *client.Me
 			return nil, ctx.Err()
 		}
 
-		seriesSet := q.Select(true, nil, matchers...)
+		hints := &storage.SelectHints{
+			Start: mint,
+			End:   maxt,
+			Func:  "series", // There is no series function, this token is used for lookups that don't need samples.
+		}
+
+		seriesSet := q.Select(true, hints, matchers...)
 		sets = append(sets, seriesSet)
 	}
 
@@ -1466,6 +1527,7 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		WALSegmentSize:            i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
 		SeriesLifecycleCallback:   userDB,
 		BlocksToDelete:            userDB.blocksToDelete,
+		MaxExemplars:              i.cfg.BlocksStorageConfig.TSDB.MaxExemplars,
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
@@ -1707,16 +1769,11 @@ func (i *Ingester) shipBlocksLoop(ctx context.Context) error {
 	for {
 		select {
 		case <-shipTicker.C:
-			i.shipBlocks(ctx)
+			i.shipBlocks(ctx, nil)
 
-		case ch := <-i.TSDBState.shipTrigger:
-			i.shipBlocks(ctx)
-
-			// Notify back.
-			select {
-			case ch <- struct{}{}:
-			default: // Nobody is waiting for notification, don't block this loop.
-			}
+		case req := <-i.TSDBState.shipTrigger:
+			i.shipBlocks(ctx, req.users)
+			close(req.callback) // Notify back.
 
 		case <-ctx.Done():
 			return nil
@@ -1724,7 +1781,8 @@ func (i *Ingester) shipBlocksLoop(ctx context.Context) error {
 	}
 }
 
-func (i *Ingester) shipBlocks(ctx context.Context) {
+// shipBlocks runs shipping for all users.
+func (i *Ingester) shipBlocks(ctx context.Context, allowed *util.AllowedTenants) {
 	// Do not ship blocks if the ingester is PENDING or JOINING. It's
 	// particularly important for the JOINING state because there could
 	// be a blocks transfer in progress (from another ingester) and if we
@@ -1739,6 +1797,10 @@ func (i *Ingester) shipBlocks(ctx context.Context) {
 	// Number of concurrent workers is limited in order to avoid to concurrently sync a lot
 	// of tenants in a large cluster.
 	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.ShipConcurrency, func(ctx context.Context, userID string) error {
+		if !allowed.IsAllowed(userID) {
+			return nil
+		}
+
 		// Get the user's DB. If the user doesn't exist, we skip it.
 		userDB := i.getTSDB(userID)
 		if userDB == nil || userDB.shipper == nil {
@@ -1803,16 +1865,11 @@ func (i *Ingester) compactionLoop(ctx context.Context) error {
 	for ctx.Err() == nil {
 		select {
 		case <-ticker.C:
-			i.compactBlocks(ctx, false)
+			i.compactBlocks(ctx, false, nil)
 
-		case ch := <-i.TSDBState.forceCompactTrigger:
-			i.compactBlocks(ctx, true)
-
-			// Notify back.
-			select {
-			case ch <- struct{}{}:
-			default: // Nobody is waiting for notification, don't block this loop.
-			}
+		case req := <-i.TSDBState.forceCompactTrigger:
+			i.compactBlocks(ctx, true, req.users)
+			close(req.callback) // Notify back.
 
 		case <-ctx.Done():
 			return nil
@@ -1822,7 +1879,7 @@ func (i *Ingester) compactionLoop(ctx context.Context) error {
 }
 
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
-func (i *Ingester) compactBlocks(ctx context.Context, force bool) {
+func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *util.AllowedTenants) {
 	// Don't compact TSDB blocks while JOINING as there may be ongoing blocks transfers.
 	// Compaction loop is not running in LEAVING state, so if we get here in LEAVING state, we're flushing blocks.
 	if i.lifecycler != nil {
@@ -1833,6 +1890,10 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool) {
 	}
 
 	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.HeadCompactionConcurrency, func(ctx context.Context, userID string) error {
+		if !allowed.IsAllowed(userID) {
+			return nil
+		}
+
 		userDB := i.getTSDB(userID)
 		if userDB == nil {
 			return nil
@@ -1982,28 +2043,43 @@ func (i *Ingester) v2LifecyclerFlush() {
 
 	ctx := context.Background()
 
-	i.compactBlocks(ctx, true)
+	i.compactBlocks(ctx, true, nil)
 	if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
-		i.shipBlocks(ctx)
+		i.shipBlocks(ctx, nil)
 	}
 
 	level.Info(i.logger).Log("msg", "finished flushing and shipping TSDB blocks")
 }
 
+const (
+	tenantParam = "tenant"
+	waitParam   = "wait"
+)
+
 // Blocks version of Flush handler. It force-compacts blocks, and triggers shipping.
-func (i *Ingester) v2FlushHandler(w http.ResponseWriter, _ *http.Request) {
-	go func() {
+func (i *Ingester) v2FlushHandler(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseForm()
+	if err != nil {
+		level.Warn(i.logger).Log("msg", "failed to parse HTTP request in flush handler", "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	tenants := r.Form[tenantParam]
+
+	allowedUsers := util.NewAllowedTenants(tenants, nil)
+	run := func() {
 		ingCtx := i.BasicService.ServiceContext()
 		if ingCtx == nil || ingCtx.Err() != nil {
 			level.Info(i.logger).Log("msg", "flushing TSDB blocks: ingester not running, ignoring flush request")
 			return
 		}
 
-		ch := make(chan struct{}, 1)
+		compactionCallbackCh := make(chan struct{})
 
 		level.Info(i.logger).Log("msg", "flushing TSDB blocks: triggering compaction")
 		select {
-		case i.TSDBState.forceCompactTrigger <- ch:
+		case i.TSDBState.forceCompactTrigger <- requestWithUsersAndCallback{users: allowedUsers, callback: compactionCallbackCh}:
 			// Compacting now.
 		case <-ingCtx.Done():
 			level.Warn(i.logger).Log("msg", "failed to compact TSDB blocks, ingester not running anymore")
@@ -2012,7 +2088,7 @@ func (i *Ingester) v2FlushHandler(w http.ResponseWriter, _ *http.Request) {
 
 		// Wait until notified about compaction being finished.
 		select {
-		case <-ch:
+		case <-compactionCallbackCh:
 			level.Info(i.logger).Log("msg", "finished compacting TSDB blocks")
 		case <-ingCtx.Done():
 			level.Warn(i.logger).Log("msg", "failed to compact TSDB blocks, ingester not running anymore")
@@ -2020,10 +2096,12 @@ func (i *Ingester) v2FlushHandler(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		if i.cfg.BlocksStorageConfig.TSDB.IsBlocksShippingEnabled() {
+			shippingCallbackCh := make(chan struct{}) // must be new channel, as compactionCallbackCh is closed now.
+
 			level.Info(i.logger).Log("msg", "flushing TSDB blocks: triggering shipping")
 
 			select {
-			case i.TSDBState.shipTrigger <- ch:
+			case i.TSDBState.shipTrigger <- requestWithUsersAndCallback{users: allowedUsers, callback: shippingCallbackCh}:
 				// shipping now
 			case <-ingCtx.Done():
 				level.Warn(i.logger).Log("msg", "failed to ship TSDB blocks, ingester not running anymore")
@@ -2032,7 +2110,7 @@ func (i *Ingester) v2FlushHandler(w http.ResponseWriter, _ *http.Request) {
 
 			// Wait until shipping finished.
 			select {
-			case <-ch:
+			case <-shippingCallbackCh:
 				level.Info(i.logger).Log("msg", "shipping of TSDB blocks finished")
 			case <-ingCtx.Done():
 				level.Warn(i.logger).Log("msg", "failed to ship TSDB blocks, ingester not running anymore")
@@ -2041,7 +2119,14 @@ func (i *Ingester) v2FlushHandler(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		level.Info(i.logger).Log("msg", "flushing TSDB blocks: finished")
-	}()
+	}
+
+	if len(r.Form[waitParam]) > 0 && r.Form[waitParam][0] == "true" {
+		// Run synchronously. This simplifies and speeds up tests.
+		run()
+	} else {
+		go run()
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -2079,6 +2164,17 @@ func wrappedTSDBIngestErr(ingestErr error, timestamp model.Time, labels []cortex
 	}
 
 	return fmt.Errorf(errTSDBIngest, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano), cortexpb.FromLabelAdaptersToLabels(labels).String())
+}
+
+func wrappedTSDBIngestExemplarErr(ingestErr error, timestamp model.Time, seriesLabels, exemplarLabels []cortexpb.LabelAdapter) error {
+	if ingestErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf(errTSDBIngestExemplar, ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano),
+		cortexpb.FromLabelAdaptersToLabels(seriesLabels).String(),
+		cortexpb.FromLabelAdaptersToLabels(exemplarLabels).String(),
+	)
 }
 
 func (i *Ingester) getInstanceLimits() *InstanceLimits {

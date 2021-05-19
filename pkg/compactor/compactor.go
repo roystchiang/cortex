@@ -172,18 +172,13 @@ type ConfigProvider interface {
 type Compactor struct {
 	services.Service
 
-	compactorCfg Config
-	storageCfg   cortex_tsdb.BlocksStorageConfig
-	cfgProvider  ConfigProvider
-	logger       log.Logger
-	parentLogger log.Logger
-	registerer   prometheus.Registerer
-
-	// If empty, all users are enabled. If not empty, only users in the map are enabled (possibly owned by compactor, also subject to sharding configuration).
-	enabledUsers map[string]struct{}
-
-	// If empty, no users are disabled. If not empty, users in the map are disabled (not owned by this compactor).
-	disabledUsers map[string]struct{}
+	compactorCfg   Config
+	storageCfg     cortex_tsdb.BlocksStorageConfig
+	cfgProvider    ConfigProvider
+	logger         log.Logger
+	parentLogger   log.Logger
+	registerer     prometheus.Registerer
+	allowedTenants *util.AllowedTenants
 
 	// Functions that creates bucket client, grouper, planner and compactor using the context.
 	// Useful for injecting mock objects from tests.
@@ -272,6 +267,7 @@ func newCompactor(
 		bucketClientFactory:    bucketClientFactory,
 		blocksGrouperFactory:   blocksGrouperFactory,
 		blocksCompactorFactory: blocksCompactorFactory,
+		allowedTenants:         util.NewAllowedTenants(compactorCfg.EnabledTenants, compactorCfg.DisabledTenants),
 
 		compactionRunsStarted: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_compactor_runs_started_total",
@@ -321,21 +317,10 @@ func newCompactor(
 	}
 
 	if len(compactorCfg.EnabledTenants) > 0 {
-		c.enabledUsers = map[string]struct{}{}
-		for _, u := range compactorCfg.EnabledTenants {
-			c.enabledUsers[u] = struct{}{}
-		}
-
-		level.Info(c.logger).Log("msg", "using enabled users", "enabled", strings.Join(compactorCfg.EnabledTenants, ", "))
+		level.Info(c.logger).Log("msg", "compactor using enabled users", "enabled", strings.Join(compactorCfg.EnabledTenants, ", "))
 	}
-
 	if len(compactorCfg.DisabledTenants) > 0 {
-		c.disabledUsers = map[string]struct{}{}
-		for _, u := range compactorCfg.DisabledTenants {
-			c.disabledUsers[u] = struct{}{}
-		}
-
-		level.Info(c.logger).Log("msg", "using disabled users", "disabled", strings.Join(compactorCfg.DisabledTenants, ", "))
+		level.Info(c.logger).Log("msg", "compactor using disabled users", "disabled", strings.Join(compactorCfg.DisabledTenants, ", "))
 	}
 
 	c.Service = services.NewBasicService(c.starting, c.running, c.stopping)
@@ -367,6 +352,15 @@ func (c *Compactor) starting(ctx context.Context) error {
 
 	// Create the users scanner.
 	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUser, c.parentLogger)
+
+	// Create the blocks cleaner (service).
+	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
+		DeletionDelay:                      c.compactorCfg.DeletionDelay,
+		CleanupInterval:                    util.DurationWithJitter(c.compactorCfg.CleanupInterval, 0.1),
+		CleanupConcurrency:                 c.compactorCfg.CleanupConcurrency,
+		BlockDeletionMarksMigrationEnabled: c.compactorCfg.BlockDeletionMarksMigrationEnabled,
+		TenantCleanupDelay:                 c.compactorCfg.TenantCleanupDelay,
+	}, c.bucketClient, c.usersScanner, c.cfgProvider, c.parentLogger, c.registerer)
 
 	// Initialize the compactors ring if sharding is enabled.
 	if c.compactorCfg.ShardingEnabled {
@@ -421,15 +415,6 @@ func (c *Compactor) starting(ctx context.Context) error {
 		}
 	}
 
-	// Create the blocks cleaner (service).
-	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
-		DeletionDelay:                      c.compactorCfg.DeletionDelay,
-		CleanupInterval:                    util.DurationWithJitter(c.compactorCfg.CleanupInterval, 0.1),
-		CleanupConcurrency:                 c.compactorCfg.CleanupConcurrency,
-		BlockDeletionMarksMigrationEnabled: c.compactorCfg.BlockDeletionMarksMigrationEnabled,
-		TenantCleanupDelay:                 c.compactorCfg.TenantCleanupDelay,
-	}, c.bucketClient, c.usersScanner, c.cfgProvider, c.parentLogger, c.registerer)
-
 	// Ensure an initial cleanup occurred before starting the compactor.
 	if err := services.StartAndAwaitRunning(ctx, c.blocksCleaner); err != nil {
 		c.ringSubservices.StopAsync()
@@ -470,11 +455,12 @@ func (c *Compactor) running(ctx context.Context) error {
 
 func (c *Compactor) compactUsers(ctx context.Context) {
 	succeeded := false
+	compactionErrorCount := 0
 
 	c.compactionRunsStarted.Inc()
 
 	defer func() {
-		if succeeded {
+		if succeeded && compactionErrorCount == 0 {
 			c.compactionRunsCompleted.Inc()
 			c.compactionRunsLastSuccess.SetToCurrentTime()
 		} else {
@@ -541,6 +527,7 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 
 		if err = c.compactUserWithRetries(ctx, userID); err != nil {
 			c.compactionRunFailedTenants.Inc()
+			compactionErrorCount++
 			level.Error(c.logger).Log("msg", "failed to compact user blocks", "user", userID, "err", err)
 			continue
 		}
@@ -640,7 +627,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		return err
 	}
 
-	syncer, err := compact.NewSyncer(
+	syncer, err := compact.NewMetaSyncer(
 		ulogger,
 		reg,
 		bucket,
@@ -711,7 +698,7 @@ func (c *Compactor) discoverUsers(ctx context.Context) ([]string, error) {
 }
 
 func (c *Compactor) ownUser(userID string) (bool, error) {
-	if !isAllowedUser(c.enabledUsers, c.disabledUsers, userID) {
+	if !c.allowedTenants.IsAllowed(userID) {
 		return false, nil
 	}
 
@@ -736,22 +723,6 @@ func (c *Compactor) ownUser(userID string) (bool, error) {
 	}
 
 	return rs.Instances[0].Addr == c.ringLifecycler.Addr, nil
-}
-
-func isAllowedUser(enabledUsers, disabledUsers map[string]struct{}, userID string) bool {
-	if len(enabledUsers) > 0 {
-		if _, ok := enabledUsers[userID]; !ok {
-			return false
-		}
-	}
-
-	if len(disabledUsers) > 0 {
-		if _, ok := disabledUsers[userID]; ok {
-			return false
-		}
-	}
-
-	return true
 }
 
 const compactorMetaPrefix = "compactor-meta-"
