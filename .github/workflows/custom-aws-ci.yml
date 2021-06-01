@@ -21,7 +21,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:2021w14_go1.16-afe06f021
+      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -68,7 +68,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:2021w14_go1.16-afe06f021
+      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -93,7 +93,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:2021w14_go1.16-afe06f021
+      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -169,7 +169,7 @@ jobs:
         run: |
           touch build-image/.uptodate
           MIGRATIONS_DIR=$(pwd)/cmd/cortex/migrations
-          make BUILD_IMAGE=quay.io/cortexproject/build-image:2021w14_go1.16-afe06f021 TTY='' configs-integration-test
+          make BUILD_IMAGE=quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6 TTY='' configs-integration-test
   integration:
     needs: integration-configs-db
     runs-on: [self-hosted, prod]
@@ -217,6 +217,7 @@ jobs:
           docker pull quay.io/cortexproject/cortex:v1.6.0
           docker pull quay.io/cortexproject/cortex:v1.7.0
           docker pull quay.io/cortexproject/cortex:v1.8.0
+          docker pull quay.io/cortexproject/cortex:v1.9.0
           docker pull shopify/bigtable-emulator:0.1.0
           docker pull rinscy/cassandra:3.11.0
           docker pull memcached:1.6.1
