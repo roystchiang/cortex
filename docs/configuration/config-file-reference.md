@@ -810,6 +810,13 @@ instance_limits:
   # tenants). Additional requests will be rejected. 0 = unlimited.
   # CLI flag: -ingester.instance-limits.max-inflight-push-requests
   [max_inflight_push_requests: <int> | default = 0]
+
+# Comma-separated list of metric names, for which
+# -ingester.max-series-per-metric and -ingester.max-global-series-per-metric
+# limits will be ignored. Does not affect max-series-per-user or
+# max-global-series-per-metric limits.
+# CLI flag: -ingester.ignore-series-limit-for-metric-names
+[ignore_series_limit_for_metric_names: <string> | default = ""]
 ```
 
 ### `querier_config`
@@ -2708,7 +2715,7 @@ chunk_tables_provisioning:
 The `storage_config` configures where Cortex stores the data (chunks storage engine).
 
 ```yaml
-# The storage engine to use: chunks or blocks.
+# The storage engine to use: chunks (deprecated) or blocks.
 # CLI flag: -store.engine
 [engine: <string> | default = "chunks"]
 
@@ -3689,6 +3696,14 @@ The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>`
 # Skip validating server certificate.
 # CLI flag: -<prefix>.etcd.tls-insecure-skip-verify
 [tls_insecure_skip_verify: <boolean> | default = false]
+
+# Etcd username.
+# CLI flag: -<prefix>.etcd.username
+[username: <string> | default = ""]
+
+# Etcd password.
+# CLI flag: -<prefix>.etcd.password
+[password: <string> | default = ""]
 ```
 
 ### `consul_config`
@@ -4028,11 +4043,9 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 [max_chunks_per_query: <int> | default = 2000000]
 
 # Maximum number of chunks that can be fetched in a single query from ingesters
-# and long-term storage: the total number of actual fetched chunks could be 2x
-# the limit, being independently applied when querying ingesters and long-term
-# storage. This limit is enforced in the ingester (if chunks streaming is
-# enabled), querier, ruler and store-gateway. Takes precedence over the
-# deprecated -store.query-chunk-limit. 0 to disable.
+# and long-term storage. This limit is enforced in the querier, ruler and
+# store-gateway. Takes precedence over the deprecated -store.query-chunk-limit.
+# 0 to disable.
 # CLI flag: -querier.max-fetched-chunks-per-query
 [max_fetched_chunks_per_query: <int> | default = 0]
 
@@ -5175,13 +5188,17 @@ sharding_ring:
   [wait_stability_min_duration: <duration> | default = 1m]
 
   # Maximum time to wait for ring stability at startup. If the compactor ring
-  # keep changing after this period of time, the compactor will start anyway.
+  # keeps changing after this period of time, the compactor will start anyway.
   # CLI flag: -compactor.ring.wait-stability-max-duration
   [wait_stability_max_duration: <duration> | default = 5m]
 
   # Name of network interface to read address from.
   # CLI flag: -compactor.ring.instance-interface-names
   [instance_interface_names: <list of string> | default = [eth0 en0]]
+
+  # Timeout for waiting on compactor to become ACTIVE in the ring.
+  # CLI flag: -compactor.ring.wait-active-instance-timeout
+  [wait_active_instance_timeout: <duration> | default = 10m]
 ```
 
 ### `store_gateway_config`
@@ -5259,6 +5276,16 @@ sharding_ring:
   # availability zones.
   # CLI flag: -store-gateway.sharding-ring.zone-awareness-enabled
   [zone_awareness_enabled: <boolean> | default = false]
+
+  # Minimum time to wait for ring stability at startup. 0 to disable.
+  # CLI flag: -store-gateway.sharding-ring.wait-stability-min-duration
+  [wait_stability_min_duration: <duration> | default = 1m]
+
+  # Maximum time to wait for ring stability at startup. If the store-gateway
+  # ring keeps changing after this period of time, the store-gateway will start
+  # anyway.
+  # CLI flag: -store-gateway.sharding-ring.wait-stability-max-duration
+  [wait_stability_max_duration: <duration> | default = 5m]
 
   # Name of network interface to read address from.
   # CLI flag: -store-gateway.sharding-ring.instance-interface-names
