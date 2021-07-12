@@ -223,11 +223,15 @@ compactor:
     [wait_stability_min_duration: <duration> | default = 1m]
 
     # Maximum time to wait for ring stability at startup. If the compactor ring
-    # keep changing after this period of time, the compactor will start anyway.
+    # keeps changing after this period of time, the compactor will start anyway.
     # CLI flag: -compactor.ring.wait-stability-max-duration
     [wait_stability_max_duration: <duration> | default = 5m]
 
     # Name of network interface to read address from.
     # CLI flag: -compactor.ring.instance-interface-names
     [instance_interface_names: <list of string> | default = [eth0 en0]]
+
+    # Timeout for waiting on compactor to become ACTIVE in the ring.
+    # CLI flag: -compactor.ring.wait-active-instance-timeout
+    [wait_active_instance_timeout: <duration> | default = 10m]
 ```
