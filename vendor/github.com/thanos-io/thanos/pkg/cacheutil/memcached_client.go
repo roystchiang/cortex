@@ -24,6 +24,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/model"
+	memcacheDiscovery "github.com/thanos-io/thanos/pkg/discovery/memcache"
 )
 
 const (
@@ -154,7 +155,7 @@ type memcachedClient struct {
 	name string
 
 	// DNS provider used to keep the memcached servers list updated.
-	dnsProvider *dns.Provider
+	dnsProvider AddressProvider
 
 	// Channel used to notify internal goroutines when they should quit.
 	stop chan struct{}
@@ -180,6 +181,11 @@ type memcachedClient struct {
 type memcachedGetMultiResult struct {
 	items map[string]*memcache.Item
 	err   error
+}
+
+type AddressProvider interface {
+	Resolve(context.Context, []string) error
+	Addresses() []string
 }
 
 // NewMemcachedClient makes a new MemcachedClient.
@@ -220,18 +226,27 @@ func newMemcachedClient(
 	reg prometheus.Registerer,
 	name string,
 ) (*memcachedClient, error) {
-	dnsProvider := dns.NewProvider(
-		logger,
-		extprom.WrapRegistererWithPrefix("thanos_memcached_", reg),
-		dns.GolangResolverType,
-	)
+	promRegisterer := extprom.WrapRegistererWithPrefix("thanos_memcached_", reg)
+	var addressProvider AddressProvider
+	if "discovery-method" == "dns" {
+		addressProvider = dns.NewProvider(
+			logger,
+			promRegisterer,
+			dns.GolangResolverType,
+		)
+	} else {
+		addressProvider = memcacheDiscovery.NewProvider(
+			logger,
+			promRegisterer,
+			2*time.Second)
+	}
 
 	c := &memcachedClient{
 		logger:      log.With(logger, "name", name),
 		config:      config,
 		client:      client,
 		selector:    selector,
-		dnsProvider: dnsProvider,
+		dnsProvider: addressProvider,
 		asyncQueue:  make(chan func(), config.MaxAsyncBufferSize),
 		stop:        make(chan struct{}, 1),
 		getMultiGate: gate.New(
@@ -566,6 +581,7 @@ func (c *memcachedClient) resolveAddrs() error {
 	}
 	// Fail in case no server address is resolved.
 	servers := c.dnsProvider.Addresses()
+	fmt.Printf("Servers: %s\n", servers)
 	if len(servers) == 0 {
 		return fmt.Errorf("no server address resolved for %s", c.name)
 	}
