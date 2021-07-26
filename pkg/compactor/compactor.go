@@ -530,9 +530,13 @@ func (c *Compactor) compactUsers(ctx context.Context) {
 		level.Info(c.logger).Log("msg", "starting compaction of user blocks", "user", userID)
 
 		if err = c.compactUserWithRetries(ctx, userID); err != nil {
-			c.compactionRunFailedTenants.Inc()
-			compactionErrorCount++
-			level.Error(c.logger).Log("msg", "failed to compact user blocks", "user", userID, "err", err)
+			if ctx.Err() == context.Canceled t {
+				level.Info(c.logger).Log("msg", "compaction was interrupted", "context", ctx.Err(), "err", err)
+			} else {
+				c.compactionRunFailedTenants.Inc()
+				compactionErrorCount++
+				level.Error(c.logger).Log("msg", "failed to compact user blocks", "user", userID, "err", err)
+			}
 			continue
 		}
 
