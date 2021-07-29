@@ -1,0 +1,11 @@
+diff --git a/cmd/cortex/Dockerfile b/cmd/cortex/Dockerfile
+index 4797ccb84..5def5577d 100644
+--- a/cmd/cortex/Dockerfile
++++ b/cmd/cortex/Dockerfile
+@@ -1,5 +1,4 @@
+-FROM       alpine:3.12
+-RUN        apk add --no-cache ca-certificates
++FROM       amazonlinux:2
+ COPY       migrations /migrations/
+ COPY       cortex /bin/cortex
+ EXPOSE     80

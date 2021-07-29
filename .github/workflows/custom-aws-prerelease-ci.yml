@@ -1,4 +1,4 @@
-name: cortex-prod-ci
+name: cortex-prerelease-ci
 on:
   pull_request:
     branches:
@@ -121,6 +121,8 @@ jobs:
         run: |
           mkdir -p /go/src/github.com/cortexproject/cortex
           ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
+      - name: Patch Dockerfile
+        run: git apply ./.github/patches/Dockerfile.patch
       - name: Build Image
         run: |
           touch build-image/.uptodate
