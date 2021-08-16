@@ -22,6 +22,9 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
+      env:
+        ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v2
@@ -66,6 +69,9 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
+      env:
+        ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     services:
       cassandra:
         image: cassandra:3.11
@@ -88,6 +94,9 @@ jobs:
     runs-on: [self-hosted, prod]
     container:
       image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
+      env:
+        ECR: ${{ env.ECR }}
+        ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
     steps:
       - run: echo "ECR=$ECR" >> $GITHUB_ENV
       - name: Checkout Repo
@@ -149,14 +158,6 @@ jobs:
     needs: build
     runs-on: [self-hosted, prod]
     steps:
-      - name: Upgrade golang
-        run: |
-          cd /tmp
-          wget https://dl.google.com/go/go1.16.6.linux-amd64.tar.gz
-          tar -zxvf go1.16.6.linux-amd64.tar.gz
-          sudo rm -fr /usr/local/go
-          sudo mv /tmp/go /usr/local/go
-          cd -
       - name: Checkout Repo
         uses: actions/checkout@v2
       - name: Download Docker Images Artifacts
@@ -170,7 +171,7 @@ jobs:
         run: |
           touch build-image/.uptodate
           MIGRATIONS_DIR=$(pwd)/cmd/cortex/migrations
-          make BUILD_IMAGE=quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6 TTY='' configs-integration-test
+          make BUILD_IMAGE=quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f TTY='' configs-integration-test
   integration:
     needs: integration-configs-db
     runs-on: [self-hosted, prod]
@@ -243,46 +244,17 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: Docker Images
-      - name: Extract Docker Images Archive
-        run: tar -xvf images.tar -C /
-      - name: Run Integration Configs Tests
-        # Github Actions does not support TTY in their default runners yet
-        run: |
-          touch build-image/.uptodate
-          MIGRATIONS_DIR=$(pwd)/cmd/cortex/migrations
-          make BUILD_IMAGE=quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f TTY='' configs-integration-test
+          path: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
 
-  deploy_website:
-    needs: [build, test]
-    if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'cortexproject/cortex'
-    runs-on: ubuntu-20.04
-    container:
-      image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
-    steps:
-      - name: Checkout Repo
+      - name: Check out amp-builds
         uses: actions/checkout@v2
         with:
           repository: aws-observability/amp-builds
           path: amp-builds
           token: ${{ secrets.MACHINE_PAT }}
 
-  deploy:
-    needs: [build, test, lint, integration, integration-configs-db]
-    if: (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && github.repository == 'cortexproject/cortex'
-    runs-on: ubuntu-20.04
-    container:
-      image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v2
-      - name: Install Docker Client
-        run: ./.github/workflows/scripts/install-docker.sh
-      - name: Sym link Expected Path to Workspace
-        run: |
-          mkdir -p /go/src/github.com/cortexproject/cortex
-          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/cortexproject/cortex
-      - name: Download Docker Images Artifact
-        uses: actions/download-artifact@v2
+      - name: Push to ECR
+        uses: ./amp-builds/actions/push-to-ecr
         with:
           imageDownloadLocation: ${{ env.IMAGE_DOWNLOAD_LOCATION }}
           repoName: ${{ env.REPO }}
