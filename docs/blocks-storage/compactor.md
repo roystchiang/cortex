@@ -209,12 +209,12 @@ compactor:
         # CLI flag: -compactor.ring.multi.mirror-timeout
         [mirror_timeout: <duration> | default = 2s]
 
-    # Period at which to heartbeat to the ring.
+    # Period at which to heartbeat to the ring. 0 = disabled.
     # CLI flag: -compactor.ring.heartbeat-period
     [heartbeat_period: <duration> | default = 5s]
 
     # The heartbeat timeout after which compactors are considered unhealthy
-    # within the ring.
+    # within the ring. 0 = never (timeout disabled).
     # CLI flag: -compactor.ring.heartbeat-timeout
     [heartbeat_timeout: <duration> | default = 1m]
 
