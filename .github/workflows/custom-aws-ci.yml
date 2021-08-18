@@ -21,7 +21,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
+      image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -68,7 +68,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
+      image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -93,7 +93,7 @@ jobs:
     needs: configure
     runs-on: [self-hosted, prod]
     container:
-      image: quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6
+      image: quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f
       env:
         ECR: ${{ env.ECR }}
         ORIGINAL_USER: ${{ needs.configure.outputs.containerUser }}
@@ -171,7 +171,7 @@ jobs:
         run: |
           touch build-image/.uptodate
           MIGRATIONS_DIR=$(pwd)/cmd/cortex/migrations
-          make BUILD_IMAGE=quay.io/cortexproject/build-image:build-image-multiarch-1d2497ff6 TTY='' configs-integration-test
+          make BUILD_IMAGE=quay.io/cortexproject/build-image:20210713_update-go-1.16.6-178ab0c4f TTY='' configs-integration-test
   integration:
     needs: integration-configs-db
     runs-on: [self-hosted, prod]
