@@ -2152,6 +2152,7 @@ func mockWriteRequest(t *testing.T, lbls labels.Labels, value float64, timestamp
 						EndTimestampMs:   timestampMs,
 						Encoding:         int32(encoding.PrometheusXorChunk),
 						Data:             chunk.Bytes(),
+						NumberOfSamples:  int64(chunk.NumSamples()),
 					},
 				},
 			},

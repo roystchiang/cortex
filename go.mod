@@ -85,3 +85,5 @@ replace google.golang.org/grpc => google.golang.org/grpc v1.38.0
 // confused about which version is the latest one. v0.22.0 was released in July, but latest tag reachable from main
 // is v0.19.1. We pin version from late september here. Feel free to remove when updating to later version.
 replace github.com/thanos-io/thanos v0.22.0 => github.com/thanos-io/thanos v0.19.1-0.20210923155558-c15594a03c45
+
+replace github.com/efficientgo/tools/core => github.com/efficientgo/tools/core v0.0.0-20210731122119-5d4a0645ce9a

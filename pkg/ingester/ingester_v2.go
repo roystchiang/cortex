@@ -1461,6 +1461,7 @@ func (i *Ingester) v2QueryStreamChunks(ctx context.Context, db *userTSDB, from, 
 				StartTimestampMs: meta.MinTime,
 				EndTimestampMs:   meta.MaxTime,
 				Data:             meta.Chunk.Bytes(),
+				NumberOfSamples:  int64(meta.Chunk.NumSamples()),
 			}
 
 			switch meta.Chunk.Encoding() {

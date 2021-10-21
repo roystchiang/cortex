@@ -668,9 +668,11 @@ func (q *blocksStoreQuerier) fetchSeriesFromStores(
 
 			numSeries := len(mySeries)
 			chunkBytes := countChunkBytes(mySeries...)
+			samples := countFetchedSamples(mySeries...)
 
 			reqStats.AddFetchedSeries(uint64(numSeries))
 			reqStats.AddFetchedChunkBytes(uint64(chunkBytes))
+			reqStats.AddFetchedSamples(uint64(samples))
 
 			level.Debug(spanLog).Log("msg", "received series from store-gateway",
 				"instance", c.RemoteAddress(),
@@ -970,4 +972,13 @@ func countChunkBytes(series ...*storepb.Series) (count int) {
 	}
 
 	return count
+}
+
+// countFetchedSamples returns the number of samples fetched
+func countFetchedSamples(series ...*storepb.Series) int {
+	seriesStats := &storepb.SeriesStatsCounter{}
+	for _, s := range series {
+		seriesStats.Count(s)
+	}
+	return seriesStats.Samples
 }

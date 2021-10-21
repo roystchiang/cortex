@@ -378,15 +378,23 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 		Chunkseries: make([]ingester_client.TimeSeriesChunk, 0, len(hashToChunkseries)),
 		Timeseries:  make([]cortexpb.TimeSeries, 0, len(hashToTimeSeries)),
 	}
+
+	samples := int64(0)
+
 	for _, series := range hashToChunkseries {
 		resp.Chunkseries = append(resp.Chunkseries, series)
+		for _, c := range series.Chunks {
+			samples += c.NumberOfSamples
+		}
 	}
 	for _, series := range hashToTimeSeries {
 		resp.Timeseries = append(resp.Timeseries, series)
+		samples += int64(len(series.Samples))
 	}
 
 	reqStats.AddFetchedSeries(uint64(len(resp.Chunkseries) + len(resp.Timeseries)))
 	reqStats.AddFetchedChunkBytes(uint64(resp.ChunksSize()))
+	reqStats.AddFetchedSamples(uint64(samples))
 
 	return resp, nil
 }
