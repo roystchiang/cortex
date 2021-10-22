@@ -61,6 +61,7 @@ type engineMetrics struct {
 	maxConcurrentQueries prometheus.Gauge
 	queryLogEnabled      prometheus.Gauge
 	queryLogFailures     prometheus.Counter
+	sampleQueries        prometheus.Counter
 	queryQueueTime       prometheus.Observer
 	queryPrepareTime     prometheus.Observer
 	queryInnerEval       prometheus.Observer
@@ -308,6 +309,7 @@ func NewEngine(opts EngineOpts) *Engine {
 			metrics.maxConcurrentQueries,
 			metrics.queryLogEnabled,
 			metrics.queryLogFailures,
+			metrics.sampleQueries,
 			queryResultSummary,
 		)
 	}
