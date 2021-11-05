@@ -789,16 +789,26 @@ func (c *Compactor) ownUser(userID string) (bool, error) {
 		return false, nil
 	}
 
-	// Always owned if sharding is disabled or if using shuffle-sharding as shard ownership
-	// is determined by the shuffle sharding grouper.
-	if !c.compactorCfg.ShardingEnabled || c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
-		return true, nil
-	}
-
 	// Hash the user ID.
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(userID))
 	userHash := hasher.Sum32()
+
+	// Always owned if sharding is disabled
+	if !c.compactorCfg.ShardingEnabled {
+		return true, nil
+	}
+
+	if c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
+		subRing := c.ring.ShuffleShard(userID, c.limits.CompactorTenantShardSize(userID))
+
+		rs, err := subRing.GetAllHealthy(RingOp)
+		if err != nil {
+			return false, err
+		}
+
+		return rs.Includes(c.ringLifecycler.Addr), nil
+	}
 
 	// Check whether this compactor instance owns the user.
 	rs, err := c.ring.Get(userHash, RingOp, nil, nil, nil)
