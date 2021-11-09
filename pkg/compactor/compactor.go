@@ -433,7 +433,7 @@ func (c *Compactor) starting(ctx context.Context) error {
 	c.bucketClient = bucketindex.BucketWithGlobalMarkers(c.bucketClient)
 
 	// Create the users scanner.
-	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.ownUser, c.parentLogger)
+	c.usersScanner = cortex_tsdb.NewUsersScanner(c.bucketClient, c.cleanUser, c.parentLogger)
 
 	// Create the blocks cleaner (service).
 	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
@@ -785,6 +785,14 @@ func (c *Compactor) discoverUsers(ctx context.Context) ([]string, error) {
 }
 
 func (c *Compactor) ownUser(userID string) (bool, error) {
+	return c.ownUserHelper(userID, false)
+}
+
+func (c *Compactor) cleanUser(userID string) (bool, error) {
+	return c.ownUserHelper(userID, true)
+}
+
+func (c *Compactor) ownUserHelper(userID string, isCleanUp bool) (bool, error) {
 	if !c.allowedTenants.IsAllowed(userID) {
 		return false, nil
 	}
@@ -799,7 +807,7 @@ func (c *Compactor) ownUser(userID string) (bool, error) {
 		return true, nil
 	}
 
-	if c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
+	if !isCleanUp && c.compactorCfg.ShardingStrategy == util.ShardingStrategyShuffle {
 		subRing := c.ring.ShuffleShard(userID, c.limits.CompactorTenantShardSize(userID))
 
 		rs, err := subRing.GetAllHealthy(RingOp)
