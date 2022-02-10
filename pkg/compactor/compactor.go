@@ -42,6 +42,9 @@ const (
 
 	blocksMarkedForDeletionName = "cortex_compactor_blocks_marked_for_deletion_total"
 	blocksMarkedForDeletionHelp = "Total number of blocks marked for deletion in compactor."
+
+	blocksMarkedForNoCompactName = "cortex_compactor_blocks_marked_for_no_compact_total"
+	blocksMarkedForNoCompactHelp = "Total number of blocks marked for no compact in compactor"
 )
 
 var (
@@ -51,7 +54,7 @@ var (
 	supportedShardingStrategies = []string{util.ShardingStrategyDefault, util.ShardingStrategyShuffle}
 	errInvalidShardingStrategy  = errors.New("invalid sharding strategy")
 
-	DefaultBlocksGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.Bucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion prometheus.Counter, garbageCollectedBlocks prometheus.Counter) compact.Grouper {
+	DefaultBlocksGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.Bucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion prometheus.Counter, garbageCollectedBlocks prometheus.Counter, blocksMarkedForNoCompact prometheus.Counter) compact.Grouper {
 		return compact.NewDefaultGrouper(
 			logger,
 			bkt,
@@ -60,11 +63,11 @@ var (
 			reg,
 			blocksMarkedForDeletion,
 			garbageCollectedBlocks,
-			prometheus.NewCounter(prometheus.CounterOpts{}),
+			blocksMarkedForNoCompact,
 			metadata.NoneFunc)
 	}
 
-	ShuffleShardingGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.Bucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion prometheus.Counter, garbageCollectedBlocks prometheus.Counter) compact.Grouper {
+	ShuffleShardingGrouperFactory = func(ctx context.Context, cfg Config, bkt objstore.Bucket, logger log.Logger, reg prometheus.Registerer, blocksMarkedForDeletion prometheus.Counter, garbageCollectedBlocks prometheus.Counter, blocksMarkedForNoCompact prometheus.Counter) compact.Grouper {
 		return NewShuffleShardingGrouper(
 			logger,
 			bkt,
@@ -72,29 +75,29 @@ var (
 			true,  // Enable vertical compaction
 			reg,
 			blocksMarkedForDeletion,
-			prometheus.NewCounter(prometheus.CounterOpts{}),
+			blocksMarkedForNoCompact,
 			garbageCollectedBlocks,
 			metadata.NoneFunc,
 			cfg)
 	}
 
-	DefaultBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, compact.Planner, error) {
+	DefaultBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer, noCompBlocks *compact.GatherNoCompactionMarkFilter) (compact.Compactor, compact.Planner, error) {
 		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		planner := compact.NewTSDBBasedPlanner(logger, cfg.BlockRanges.ToMilliseconds())
+		planner := compact.NewPlanner(logger, cfg.BlockRanges.ToMilliseconds(), noCompBlocks)
 		return compactor, planner, nil
 	}
 
-	ShuffleShardingBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, compact.Planner, error) {
+	ShuffleShardingBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer, noCompBlocks *compact.GatherNoCompactionMarkFilter) (compact.Compactor, compact.Planner, error) {
 		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		planner := NewShuffleShardingPlanner(logger, cfg.BlockRanges.ToMilliseconds())
+		planner := NewShuffleShardingPlanner(logger, cfg.BlockRanges.ToMilliseconds(), noCompBlocks)
 		return compactor, planner, nil
 	}
 )
@@ -108,6 +111,7 @@ type BlocksGrouperFactory func(
 	reg prometheus.Registerer,
 	blocksMarkedForDeletion prometheus.Counter,
 	garbageCollectedBlocks prometheus.Counter,
+	markedForNoCompact prometheus.Counter,
 ) compact.Grouper
 
 // BlocksCompactorFactory builds and returns the compactor and planner to use to compact a tenant's blocks.
@@ -116,6 +120,7 @@ type BlocksCompactorFactory func(
 	cfg Config,
 	logger log.Logger,
 	reg prometheus.Registerer,
+	noCompBlocks *compact.GatherNoCompactionMarkFilter,
 ) (compact.Compactor, compact.Planner, error)
 
 // Config holds the Compactor config.
@@ -231,10 +236,6 @@ type Compactor struct {
 	// Blocks cleaner is responsible to hard delete blocks marked for deletion.
 	blocksCleaner *BlocksCleaner
 
-	// Underlying compactor and planner used to compact TSDB blocks.
-	blocksCompactor compact.Compactor
-	blocksPlanner   compact.Planner
-
 	// Client used to run operations on the bucket storing blocks.
 	bucketClient objstore.Bucket
 
@@ -256,6 +257,7 @@ type Compactor struct {
 	compactionRunInterval          prometheus.Gauge
 	blocksMarkedForDeletion        prometheus.Counter
 	garbageCollectedBlocks         prometheus.Counter
+	blocksMarkedForNoCompact	   prometheus.Counter
 
 	// TSDB syncer metrics
 	syncerMetrics *syncerMetrics
@@ -361,6 +363,11 @@ func newCompactor(
 			Name: "cortex_compactor_garbage_collected_blocks_total",
 			Help: "Total number of blocks marked for deletion by compactor.",
 		}),
+		blocksMarkedForNoCompact: promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+			Name: blocksMarkedForNoCompactName,
+			Help: blocksMarkedForNoCompactHelp,
+			ConstLabels: prometheus.Labels{"reason": "compaction"},
+	}),
 	}
 
 	if len(compactorCfg.EnabledTenants) > 0 {
@@ -386,12 +393,6 @@ func (c *Compactor) starting(ctx context.Context) error {
 	c.bucketClient, err = c.bucketClientFactory(ctx)
 	if err != nil {
 		return errors.Wrap(err, "failed to create bucket client")
-	}
-
-	// Create blocks compactor dependencies.
-	c.blocksCompactor, c.blocksPlanner, err = c.blocksCompactorFactory(ctx, c.compactorCfg, c.logger, c.registerer)
-	if err != nil {
-		return errors.Wrap(err, "failed to initialize compactor dependencies")
 	}
 
 	// Wrap the bucket client to write block deletion marks in the global location too.
@@ -657,6 +658,9 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		0,
 		c.compactorCfg.MetaSyncConcurrency)
 
+	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(ulogger, bucket, c.compactorCfg.MetaSyncConcurrency)
+
+
 	fetcher, err := block.NewMetaFetcher(
 		ulogger,
 		c.compactorCfg.MetaSyncConcurrency,
@@ -671,6 +675,7 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 			block.NewConsistencyDelayMetaFilter(ulogger, c.compactorCfg.ConsistencyDelay, reg),
 			ignoreDeletionMarkFilter,
 			deduplicateBlocksFilter,
+			noCompactMarkerFilter,
 		},
 		nil,
 	)
@@ -693,12 +698,17 @@ func (c *Compactor) compactUser(ctx context.Context, userID string) error {
 		return errors.Wrap(err, "failed to create syncer")
 	}
 
+	tsdbCompactor, tsdbPlanner, err := c.blocksCompactorFactory(ctx, c.compactorCfg, c.logger, c.registerer, noCompactMarkerFilter)
+	if err != nil {
+		return errors.Wrap(err, "failed to initialize compactor dependencies")
+	}
+
 	compactor, err := compact.NewBucketCompactor(
 		ulogger,
 		syncer,
-		c.blocksGrouperFactory(ctx, c.compactorCfg, bucket, ulogger, reg, c.blocksMarkedForDeletion, c.garbageCollectedBlocks),
-		c.blocksPlanner,
-		c.blocksCompactor,
+		c.blocksGrouperFactory(ctx, c.compactorCfg, bucket, ulogger, reg, c.blocksMarkedForDeletion, c.garbageCollectedBlocks, c.blocksMarkedForNoCompact),
+		tsdbPlanner,
+		tsdbCompactor,
 		path.Join(c.compactorCfg.DataDir, "compact"),
 		bucket,
 		c.compactorCfg.CompactionConcurrency,
