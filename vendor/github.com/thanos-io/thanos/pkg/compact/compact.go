@@ -1140,6 +1140,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	}
 	level.Info(cg.logger).Log("msg", "uploaded block", "result_block", compID, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 
+	/*
 	// Mark for deletion the blocks we just compacted from the group and bucket so they do not get included
 	// into the next planning cycle.
 	// Eventually the block we just uploaded should get synced into the group again (including sync-delay).
@@ -1152,6 +1153,7 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		}
 		cg.groupGarbageCollectedBlocks.Inc()
 	}
+	 */
 	return true, compID, nil
 }
 

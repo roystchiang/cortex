@@ -300,9 +300,9 @@ type genericMergeSeriesSet struct {
 // merged series set will be incorrect.
 // Overlapped situations are merged using provided mergeFunc.
 func newGenericMergeSeriesSet(sets []genericSeriesSet, mergeFunc genericSeriesMergeFunc) genericSeriesSet {
-	if len(sets) == 1 {
-		return sets[0]
-	}
+	//if len(sets) == 1 {
+	//	return sets[0]
+	//}
 
 	// We are pre-advancing sets, so we can introspect the label of the
 	// series under the cursor.
@@ -360,9 +360,9 @@ func (c *genericMergeSeriesSet) Next() bool {
 }
 
 func (c *genericMergeSeriesSet) At() Labels {
-	if len(c.currentSets) == 1 {
-		return c.currentSets[0].At()
-	}
+	//if len(c.currentSets) == 1 {
+	//	return c.currentSets[0].At()
+	//}
 	series := make([]Labels, 0, len(c.currentSets))
 	for _, seriesSet := range c.currentSets {
 		series = append(series, seriesSet.At())

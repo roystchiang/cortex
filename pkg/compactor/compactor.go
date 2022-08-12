@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/prometheus/prometheus/storage"
 	"hash/fnv"
 	"io/ioutil"
 	"math/rand"
@@ -90,7 +91,7 @@ var (
 	}
 
 	DefaultBlocksCompactorFactory = func(ctx context.Context, cfg Config, logger log.Logger, reg prometheus.Registerer) (compact.Compactor, PlannerFactory, error) {
-		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), nil)
+		compactor, err := tsdb.NewLeveledCompactor(ctx, reg, logger, cfg.BlockRanges.ToMilliseconds(), downsample.NewPool(), NewVerticalCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
 		if err != nil {
 			return nil, nil, err
 		}
