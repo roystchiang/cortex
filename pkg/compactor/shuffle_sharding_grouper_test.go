@@ -423,7 +423,7 @@ func TestGroupBlocksByCompactableRanges(t *testing.T) {
 			ranges: []int64{10, 20, 40},
 			blocks: []*metadata.Meta{
 				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40}},
-				{BlockMeta: tsdb.BlockMeta{MinTime: 30, MaxTime: 150}}, // This block is larger then the largest compaction range.
+				{BlockMeta: tsdb.BlockMeta{MinTime: 30, MaxTime: 150}}, // This block is larger than the largest compaction range.
 				{BlockMeta: tsdb.BlockMeta{MinTime: 40, MaxTime: 70}},
 				{BlockMeta: tsdb.BlockMeta{MinTime: 80, MaxTime: 120}},
 				{BlockMeta: tsdb.BlockMeta{MinTime: 80, MaxTime: 120}},
@@ -504,7 +504,7 @@ func TestGroupBlocksByRange(t *testing.T) {
 			timeRange: 20,
 			blocks: []*metadata.Meta{
 				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 20}},
-				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40}}, // This block is larger then the range.
+				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40}}, // This block is larger than the range.
 				{BlockMeta: tsdb.BlockMeta{MinTime: 10, MaxTime: 20}},
 				{BlockMeta: tsdb.BlockMeta{MinTime: 20, MaxTime: 30}},
 			},

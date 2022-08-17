@@ -16,21 +16,6 @@ func NewVerticalCompactingChunkSeriesMerger(mergeFunc storage.VerticalSeriesMerg
 			return nil
 		}
 
-		//do some sharding
-		//labelSet := series[0].Labels()
-		//if labelSet.Hash() % 2 == 0 {
-		//	return &storage.ChunkSeriesEntry{
-		//		Lset: series[0].Labels(),
-		//		ChunkIteratorFn: func() chunks.Iterator {
-		//			iterators := make([]chunks.Iterator, 0, len(series))
-		//			return &compactChunkIterator{
-		//				mergeFunc: mergeFunc,
-		//				iterators: iterators,
-		//			}
-		//		},
-		//	}
-		//}
-
 		return &storage.ChunkSeriesEntry{
 			Lset: series[0].Labels(),
 			ChunkIteratorFn: func() chunks.Iterator {

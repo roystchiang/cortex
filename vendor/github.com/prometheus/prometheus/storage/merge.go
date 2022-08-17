@@ -311,8 +311,11 @@ func newGenericMergeSeriesSet(sets []genericSeriesSet, mergeFunc genericSeriesMe
 		if set == nil {
 			continue
 		}
-		if set.Next() {
-			heap.Push(&h, set)
+		for set.Next() {
+			if set.At().Labels().Hash() % 2 == 0 {
+				heap.Push(&h, set)
+				break
+			}
 		}
 		if err := set.Err(); err != nil {
 			return errorOnlySeriesSet{err}
@@ -332,10 +335,26 @@ func (c *genericMergeSeriesSet) Next() bool {
 	for {
 		// Firstly advance all the current series sets. If any of them have run out,
 		// we can drop them, otherwise they should be inserted back into the heap.
-		for _, set := range c.currentSets {
-			if set.Next() {
-				heap.Push(&c.heap, set)
-			}
+		ch := make(chan genericSeriesSet, len(c.currentSets))
+		wg := sync.WaitGroup{}
+		for i := range c.currentSets {
+			wg.Add(1)
+			i := i
+			go func() {
+				defer wg.Done()
+				for c.currentSets[i].Next() {
+					if c.currentSets[i].At().Labels().Hash() % 2 == 0 {
+						ch <- c.currentSets[i]
+						break
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+		close(ch)
+		for set := range ch {
+			heap.Push(&c.heap, set)
 		}
 
 		if len(c.heap) == 0 {
