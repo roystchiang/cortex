@@ -726,8 +726,9 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			return err
 		}
 		all = indexr.SortedPostings(all)
+		shardedPosting := index.NewShardedPosting(all, indexr.Series)
 		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
-		sets = append(sets, newBlockChunkSeriesSet(indexr, chunkr, tombsr, all, meta.MinTime, meta.MaxTime-1, false))
+		sets = append(sets, newBlockChunkSeriesSet(indexr, chunkr, tombsr, shardedPosting, meta.MinTime, meta.MaxTime-1, false))
 		syms := indexr.Symbols()
 		if i == 0 {
 			symbols = syms

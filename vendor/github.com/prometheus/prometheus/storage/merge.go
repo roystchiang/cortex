@@ -312,7 +312,8 @@ func newGenericMergeSeriesSet(sets []genericSeriesSet, mergeFunc genericSeriesMe
 			continue
 		}
 		for set.Next() {
-			if set.At().Labels().Hash() % 2 == 0 {
+			if true {
+			//if set.At().Labels().Hash() % 2 == 0 {
 				heap.Push(&h, set)
 				break
 			}
@@ -343,7 +344,8 @@ func (c *genericMergeSeriesSet) Next() bool {
 			go func() {
 				defer wg.Done()
 				for c.currentSets[i].Next() {
-					if c.currentSets[i].At().Labels().Hash() % 2 == 0 {
+					if true {
+					//if c.currentSets[i].At().Labels().Hash() % 2 == 0 {
 						ch <- c.currentSets[i]
 						break
 					}

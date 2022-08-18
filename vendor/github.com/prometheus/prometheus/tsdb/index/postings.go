@@ -16,6 +16,9 @@ package index
 import (
 	"container/heap"
 	"encoding/binary"
+	labels2 "github.com/prometheus/prometheus/model/labels"
+	storage2 "github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"runtime"
 	"sort"
 	"sync"
@@ -410,6 +413,40 @@ type Postings interface {
 	Err() error
 }
 
+type shardedPostings struct {
+	postings Postings
+	labelsFn func(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error
+
+	bufChks []chunks.Meta
+	bufLbls labels.Labels
+}
+
+func NewShardedPosting(postings Postings, labelsFn func(ref storage2.SeriesRef, lset *labels2.Labels, chks *[]chunks.Meta) error) *shardedPostings {
+	return &shardedPostings{postings: postings, labelsFn: labelsFn}
+}
+
+func (p shardedPostings) Next() bool {
+	for p.postings.Next() {
+		p.labelsFn(p.postings.At(), &p.bufLbls, &p.bufChks)
+		if p.bufLbls.Hash() % 2 == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p shardedPostings) At() storage.SeriesRef {
+	return p.postings.At()
+}
+
+func (p shardedPostings) Seek(v storage.SeriesRef) bool {
+	return p.postings.Seek(v)
+}
+
+func (p shardedPostings) Err() error {
+	return nil
+}
+
 // errPostings is an empty iterator that always errors.
 type errPostings struct {
 	err error
@@ -584,6 +621,7 @@ func (it *mergedPostings) Next() bool {
 	for {
 		cur := it.h[0]
 		if !cur.Next() {
+			it.h[0].At()
 			heap.Pop(&it.h)
 			if cur.Err() != nil {
 				it.err = cur.Err()
