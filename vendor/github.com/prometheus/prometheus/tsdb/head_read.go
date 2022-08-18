@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 
@@ -118,6 +119,7 @@ func (h *headIndexReader) Postings(name string, values ...string) (index.Posting
 }
 
 func (h *headIndexReader) SortedPostings(p index.Postings) index.Postings {
+	fmt.Println("sorted postings")
 	series := make([]*memSeries, 0, 128)
 
 	// Fetch all the series only once.

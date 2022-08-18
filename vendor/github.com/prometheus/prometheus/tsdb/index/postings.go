@@ -16,6 +16,7 @@ package index
 import (
 	"container/heap"
 	"encoding/binary"
+	"fmt"
 	labels2 "github.com/prometheus/prometheus/model/labels"
 	storage2 "github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -414,36 +415,51 @@ type Postings interface {
 }
 
 type shardedPostings struct {
-	postings Postings
-	labelsFn func(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error
+	//postings Postings
+	//labelsFn func(ref storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error
+	series []storage.SeriesRef
+	cur    storage.SeriesRef
+	initialized bool
 
-	bufChks []chunks.Meta
-	bufLbls labels.Labels
+	//bufChks []chunks.Meta
+	//bufLbls labels.Labels
 }
 
 func NewShardedPosting(postings Postings, labelsFn func(ref storage2.SeriesRef, lset *labels2.Labels, chks *[]chunks.Meta) error) *shardedPostings {
-	return &shardedPostings{postings: postings, labelsFn: labelsFn}
+	bufChks := make([]chunks.Meta, 0)
+	bufLbls := make(labels.Labels, 0)
+	series := make([]storage.SeriesRef, 0)
+	for postings.Next() {
+		err := labelsFn(postings.At(), &bufLbls, &bufChks)
+		if err != nil {
+			fmt.Printf("err: %v", err)
+		}
+		if bufLbls.Hash() %2 == 1 {
+			posting := postings.At()
+			series = append(series, posting)
+		}
+	}
+	return &shardedPostings{series: series, initialized: false}
 }
 
-func (p shardedPostings) Next() bool {
-	for p.postings.Next() {
-		p.labelsFn(p.postings.At(), &p.bufLbls, &p.bufChks)
-		if p.bufLbls.Hash() % 2 == 1 {
-			return true
-		}
+func (p *shardedPostings) Next() bool {
+	if len(p.series) > 0 {
+		p.cur, p.series = p.series[0], p.series[1:]
+		return true
 	}
 	return false
 }
 
-func (p shardedPostings) At() storage.SeriesRef {
-	return p.postings.At()
+func (p *shardedPostings) At() storage.SeriesRef {
+	return p.cur
 }
 
-func (p shardedPostings) Seek(v storage.SeriesRef) bool {
-	return p.postings.Seek(v)
+func (p *shardedPostings) Seek(v storage.SeriesRef) bool {
+	fmt.Println("ran seek")
+	return false
 }
 
-func (p shardedPostings) Err() error {
+func (p *shardedPostings) Err() error {
 	return nil
 }
 
@@ -519,6 +535,7 @@ Loop:
 }
 
 func (it *intersectPostings) Next() bool {
+	fmt.Println("intersectingPostings next")
 	for _, p := range it.arr {
 		if !p.Next() {
 			return false
@@ -553,6 +570,7 @@ func Merge(its ...Postings) Postings {
 		return its[0]
 	}
 
+	fmt.Println("creating a mergedPostings")
 	p, ok := newMergedPostings(its)
 	if !ok {
 		return EmptyPostings()
@@ -643,6 +661,7 @@ func (it *mergedPostings) Next() bool {
 }
 
 func (it *mergedPostings) Seek(id storage.SeriesRef) bool {
+	fmt.Println("seeked mergedPostings")
 	if it.h.Len() == 0 || it.err != nil {
 		return false
 	}
@@ -673,6 +692,9 @@ func (it *mergedPostings) Seek(id storage.SeriesRef) bool {
 }
 
 func (it mergedPostings) At() storage.SeriesRef {
+	if !it.initialized {
+		fmt.Println("merged postings not initialized")
+	}
 	return it.cur
 }
 
@@ -785,6 +807,7 @@ func (it *ListPostings) At() storage.SeriesRef {
 }
 
 func (it *ListPostings) Next() bool {
+	fmt.Println("ListPostings next")
 	if len(it.list) > 0 {
 		it.cur = it.list[0]
 		it.list = it.list[1:]
@@ -825,18 +848,24 @@ func (it *ListPostings) Err() error {
 type bigEndianPostings struct {
 	list []byte
 	cur  uint32
+	initialized bool
 }
 
 func newBigEndianPostings(list []byte) *bigEndianPostings {
-	return &bigEndianPostings{list: list}
+	return &bigEndianPostings{list: list, initialized: false}
 }
 
 func (it *bigEndianPostings) At() storage.SeriesRef {
+	if !it.initialized {
+		fmt.Println("bigEndianPostings not initialized")
+	}
 	return storage.SeriesRef(it.cur)
 }
 
 func (it *bigEndianPostings) Next() bool {
+	it.initialized = true
 	if len(it.list) >= 4 {
+		it.initialized = true
 		it.cur = binary.BigEndian.Uint32(it.list)
 		it.list = it.list[4:]
 		return true

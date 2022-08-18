@@ -1713,13 +1713,13 @@ func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 			return nil, errors.Wrap(d.Err(), "get postings offset entry")
 		}
 	}
-
 	return Merge(res...), nil
 }
 
 // SortedPostings returns the given postings list reordered so that the backing series
 // are sorted.
 func (r *Reader) SortedPostings(p Postings) Postings {
+	fmt.Println("Reader SortedPostings")
 	return p
 }
 

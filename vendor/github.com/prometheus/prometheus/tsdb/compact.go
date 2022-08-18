@@ -725,6 +725,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		if err != nil {
 			return err
 		}
+		fmt.Println("creating posting")
 		all = indexr.SortedPostings(all)
 		shardedPosting := index.NewShardedPosting(all, indexr.Series)
 		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
