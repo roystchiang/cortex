@@ -17,10 +17,12 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -669,6 +671,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 
 	var (
 		sets        []storage.ChunkSeriesSet
+		setsMtx		sync.Mutex
 		symbols     index.StringIter
 		closers     []io.Closer
 		overlapping bool
@@ -684,6 +687,9 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	c.metrics.populatingBlocks.Set(1)
 
 	globalMaxt := blocks[0].Meta().MaxTime
+	g, _:= errgroup.WithContext(c.ctx)
+	g.SetLimit(8)
+	start := time.Now()
 	for i, b := range blocks {
 		select {
 		case <-c.ctx.Done():
@@ -725,11 +731,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		if err != nil {
 			return err
 		}
-		fmt.Println("creating posting")
 		all = indexr.SortedPostings(all)
-		shardedPosting := index.NewShardedPosting(all, indexr.Series)
-		// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
-		sets = append(sets, newBlockChunkSeriesSet(indexr, chunkr, tombsr, shardedPosting, meta.MinTime, meta.MaxTime-1, false))
+		g.Go(func() error {
+			shardStart := time.Now()
+			shardedPosting := index.NewShardedPosting(all, indexr.Series)
+			fmt.Printf("finished sharding, duration: %v\n", time.Since(shardStart))
+			// Blocks meta is half open: [min, max), so subtract 1 to ensure we don't hold samples with exact meta.MaxTime timestamp.
+			setsMtx.Lock()
+			sets = append(sets, newBlockChunkSeriesSet(indexr, chunkr, tombsr, shardedPosting, meta.MinTime, meta.MaxTime-1, false))
+			setsMtx.Unlock()
+			return nil
+		})
 		syms := indexr.Symbols()
 		if i == 0 {
 			symbols = syms
@@ -737,6 +749,10 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		}
 		symbols = NewMergedStringIter(symbols, syms)
 	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	fmt.Printf("done: %v\n", time.Since(start))
 
 	for symbols.Next() {
 		if err := indexw.AddSymbol(symbols.At()); err != nil {

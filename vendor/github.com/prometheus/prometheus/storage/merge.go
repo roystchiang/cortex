@@ -300,9 +300,9 @@ type genericMergeSeriesSet struct {
 // merged series set will be incorrect.
 // Overlapped situations are merged using provided mergeFunc.
 func newGenericMergeSeriesSet(sets []genericSeriesSet, mergeFunc genericSeriesMergeFunc) genericSeriesSet {
-	//if len(sets) == 1 {
-	//	return sets[0]
-	//}
+	if len(sets) == 1 {
+		return sets[0]
+	}
 
 	// We are pre-advancing sets, so we can introspect the label of the
 	// series under the cursor.
@@ -311,12 +311,8 @@ func newGenericMergeSeriesSet(sets []genericSeriesSet, mergeFunc genericSeriesMe
 		if set == nil {
 			continue
 		}
-		for set.Next() {
-			if true {
-			//if set.At().Labels().Hash() % 2 == 0 {
-				heap.Push(&h, set)
-				break
-			}
+		if set.Next() {
+			heap.Push(&h, set)
 		}
 		if err := set.Err(); err != nil {
 			return errorOnlySeriesSet{err}
@@ -336,27 +332,10 @@ func (c *genericMergeSeriesSet) Next() bool {
 	for {
 		// Firstly advance all the current series sets. If any of them have run out,
 		// we can drop them, otherwise they should be inserted back into the heap.
-		ch := make(chan genericSeriesSet, len(c.currentSets))
-		wg := sync.WaitGroup{}
-		for i := range c.currentSets {
-			wg.Add(1)
-			i := i
-			go func() {
-				defer wg.Done()
-				for c.currentSets[i].Next() {
-					if true {
-					//if c.currentSets[i].At().Labels().Hash() % 2 == 0 {
-						ch <- c.currentSets[i]
-						break
-					}
-				}
-			}()
-		}
-
-		wg.Wait()
-		close(ch)
-		for set := range ch {
-			heap.Push(&c.heap, set)
+		for _, set := range c.currentSets {
+			if set.Next() {
+				heap.Push(&c.heap, set)
+			}
 		}
 
 		if len(c.heap) == 0 {
@@ -381,9 +360,9 @@ func (c *genericMergeSeriesSet) Next() bool {
 }
 
 func (c *genericMergeSeriesSet) At() Labels {
-	//if len(c.currentSets) == 1 {
-	//	return c.currentSets[0].At()
-	//}
+	if len(c.currentSets) == 1 {
+		return c.currentSets[0].At()
+	}
 	series := make([]Labels, 0, len(c.currentSets))
 	for _, seriesSet := range c.currentSets {
 		series = append(series, seriesSet.At())
