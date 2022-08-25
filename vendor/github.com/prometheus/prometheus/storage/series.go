@@ -224,8 +224,10 @@ type seriesToChunkEncoder struct {
 
 const seriesToChunkEncoderSplit = 120
 
+var SeriesToChunkEncoderCount = 0
 // NewSeriesToChunkEncoder encodes samples to chunks with 120 samples limit.
 func NewSeriesToChunkEncoder(series Series) ChunkSeries {
+	SeriesToChunkEncoderCount += 1
 	return &seriesToChunkEncoder{series}
 }
 

@@ -754,6 +754,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	}
 	fmt.Printf("done: %v\n", time.Since(start))
 
+	start = time.Now()
 	for symbols.Next() {
 		if err := indexw.AddSymbol(symbols.At()); err != nil {
 			return errors.Wrap(err, "add symbol")
@@ -767,6 +768,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		ref  = storage.SeriesRef(0)
 		chks []chunks.Meta
 	)
+	fmt.Printf("symbols: %v\n", time.Since(start))
 
 	set := sets[0]
 	if len(sets) > 1 {
@@ -775,6 +777,14 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		set = storage.NewMergeChunkSeriesSet(sets, c.mergeFunc)
 	}
 
+	start = time.Now()
+	writeCount := 0
+	writeDuration := time.Duration(0)
+	writeChunkDuration := time.Duration(0)
+	indexDuration := time.Duration(0)
+	chunkPoolDuration := time.Duration(0)
+	chunkAppendDuration := time.Duration(0)
+	chunkAppendCount := 0
 	// Iterate over all sorted chunk series.
 	for set.Next() {
 		select {
@@ -782,14 +792,20 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			return c.ctx.Err()
 		default:
 		}
+		writeStart := time.Now()
 		s := set.At()
 		chksIter := s.Iterator()
 		chks = chks[:0]
+
+		chunkAppendStart := time.Now()
 		for chksIter.Next() {
+			chunkAppendCount += 1
 			// We are not iterating in streaming way over chunk as it's more efficient to do bulk write for index and
 			// chunk file purposes.
 			chks = append(chks, chksIter.At())
 		}
+		chunkAppendDuration += time.Since(chunkAppendStart)
+
 		if chksIter.Err() != nil {
 			return errors.Wrap(chksIter.Err(), "chunk iter")
 		}
@@ -799,12 +815,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			continue
 		}
 
+		writeChunkStart := time.Now()
 		if err := chunkw.WriteChunks(chks...); err != nil {
 			return errors.Wrap(err, "write chunks")
 		}
+		writeChunkDuration += time.Since(writeChunkStart)
+
+		indexStart := time.Now()
 		if err := indexw.AddSeries(ref, s.Labels(), chks...); err != nil {
 			return errors.Wrap(err, "add series")
 		}
+		indexDuration += time.Since(indexStart)
 
 		meta.Stats.NumChunks += uint64(len(chks))
 		meta.Stats.NumSeries++
@@ -812,16 +833,23 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
 		}
 
+		chunkPoolStart := time.Now()
 		for _, chk := range chks {
 			if err := c.chunkPool.Put(chk.Chunk); err != nil {
 				return errors.Wrap(err, "put chunk")
 			}
 		}
+		chunkPoolDuration += time.Since(chunkPoolStart)
 		ref++
+		writeCount += 1
+		writeDuration += time.Since(writeStart)
 	}
 	if set.Err() != nil {
 		return errors.Wrap(set.Err(), "iterate compaction set")
 	}
+	fmt.Printf("write count: %v, write duration:%v, chunk append duration: %v, chunk append count: %v, write chunk duration: %v, index duration:%v, chunkPool duration:%v, compactChunkIterator count: %v, mergeNext duration: %v, mergeNext count:%v, mergeNext loop count: %v, mergeNext loop duration: %v, return count: %v\n",
+	writeCount, writeDuration, chunkAppendDuration, chunkAppendCount, writeChunkDuration, indexDuration, chunkPoolDuration, storage.CompactSeriesIteratorCount, storage.NextDuration, storage.NextCount, storage.NextLoopCount, storage.NextLoopDuration, storage.ReturnCount)
+	fmt.Printf("completed: %v\n", time.Since(start))
 
 	return nil
 }

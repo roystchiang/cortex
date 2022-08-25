@@ -434,7 +434,7 @@ func NewShardedPosting(postings Postings, labelsFn func(ref storage2.SeriesRef, 
 		if err != nil {
 			fmt.Printf("err: %v", err)
 		}
-		if bufLbls.Hash() %2 == 0 {
+		if bufLbls.Hash() %20 == 0 {
 			posting := postings.At()
 			series = append(series, posting)
 		}

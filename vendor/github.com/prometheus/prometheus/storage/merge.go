@@ -16,9 +16,11 @@ package storage
 import (
 	"bytes"
 	"container/heap"
+	"fmt"
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -292,6 +294,8 @@ type genericMergeSeriesSet struct {
 	heap        genericSeriesSetHeap
 	sets        []genericSeriesSet
 	currentSets []genericSeriesSet
+	total		time.Duration
+	called		int
 }
 
 // newGenericMergeSeriesSet returns a new genericSeriesSet that merges (and deduplicates)
@@ -373,14 +377,18 @@ func (c *genericMergeSeriesSet) Next() bool {
 	return true
 }
 
+var ReturnCount = 0
+var MergeCount = 0
 func (c *genericMergeSeriesSet) At() Labels {
 	if len(c.currentSets) == 1 {
+		ReturnCount += 1
 		return c.currentSets[0].At()
 	}
 	series := make([]Labels, 0, len(c.currentSets))
 	for _, seriesSet := range c.currentSets {
 		series = append(series, seriesSet.At())
 	}
+	MergeCount += 1
 	return c.mergeFunc(series...)
 }
 
@@ -390,6 +398,7 @@ func (c *genericMergeSeriesSet) Err() error {
 			return err
 		}
 	}
+	fmt.Printf("total: %v, called: %v\n", c.total, c.called)
 	return nil
 }
 
@@ -591,11 +600,13 @@ func (h *samplesIteratorHeap) Pop() interface{} {
 //
 // NOTE: Use the returned merge function only when you see potentially overlapping series, as this introduces small a overhead
 // to handle overlaps between series.
+var CompactSeriesIteratorCount = 0
 func NewCompactingChunkSeriesMerger(mergeFunc VerticalSeriesMergeFunc) VerticalChunkSeriesMergeFunc {
 	return func(series ...ChunkSeries) ChunkSeries {
 		if len(series) == 0 {
 			return nil
 		}
+		CompactSeriesIteratorCount += 1
 		return &ChunkSeriesEntry{
 			Lset: series[0].Labels(),
 			ChunkIteratorFn: func() chunks.Iterator {
@@ -629,7 +640,14 @@ func (c *compactChunkIterator) At() chunks.Meta {
 	return c.curr
 }
 
+var NextCount int
+var NextDuration time.Duration
+var NextLoopDuration time.Duration
+var NextLoopCount int
+
+
 func (c *compactChunkIterator) Next() bool {
+	start := time.Now()
 	if c.h == nil {
 		for _, iter := range c.iterators {
 			if iter.Next() {
@@ -653,8 +671,10 @@ func (c *compactChunkIterator) Next() bool {
 		prev        = c.curr
 	)
 	// Detect overlaps to compact. Be smart about it and deduplicate on the fly if chunks are identical.
+	loopStart := time.Now()
 	for len(c.h) > 0 {
 		// Get the next oldest chunk by min, then max time.
+		NextLoopCount += 1
 		next := c.h[0].At()
 		if next.MinTime > oMaxTime {
 			// No overlap with current one.
@@ -680,6 +700,9 @@ func (c *compactChunkIterator) Next() bool {
 		}
 	}
 	if len(overlapping) == 0 {
+		NextLoopDuration += time.Since(loopStart)
+		NextCount += 1
+		NextDuration += time.Since(start)
 		return true
 	}
 
