@@ -357,6 +357,7 @@ func (g *ShuffleShardingGrouper) groupBlocksByMinTime(group blocksGroup) map[int
 		for _, tr := range g.compactorCfg.BlockRanges.ToMilliseconds() {
 			if blockRange <= tr {
 				minTime = tr * (block.MinTime / tr)
+				break
 			}
 		}
 		blocksByMinTime[minTime] = append(blocksByMinTime[minTime], block)
@@ -382,8 +383,8 @@ func (g *ShuffleShardingGrouper) partitionBlocksGroup(partitionNumber int, block
 				} else if numMinTimeBlocks == partitionNumber {
 					blocksInPartition = append(blocksInPartition, minTimeBlocks[partitionID])
 				} else {
-					for idx := partitionID; idx < numMinTimeBlocks/partitionNumber; idx += partitionNumber {
-						blocksInPartition = append(blocksInPartition, minTimeBlocks[idx])
+					for idx := 0; idx < numMinTimeBlocks/partitionNumber; idx++ {
+						blocksInPartition = append(blocksInPartition, minTimeBlocks[partitionID+idx*partitionNumber])
 					}
 				}
 			} else {
