@@ -351,6 +351,8 @@ type Group struct {
 	hashFunc                      metadata.HashFunc
 	blockFilesConcurrency         int
 	compactBlocksFetchConcurrency int
+	partitionNumber               int
+	partitionID                   int
 }
 
 // NewGroup returns a new compaction group.
@@ -489,6 +491,19 @@ func (cg *Group) Labels() labels.Labels {
 // Resolution returns the common downsampling resolution of blocks in the group.
 func (cg *Group) Resolution() int64 {
 	return cg.resolution
+}
+
+func (cg *Group) PartitionNumber() int {
+	return cg.partitionNumber
+}
+
+func (cg *Group) PartitionID() int {
+	return cg.partitionID
+}
+
+func (cg *Group) SetPartitionInfo(partitionNumber int, partitionID int) {
+	cg.partitionNumber = partitionNumber
+	cg.partitionID = partitionID
 }
 
 // CompactProgressMetrics contains Prometheus metrics related to compaction progress.

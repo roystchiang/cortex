@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
+	thanosblock "github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
 
@@ -212,6 +214,13 @@ mainLoop:
 
 		groupHash := hashGroup(g.userID, group.rangeStart, group.rangeEnd)
 
+		partitionedGroups := g.partitionBlockGroupPOC(group, groupHash)
+		var partitionedGroupsInfo []string
+		for _, partitionedGroup := range partitionedGroups {
+			partitionedGroupsInfo = append(partitionedGroupsInfo, fmt.Sprintf("(blocks: %s, partition_number: %d, partition_id: %d", partitionedGroup.IDs(), partitionedGroup.PartitionNumber(), partitionedGroup.PartitionID()))
+		}
+		level.Debug(g.logger).Log("msg", "generated partitioned groups", "groups", strings.Join(partitionedGroupsInfo, ", "))
+
 		if isVisited, err := g.isGroupVisited(group.blocks, g.ringLifecyclerID); err != nil {
 			level.Warn(g.logger).Log("msg", "unable to check if blocks in group are visited", "group hash", groupHash, "err", err, "group", group.String())
 			continue
@@ -270,6 +279,125 @@ mainLoop:
 	level.Info(g.logger).Log("msg", fmt.Sprintf("total groups for compaction: %d", len(outGroups)))
 
 	return outGroups, nil
+}
+
+func (g *ShuffleShardingGrouper) partitionBlockGroupPOC(group blocksGroup, groupHash uint32) []*compact.Group {
+	partitionNumber := g.calculatePartitionNumber(group)
+	blocksByMinTime := g.groupBlocksByMinTime(group)
+	partitionedGroups := g.partitionBlocksGroup(partitionNumber, blocksByMinTime, group.rangeStart, group.rangeEnd)
+
+	var partitionedThanosGroups []*compact.Group
+	for partitionID, partitionedGroup := range partitionedGroups {
+		partitionedGroupKey := createGroupKey(groupHash, partitionedGroup)
+		resolution := group.blocks[0].Thanos.Downsample.Resolution
+		externalLabels := labels.FromMap(group.blocks[0].Thanos.Labels)
+		thanosGroup, err := compact.NewGroup(
+			log.With(g.logger, "groupKey", partitionedGroupKey, "rangeStart", group.rangeStartTime().String(), "rangeEnd", group.rangeEndTime().String(), "externalLabels", externalLabels, "downsampleResolution", resolution),
+			g.bkt,
+			partitionedGroupKey,
+			externalLabels,
+			resolution,
+			false, // No malformed index.
+			true,  // Enable vertical compaction.
+			g.compactions.WithLabelValues(partitionedGroupKey),
+			g.compactionRunsStarted.WithLabelValues(partitionedGroupKey),
+			g.compactionRunsCompleted.WithLabelValues(partitionedGroupKey),
+			g.compactionFailures.WithLabelValues(partitionedGroupKey),
+			g.verticalCompactions.WithLabelValues(partitionedGroupKey),
+			g.garbageCollectedBlocks,
+			g.blocksMarkedForDeletion,
+			g.blocksMarkedForNoCompact,
+			g.hashFunc,
+			g.blockFilesConcurrency,
+			g.blocksFetchConcurrency,
+		)
+		if err != nil {
+			level.Debug(g.logger).Log("msg", "failed to create partitioned group", "group", partitionedGroup.String(), "partition_number", partitionNumber, "partition_id", partitionID)
+		}
+
+		for _, m := range partitionedGroup.blocks {
+			if err := thanosGroup.AppendMeta(m); err != nil {
+				level.Debug(g.logger).Log("msg", "failed to add block to partitioned group", "block", m.ULID, "partition_number", partitionNumber, "partition_id", partitionID)
+			}
+		}
+		thanosGroup.SetPartitionInfo(partitionNumber, partitionID)
+		partitionedThanosGroups = append(partitionedThanosGroups, thanosGroup)
+	}
+	return partitionedThanosGroups
+}
+
+func (g *ShuffleShardingGrouper) calculatePartitionNumber(group blocksGroup) int {
+	indexSizeLimit := int64(64 * 1024 * 1024 * 1024) // hard coded to 64G. make it configurable later
+	totalIndexSizeInBytes := int64(0)
+	for _, block := range group.blocks {
+		blockFiles := block.Thanos.Files
+		var indexFile *metadata.File
+		for _, file := range blockFiles {
+			if file.RelPath == thanosblock.IndexFilename {
+				indexFile = &file
+			}
+		}
+		if indexFile == nil {
+			level.Debug(g.logger).Log("msg", "unable to find index file in metadata", "block", block.ULID)
+			break
+		}
+		indexSize := indexFile.SizeBytes
+		totalIndexSizeInBytes += indexSize
+	}
+	partitionNumber := int(math.Pow(2, math.Ceil(math.Log2(float64(totalIndexSizeInBytes)/float64(indexSizeLimit)))))
+	level.Debug(g.logger).Log("msg", "calculated partition number for group", "group", group.String(), "partition_number", partitionNumber, "total_index_size", totalIndexSizeInBytes)
+	return partitionNumber
+}
+
+func (g *ShuffleShardingGrouper) groupBlocksByMinTime(group blocksGroup) map[int64][]*metadata.Meta {
+	blocksByMinTime := make(map[int64][]*metadata.Meta)
+	for _, block := range group.blocks {
+		blockRange := block.MaxTime - block.MinTime
+		minTime := block.MinTime
+		for _, tr := range g.compactorCfg.BlockRanges.ToMilliseconds() {
+			if blockRange <= tr {
+				minTime = tr * (block.MinTime / tr)
+			}
+		}
+		blocksByMinTime[minTime] = append(blocksByMinTime[minTime], block)
+	}
+	return blocksByMinTime
+}
+
+func (g *ShuffleShardingGrouper) partitionBlocksGroup(partitionNumber int, blocksByMinTime map[int64][]*metadata.Meta, rangeStart int64, rangeEnd int64) map[int]blocksGroup {
+	partitionedGroups := make(map[int]blocksGroup)
+	for i := 0; i < partitionNumber; i++ {
+		partitionID := i
+		var blocksInPartition []*metadata.Meta
+		for _, minTimeBlocks := range blocksByMinTime {
+			numMinTimeBlocks := len(minTimeBlocks)
+			if numMinTimeBlocks == 1 {
+				blocksInPartition = append(blocksInPartition, minTimeBlocks[0])
+				continue
+			}
+			numBlocksCheck := math.Log2(float64(numMinTimeBlocks))
+			if math.Ceil(numBlocksCheck) == math.Floor(numBlocksCheck) {
+				if numMinTimeBlocks < partitionNumber {
+					blocksInPartition = append(blocksInPartition, minTimeBlocks[partitionID%numMinTimeBlocks])
+				} else if numMinTimeBlocks == partitionNumber {
+					blocksInPartition = append(blocksInPartition, minTimeBlocks[partitionID])
+				} else {
+					for idx := partitionID; idx < numMinTimeBlocks/partitionNumber; idx += partitionNumber {
+						blocksInPartition = append(blocksInPartition, minTimeBlocks[idx])
+					}
+				}
+			} else {
+				blocksInPartition = append(blocksInPartition, minTimeBlocks...)
+			}
+		}
+		partitionedGroup := blocksGroup{
+			rangeStart: rangeStart,
+			rangeEnd:   rangeEnd,
+			blocks:     blocksInPartition,
+		}
+		partitionedGroups[partitionID] = partitionedGroup
+	}
+	return partitionedGroups
 }
 
 func (g *ShuffleShardingGrouper) isGroupVisited(blocks []*metadata.Meta, compactorID string) (bool, error) {
