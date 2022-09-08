@@ -323,10 +323,13 @@ func (g *ShuffleShardingGrouper) partitionBlockGroupPOC(group blocksGroup, group
 }
 
 func (g *ShuffleShardingGrouper) calculatePartitionNumber(group blocksGroup) int {
-	indexSizeLimit := int64(64 * 1024 * 1024 * 1024) // hard coded to 64G. make it configurable later
+	indexSizeLimit := g.compactorCfg.PartitionIndexSizeLimitInBytes
+	seriesCountLimit := g.compactorCfg.PartitionSeriesCountLimit
 	totalIndexSizeInBytes := int64(0)
+	totalSeriesCount := int64(0)
 	for _, block := range group.blocks {
 		blockFiles := block.Thanos.Files
+		totalSeriesCount += int64(block.Stats.NumSeries)
 		var indexFile *metadata.File
 		for _, file := range blockFiles {
 			if file.RelPath == thanosblock.IndexFilename {
@@ -340,9 +343,24 @@ func (g *ShuffleShardingGrouper) calculatePartitionNumber(group blocksGroup) int
 		indexSize := indexFile.SizeBytes
 		totalIndexSizeInBytes += indexSize
 	}
-	partitionNumber := int(math.Pow(2, math.Ceil(math.Log2(float64(totalIndexSizeInBytes)/float64(indexSizeLimit)))))
-	level.Debug(g.logger).Log("msg", "calculated partition number for group", "group", group.String(), "partition_number", partitionNumber, "total_index_size", totalIndexSizeInBytes)
+	partitionNumberBasedOnIndex := 1
+	if indexSizeLimit > 0 && totalIndexSizeInBytes > indexSizeLimit {
+		partitionNumberBasedOnIndex = g.findNearestPartitionNumber(float64(totalIndexSizeInBytes), float64(indexSizeLimit))
+	}
+	partitionNumberBasedOnSeries := 1
+	if seriesCountLimit > 0 && totalSeriesCount > seriesCountLimit {
+		partitionNumberBasedOnSeries = g.findNearestPartitionNumber(float64(totalSeriesCount), float64(seriesCountLimit))
+	}
+	partitionNumber := partitionNumberBasedOnIndex
+	if partitionNumberBasedOnSeries > partitionNumberBasedOnIndex {
+		partitionNumber = partitionNumberBasedOnSeries
+	}
+	level.Debug(g.logger).Log("msg", "calculated partition number for group", "group", group.String(), "partition_number", partitionNumber, "total_index_size", totalIndexSizeInBytes, "index_size_limit", indexSizeLimit, "total_series_count", totalSeriesCount, "series_count_limit", seriesCountLimit)
 	return partitionNumber
+}
+
+func (g *ShuffleShardingGrouper) findNearestPartitionNumber(size float64, limit float64) int {
+	return int(math.Pow(2, math.Ceil(math.Log2(size/limit))))
 }
 
 func (g *ShuffleShardingGrouper) groupBlocksByMinTime(group blocksGroup) map[int64][]*metadata.Meta {
@@ -604,11 +622,7 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 			continue
 		}
 
-		// Skip blocks that have rounded range equal to tr, and level > 1
-		// Because tr is divisible by the previous tr, block range falls in
-		// (tr/2, tr] should be rounded to tr.
-		blockRange := m.MaxTime - m.MinTime
-		if blockRange <= tr && blockRange > tr/2 && m.Compaction.Level > 1 {
+		if skipHighLevelBlock(m, tr) {
 			i++
 			continue
 		}
@@ -627,6 +641,10 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 				continue
 			}
 
+			if skipHighLevelBlock(blocks[i], tr) {
+				continue
+			}
+
 			group.blocks = append(group.blocks, blocks[i])
 		}
 
@@ -636,6 +654,14 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 	}
 
 	return ret
+}
+
+func skipHighLevelBlock(block *metadata.Meta, tr int64) bool {
+	// Skip blocks that have rounded range equal to tr, and level > 1
+	// Because tr is divisible by the previous tr, block range falls in
+	// (tr/2, tr] should be rounded to tr.
+	blockRange := block.MaxTime - block.MinTime
+	return blockRange <= tr && blockRange > tr/2 && block.Compaction.Level > 1
 }
 
 func getRangeStart(m *metadata.Meta, tr int64) int64 {

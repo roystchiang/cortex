@@ -683,6 +683,21 @@ func TestGroupBlocksByRange(t *testing.T) {
 				}},
 			},
 		},
+		"blocks with level greater than 1 and same time range as asked for should be skipped": {
+			timeRange: 40,
+			blocks: []*metadata.Meta{
+				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 1}}},
+				{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 2}}},
+				{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 1}}},
+				{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 2}}},
+			},
+			expected: []blocksGroup{
+				{rangeStart: 0, rangeEnd: 40, blocks: []*metadata.Meta{
+					{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 1}}},
+					{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 40, Compaction: tsdb.BlockMetaCompaction{Level: 1}}},
+				}},
+			},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -827,12 +842,15 @@ func TestGroupPartitioning(t *testing.T) {
 	testCompactorID := "test-compactor"
 
 	tests := map[string]struct {
-		ranges     []time.Duration
-		rangeStart int64
-		rangeEnd   int64
-		indexSize  int64
-		blocks     []*metadata.Meta
-		expected   struct {
+		ranges      []time.Duration
+		rangeStart  int64
+		rangeEnd    int64
+		indexSize   int64
+		indexLimit  int64
+		seriesCount int64
+		seriesLimit int64
+		blocks      []*metadata.Meta
+		expected    struct {
 			partitionNumber int
 			partitions      map[int][]ulid.ULID
 		}
@@ -841,7 +859,8 @@ func TestGroupPartitioning(t *testing.T) {
 			ranges:     []time.Duration{2 * time.Hour, 6 * time.Hour},
 			rangeStart: 1 * time.Hour.Milliseconds(),
 			rangeEnd:   9 * time.Hour.Milliseconds(),
-			indexSize:  int64(14 * 1024 * 1024 * 1024),
+			indexSize:  int64(14),
+			indexLimit: int64(64),
 			blocks: []*metadata.Meta{
 				blocks[t1block1Ulid], blocks[t1block2Ulid],
 				blocks[t2block1Ulid], blocks[t2block2Ulid], blocks[t2block3Ulid], blocks[t2block4Ulid],
@@ -864,7 +883,8 @@ func TestGroupPartitioning(t *testing.T) {
 			ranges:     []time.Duration{2 * time.Hour, 6 * time.Hour},
 			rangeStart: 1 * time.Hour.Milliseconds(),
 			rangeEnd:   9 * time.Hour.Milliseconds(),
-			indexSize:  int64(30 * 1024 * 1024 * 1024),
+			indexSize:  int64(30),
+			indexLimit: int64(64),
 			blocks: []*metadata.Meta{
 				blocks[t0block1Ulid], blocks[t0block2Ulid], blocks[t0block3Ulid],
 			},
@@ -883,7 +903,8 @@ func TestGroupPartitioning(t *testing.T) {
 			ranges:     []time.Duration{2 * time.Hour, 6 * time.Hour},
 			rangeStart: 1 * time.Hour.Milliseconds(),
 			rangeEnd:   9 * time.Hour.Milliseconds(),
-			indexSize:  int64(50 * 1024 * 1024 * 1024),
+			indexSize:  int64(50),
+			indexLimit: int64(64),
 			blocks: []*metadata.Meta{
 				blocks[t4block1Ulid], blocks[t4block2Ulid],
 			},
@@ -898,12 +919,84 @@ func TestGroupPartitioning(t *testing.T) {
 				},
 			},
 		},
+		"test ideal partition with series limit": {
+			ranges:      []time.Duration{2 * time.Hour, 6 * time.Hour},
+			rangeStart:  1 * time.Hour.Milliseconds(),
+			rangeEnd:    9 * time.Hour.Milliseconds(),
+			seriesCount: int64(14),
+			seriesLimit: int64(64),
+			blocks: []*metadata.Meta{
+				blocks[t1block1Ulid], blocks[t1block2Ulid],
+				blocks[t2block1Ulid], blocks[t2block2Ulid], blocks[t2block3Ulid], blocks[t2block4Ulid],
+				blocks[t3block1Ulid], blocks[t3block2Ulid], blocks[t3block3Ulid], blocks[t3block4Ulid],
+				blocks[t3block5Ulid], blocks[t3block6Ulid], blocks[t3block7Ulid], blocks[t3block8Ulid]},
+			expected: struct {
+				partitionNumber int
+				partitions      map[int][]ulid.ULID
+			}{
+				partitionNumber: 4,
+				partitions: map[int][]ulid.ULID{
+					0: {t1block1Ulid, t2block1Ulid, t3block1Ulid, t3block5Ulid},
+					1: {t1block2Ulid, t2block2Ulid, t3block2Ulid, t3block6Ulid},
+					2: {t1block1Ulid, t2block3Ulid, t3block3Ulid, t3block7Ulid},
+					3: {t1block2Ulid, t2block4Ulid, t3block4Ulid, t3block8Ulid},
+				},
+			},
+		},
+		"test ideal partition with both index and series limit set": {
+			ranges:      []time.Duration{2 * time.Hour, 6 * time.Hour},
+			rangeStart:  1 * time.Hour.Milliseconds(),
+			rangeEnd:    9 * time.Hour.Milliseconds(),
+			indexSize:   int64(1),
+			indexLimit:  int64(64),
+			seriesCount: int64(14),
+			seriesLimit: int64(64),
+			blocks: []*metadata.Meta{
+				blocks[t1block1Ulid], blocks[t1block2Ulid],
+				blocks[t2block1Ulid], blocks[t2block2Ulid], blocks[t2block3Ulid], blocks[t2block4Ulid],
+				blocks[t3block1Ulid], blocks[t3block2Ulid], blocks[t3block3Ulid], blocks[t3block4Ulid],
+				blocks[t3block5Ulid], blocks[t3block6Ulid], blocks[t3block7Ulid], blocks[t3block8Ulid]},
+			expected: struct {
+				partitionNumber int
+				partitions      map[int][]ulid.ULID
+			}{
+				partitionNumber: 4,
+				partitions: map[int][]ulid.ULID{
+					0: {t1block1Ulid, t2block1Ulid, t3block1Ulid, t3block5Ulid},
+					1: {t1block2Ulid, t2block2Ulid, t3block2Ulid, t3block6Ulid},
+					2: {t1block1Ulid, t2block3Ulid, t3block3Ulid, t3block7Ulid},
+					3: {t1block2Ulid, t2block4Ulid, t3block4Ulid, t3block8Ulid},
+				},
+			},
+		},
+		"test ideal partition with partition number equals to 1": {
+			ranges:     []time.Duration{2 * time.Hour, 6 * time.Hour},
+			rangeStart: 1 * time.Hour.Milliseconds(),
+			rangeEnd:   9 * time.Hour.Milliseconds(),
+			blocks: []*metadata.Meta{
+				blocks[t1block1Ulid], blocks[t1block2Ulid],
+				blocks[t2block1Ulid], blocks[t2block2Ulid], blocks[t2block3Ulid], blocks[t2block4Ulid],
+				blocks[t3block1Ulid], blocks[t3block2Ulid], blocks[t3block3Ulid], blocks[t3block4Ulid],
+				blocks[t3block5Ulid], blocks[t3block6Ulid], blocks[t3block7Ulid], blocks[t3block8Ulid]},
+			expected: struct {
+				partitionNumber int
+				partitions      map[int][]ulid.ULID
+			}{
+				partitionNumber: 1,
+				partitions: map[int][]ulid.ULID{
+					0: {t1block1Ulid, t1block2Ulid, t2block1Ulid, t2block2Ulid, t2block3Ulid, t2block4Ulid, t3block1Ulid,
+						t3block2Ulid, t3block3Ulid, t3block4Ulid, t3block5Ulid, t3block6Ulid, t3block7Ulid, t3block8Ulid},
+				},
+			},
+		},
 	}
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
 			compactorCfg := &Config{
-				BlockRanges: testData.ranges,
+				BlockRanges:                    testData.ranges,
+				PartitionIndexSizeLimitInBytes: testData.indexLimit,
+				PartitionSeriesCountLimit:      testData.seriesLimit,
 			}
 
 			limits := &validation.Limits{}
@@ -946,6 +1039,7 @@ func TestGroupPartitioning(t *testing.T) {
 				block.Thanos.Files = []metadata.File{
 					{RelPath: thanosblock.IndexFilename, SizeBytes: testData.indexSize},
 				}
+				block.Stats.NumSeries = uint64(testData.seriesCount)
 				testBlocks = append(testBlocks, block)
 			}
 			testGroup := blocksGroup{
