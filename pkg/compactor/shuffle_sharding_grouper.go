@@ -215,11 +215,7 @@ mainLoop:
 		groupHash := hashGroup(g.userID, group.rangeStart, group.rangeEnd)
 
 		partitionedGroups := g.partitionBlockGroupPOC(group, groupHash)
-		var partitionedGroupsInfo []string
-		for _, partitionedGroup := range partitionedGroups {
-			partitionedGroupsInfo = append(partitionedGroupsInfo, fmt.Sprintf("(blocks: %s, partition_number: %d, partition_id: %d", partitionedGroup.IDs(), partitionedGroup.PartitionNumber(), partitionedGroup.PartitionID()))
-		}
-		level.Debug(g.logger).Log("msg", "generated partitioned groups", "groups", strings.Join(partitionedGroupsInfo, ", "))
+		level.Debug(g.logger).Log("msg", "generated partitioned groups", "groups", partitionedGroupsInfo(partitionedGroups))
 
 		if isVisited, err := g.isGroupVisited(group.blocks, g.ringLifecyclerID); err != nil {
 			level.Warn(g.logger).Log("msg", "unable to check if blocks in group are visited", "group hash", groupHash, "err", err, "group", group.String())
@@ -608,6 +604,15 @@ func groupBlocksByRange(blocks []*metadata.Meta, tr int64) []blocksGroup {
 			continue
 		}
 
+		// Skip blocks that have rounded range equal to tr, and level > 1
+		// Because tr is divisible by the previous tr, block range falls in
+		// (tr/2, tr] should be rounded to tr.
+		blockRange := m.MaxTime - m.MinTime
+		if blockRange <= tr && blockRange > tr/2 && m.Compaction.Level > 1 {
+			i++
+			continue
+		}
+
 		// Add all blocks to the current group that are within [t0, t0+tr].
 		for ; i < len(blocks); i++ {
 			// If the block does not start within this group, then we should break the iteration
@@ -647,4 +652,14 @@ func sortMetasByMinTime(metas []*metadata.Meta) {
 	sort.Slice(metas, func(i, j int) bool {
 		return metas[i].BlockMeta.MinTime < metas[j].BlockMeta.MinTime
 	})
+}
+
+type partitionedGroupsInfo []*compact.Group
+
+func (p partitionedGroupsInfo) String() string {
+	var info []string
+	for _, partitionedGroup := range p {
+		info = append(info, fmt.Sprintf("(blocks: %s, partition_number: %d, partition_id: %d", partitionedGroup.IDs(), partitionedGroup.PartitionNumber(), partitionedGroup.PartitionID()))
+	}
+	return strings.Join(info, ", ")
 }
