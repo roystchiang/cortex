@@ -685,7 +685,7 @@ type partitionedGroupsInfo []*compact.Group
 func (p partitionedGroupsInfo) String() string {
 	var info []string
 	for _, partitionedGroup := range p {
-		info = append(info, fmt.Sprintf("(blocks: %s, partition_number: %d, partition_id: %d", partitionedGroup.IDs(), partitionedGroup.PartitionNumber(), partitionedGroup.PartitionID()))
+		info = append(info, fmt.Sprintf("(blocks: %s, partition_number: %d, partition_id: %d)", partitionedGroup.IDs(), partitionedGroup.PartitionNumber(), partitionedGroup.PartitionID()))
 	}
 	return strings.Join(info, ", ")
 }
