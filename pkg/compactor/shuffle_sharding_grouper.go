@@ -266,8 +266,10 @@ mainLoop:
 			}
 		}
 
-		outGroups = append(outGroups, thanosGroup)
-		if len(outGroups) == g.compactionConcurrency {
+		for _, partitionedGroup := range partitionedGroups {
+			outGroups = append(outGroups, partitionedGroup)
+		}
+		if len(outGroups) >= g.compactionConcurrency {
 			break mainLoop
 		}
 	}
@@ -293,7 +295,7 @@ func (g *ShuffleShardingGrouper) partitionBlockGroupPOC(group blocksGroup, group
 			partitionedGroupKey,
 			externalLabels,
 			resolution,
-			false, // No malformed index.
+			true, // No malformed index.
 			true,  // Enable vertical compaction.
 			g.compactions.WithLabelValues(partitionedGroupKey),
 			g.compactionRunsStarted.WithLabelValues(partitionedGroupKey),
